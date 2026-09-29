@@ -1,0 +1,38 @@
+; DirectHCI development-only WinUSB package for the Intel AX201 Bluetooth USB
+; function. This package contains no custom driver binary or filter.
+
+[Version]
+Signature="$WINDOWS NT$"
+; Keep the existing Bluetooth setup class so SetupAPI can enumerate this
+; package in the AX201 devnode's compatible-driver list for exact selection.
+Class=Bluetooth
+ClassGuid={E0CBF06C-CD8B-4647-BB8A-263B43F0F974}
+Provider=%ProviderName%
+DriverVer=09/01/2026,0.1.0.0
+CatalogFile=directhci-ax201-dev.cat
+PnpLockdown=1
+
+[Manufacturer]
+%ManufacturerName%=DirectHCI,NTamd64
+
+[DirectHCI.NTamd64]
+%DeviceName%=DirectHCI_Install,USB\VID_8087&PID_0026
+
+[DirectHCI_Install]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[DirectHCI_Install.Services]
+Include=winusb.inf
+Needs=WINUSB.NT.Services
+
+[DirectHCI_Install.HW]
+AddReg=DirectHCI_DeviceInterface
+
+[DirectHCI_DeviceInterface]
+HKR,,DeviceInterfaceGUIDs,0x00010000,"{CF97AABE-7898-4D73-B044-A481B26747AA}"
+
+[Strings]
+ProviderName="DirectHCI Project"
+ManufacturerName="DirectHCI Project"
+DeviceName="DirectHCI WinUSB Controller (AX201 Development)"
