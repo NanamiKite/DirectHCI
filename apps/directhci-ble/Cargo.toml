@@ -11,7 +11,7 @@ critical-section = { version = "1", features = ["std"] }
 directhci-bt-hci.workspace = true
 directhci-client.workspace = true
 embassy-time = { version = "0.5.0", features = ["std", "generic-queue-8"] }
-tokio = { workspace = true, features = ["macros", "rt", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
 trouble-host = { workspace = true, default-features = false, features = [
     "central",
     "gatt",

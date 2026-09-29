@@ -21,6 +21,10 @@ const REQUEST_DEPTH: usize = 32;
 const INBOUND_DEPTH: usize = 128;
 const POLL_INTERVAL: Duration = Duration::from_millis(5);
 const MAX_DRAIN_PER_TICK: usize = 32;
+// bt-hci 0.10.1 models Disconnect as SyncCmd<Return = ()>, although the
+// controller acknowledges it with Command Status and completes it later with
+// Disconnection Complete. Keep this exception opcode-scoped.
+const HCI_DISCONNECT_OPCODE: u16 = 0x0406;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AdapterError {
@@ -319,9 +323,26 @@ impl<C: SyncCmd> ControllerCmdSync<C> for DirectHciController {
                 .to_result::<C>()
                 .map_err(cmd::Error::Hci)
             }
-            HciCommandResponse::Status { .. } => Err(cmd::Error::Io(
-                AdapterError::UnexpectedResponseKind("Command Status for synchronous command"),
-            )),
+            HciCommandResponse::Status {
+                command_opcode,
+                status,
+                ..
+            } => {
+                if command_opcode != C::OPCODE.to_raw() {
+                    return Err(cmd::Error::Io(AdapterError::UnexpectedResponse {
+                        expected: C::OPCODE.to_raw(),
+                        actual: command_opcode,
+                    }));
+                }
+                if C::OPCODE.to_raw() != HCI_DISCONNECT_OPCODE {
+                    return Err(cmd::Error::Io(AdapterError::UnexpectedResponseKind(
+                        "Command Status for synchronous command",
+                    )));
+                }
+                Status::new(status).to_result().map_err(cmd::Error::Hci)?;
+                C::Return::from_hci_bytes_complete(&[])
+                    .map_err(|e| cmd::Error::Io(AdapterError::Decode(format!("{e:?}"))))
+            }
         }
     }
 }

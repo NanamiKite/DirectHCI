@@ -27,6 +27,16 @@ tool flow. These are API/tool contracts, not copied implementation code.
 | `bt-hci` 0.10.1 | [`Controller`, `ControllerCmdSync`, and `ControllerCmdAsync`](https://docs.rs/bt-hci/0.10.1/bt_hci/controller/index.html) | Direct dependency defining the typed HCI controller boundary used by `directhci-bt-hci` | MIT OR Apache-2.0; DirectHCI independently adapts its own IPC SDK and does not copy a transport implementation |
 | TrouBLE (`trouble-host`) 0.8.0 | [repository and current examples](https://github.com/embassy-rs/trouble/tree/trouble-host-v0.8.0/examples), [crate source](https://docs.rs/crate/trouble-host/0.8.0/source/) | Direct dependency for GAP Central, L2CAP, ATT, GATT discovery/read/write, and notification/indication handling in the generic `directhci-ble` consumer | MIT OR Apache-2.0; used as an upstream dependency, not forked or copied into DirectHCI |
 
+## Confirmed compatibility notes
+
+- `bt-hci` 0.10.1 declares `link_control::Disconnect` (opcode `0x0406`)
+  as `SyncCmd<Return = ()>`. The Bluetooth HCI procedure and the observed
+  Intel AX201 behavior acknowledge this command with Command Status, followed
+  later by the unsolicited Disconnection Complete event. The
+  `directhci-bt-hci` adapter therefore accepts a successful Command Status only
+  for opcode `0x0406`; all other `SyncCmd` implementations still require
+  Command Complete. This compatibility branch should be removed when the
+  upstream command model represents Disconnect as an asynchronous command.
 
 The Dedicated WinUSB readiness implementation uses only Microsoft-documented
 API contracts through `windows-rs`: `SetupDiOpenDevRegKey` reads the

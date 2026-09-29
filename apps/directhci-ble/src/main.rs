@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
+use std::future::{Future, poll_fn};
 use std::sync::Mutex;
+use std::task::Poll;
 use std::time::{Duration as StdDuration, SystemTime, UNIX_EPOCH};
 
 use directhci_bt_hci::DirectHciController;
@@ -45,6 +47,29 @@ enum Command {
         indications: bool,
         seconds: u64,
     },
+    Listen {
+        peer: Address,
+        uuid: Uuid,
+        seconds: u64,
+    },
+    ListenAll {
+        peer: Address,
+        seconds: u64,
+    },
+    Exchange {
+        peer: Address,
+        write_uuid: Uuid,
+        value: Vec<u8>,
+        without_response: bool,
+        listen: ListenTarget,
+        seconds: u64,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ListenTarget {
+    Characteristic(Uuid),
+    All,
 }
 
 #[derive(Clone, Debug)]
@@ -136,18 +161,19 @@ async fn run() -> AppResult<()> {
 
     let operation = execute(&stack, &mut central, &collector, command);
     let outcome = tokio::select! {
-        result = runner.run_with_handler(&collector) => Err(format!("TrouBLE host runner stopped: {result:?}").into()),
+        biased;
         result = operation => result,
+        result = runner.run_with_handler(&collector) => Err(format!("TrouBLE host runner stopped: {result:?}").into()),
     };
     drop(runner);
     drop(central);
     let release = shutdown.shutdown().await;
     match (outcome, release) {
         (Err(primary), Err(recovery)) => {
-            Err(format!("{primary}; DirectHCI release also failed: {recovery}").into())
+            Err(format!("primary: {primary}; cleanup: DirectHCI release failed: {recovery}").into())
         }
-        (Err(primary), _) => Err(primary),
-        (Ok(()), Err(error)) => Err(error.into()),
+        (Err(primary), _) => Err(format!("primary: {primary}").into()),
+        (Ok(()), Err(error)) => Err(format!("cleanup: DirectHCI release failed: {error}").into()),
         (Ok(()), Ok(())) => Ok(()),
     }
 }
@@ -169,8 +195,14 @@ async fn execute<'stack, 'borrow>(
                 ..Default::default()
             };
             let session = scanner.scan(&config).await.map_err(debug_error)?;
-            tokio::time::sleep(StdDuration::from_secs(seconds)).await;
+            let interrupted = tokio::select! {
+                _ = tokio::time::sleep(StdDuration::from_secs(seconds)) => false,
+                _ = tokio::signal::ctrl_c() => true,
+            };
             session.stop().await;
+            if interrupted {
+                return Err("operation interrupted by Ctrl+C".into());
+            }
             for record in collector
                 .records
                 .lock()
@@ -207,7 +239,10 @@ async fn execute_connected<'stack, 'borrow>(
         | Command::Inspect { peer }
         | Command::Read { peer, .. }
         | Command::Write { peer, .. }
-        | Command::Subscribe { peer, .. } => peer,
+        | Command::Subscribe { peer, .. }
+        | Command::Listen { peer, .. }
+        | Command::ListenAll { peer, .. }
+        | Command::Exchange { peer, .. } => peer,
         Command::Scan { .. } => unreachable!(),
     };
     let filter = [peer];
@@ -224,8 +259,10 @@ async fn execute_connected<'stack, 'borrow>(
     let result = match command {
         Command::Connect { seconds, .. } => {
             println!("connected {}", format_address(peer));
-            tokio::time::sleep(StdDuration::from_secs(seconds)).await;
-            Ok(())
+            tokio::select! {
+                _ = tokio::time::sleep(StdDuration::from_secs(seconds)) => Ok(()),
+                _ = tokio::signal::ctrl_c() => Err("operation interrupted by Ctrl+C".into()),
+            }
         }
         command => {
             match GattClient::<DirectHciController, DefaultPacketPool, MAX_SERVICES>::new(
@@ -234,9 +271,7 @@ async fn execute_connected<'stack, 'borrow>(
             )
             .await
             {
-                Ok(client) => {
-                    tokio::select! { result = client.task() => Err(format!("GATT task stopped: {result:?}").into()), result = gatt_operation(&client, command) => result }
-                }
+                Ok(client) => run_gatt_operation(&client, command).await,
                 Err(error) => Err(debug_error(error)),
             }
         }
@@ -244,6 +279,35 @@ async fn execute_connected<'stack, 'borrow>(
     connection.disconnect();
     tokio::time::sleep(StdDuration::from_millis(100)).await;
     result
+}
+
+async fn run_gatt_operation(
+    client: &GattClient<'_, DirectHciController, DefaultPacketPool, MAX_SERVICES>,
+    command: Command,
+) -> AppResult<()> {
+    let task = client.task();
+    tokio::pin!(task);
+
+    // Prime GattClient::task before any operation can create a listener or
+    // issue a write. This registers the GATT receive path first without
+    // detaching a task that could outlive the client/connection.
+    let stopped = poll_fn(|context| match task.as_mut().poll(context) {
+        Poll::Ready(result) => Poll::Ready(Some(result)),
+        Poll::Pending => Poll::Ready(None),
+    })
+    .await;
+    if let Some(result) = stopped {
+        return Err(format!("GATT task stopped before operation: {result:?}").into());
+    }
+
+    let operation = gatt_operation(client, command);
+    tokio::pin!(operation);
+    tokio::select! {
+        biased;
+        result = &mut operation => result,
+        result = &mut task => Err(format!("GATT task stopped during operation: {result:?}").into()),
+        _ = tokio::signal::ctrl_c() => Err("operation interrupted by Ctrl+C".into()),
+    }
 }
 
 async fn gatt_operation(
@@ -269,17 +333,7 @@ async fn gatt_operation(
             ..
         } => {
             let characteristic = find_characteristic(client, uuid).await?;
-            if without_response {
-                client
-                    .write_characteristic_without_response(&characteristic, &value)
-                    .await
-                    .map_err(debug_error)?;
-            } else {
-                client
-                    .write_characteristic(&characteristic, &value)
-                    .await
-                    .map_err(debug_error)?;
-            }
+            write_value(client, &characteristic, &value, without_response).await?;
             println!(
                 "wrote {} bytes ({})",
                 value.len(),
@@ -298,38 +352,180 @@ async fn gatt_operation(
             ..
         } => {
             let characteristic = find_characteristic(client, uuid).await?;
+            let required = if indications {
+                CharacteristicProp::Indicate
+            } else {
+                CharacteristicProp::Notify
+            };
+            if !characteristic.props.any(&[required]) {
+                return Err(format!(
+                    "NotificationModeNotSupported: characteristic {} does not declare {}",
+                    format_uuid(uuid),
+                    if indications { "Indicate" } else { "Notify" }
+                )
+                .into());
+            }
+            if characteristic.cccd_handle.is_none() {
+                return Err(format!(
+                    "CccdNotAvailable: characteristic {} has no discovered CCCD; use `listen` for passive reception",
+                    format_uuid(uuid)
+                )
+                .into());
+            }
             let mut listener = client
                 .subscribe(&characteristic, indications)
                 .await
                 .map_err(debug_error)?;
-            let deadline = tokio::time::Instant::now() + StdDuration::from_secs(seconds);
-            loop {
-                match tokio::time::timeout_at(deadline, listener.next()).await {
-                    Ok(value) => {
-                        println!(
-                            "handle=0x{:04x} kind={} value={}",
-                            value.handle(),
-                            if value.is_indication() {
-                                "indication"
-                            } else {
-                                "notification"
-                            },
-                            hex(value.as_ref())
-                        );
-                        if value.is_indication() {
-                            client.confirm_indication().await.map_err(debug_error)?;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
+            receive_notifications(client, &mut listener, seconds).await?;
             client
                 .unsubscribe(&characteristic)
                 .await
                 .map_err(debug_error)?;
             Ok(())
         }
+        Command::Listen { uuid, seconds, .. } => {
+            let characteristic = find_characteristic(client, uuid).await?;
+            ensure_passive_listen_supported(&characteristic)?;
+            let mut listener = client.listen(&characteristic).map_err(debug_error)?;
+            println!("passive listener ready for {}", format_uuid(uuid));
+            receive_notifications(client, &mut listener, seconds).await
+        }
+        Command::ListenAll { seconds, .. } => {
+            let mut listener = client.listen_all().map_err(debug_error)?;
+            println!("passive listener ready for all characteristic handles");
+            receive_notifications(client, &mut listener, seconds).await
+        }
+        Command::Exchange {
+            write_uuid,
+            value,
+            without_response,
+            listen,
+            seconds,
+            ..
+        } => {
+            let write_characteristic = find_characteristic(client, write_uuid).await?;
+            ensure_write_supported(&write_characteristic, without_response)?;
+            match listen {
+                ListenTarget::Characteristic(listen_uuid) => {
+                    let listen_characteristic = find_characteristic(client, listen_uuid).await?;
+                    ensure_passive_listen_supported(&listen_characteristic)?;
+                    let mut listener = client.listen(&listen_characteristic).map_err(debug_error)?;
+                    println!("passive listener ready for {}", format_uuid(listen_uuid));
+                    write_value(client, &write_characteristic, &value, without_response).await?;
+                    print_write_result(value.len(), without_response);
+                    receive_notifications(client, &mut listener, seconds).await
+                }
+                ListenTarget::All => {
+                    let mut listener = client.listen_all().map_err(debug_error)?;
+                    println!("passive listener ready for all characteristic handles");
+                    write_value(client, &write_characteristic, &value, without_response).await?;
+                    print_write_result(value.len(), without_response);
+                    receive_notifications(client, &mut listener, seconds).await
+                }
+            }
+        }
         _ => unreachable!(),
+    }
+}
+
+fn print_write_result(length: usize, without_response: bool) {
+    println!(
+        "wrote {length} bytes ({})",
+        if without_response {
+            "without response"
+        } else {
+            "request"
+        }
+    );
+}
+
+async fn write_value(
+    client: &GattClient<'_, DirectHciController, DefaultPacketPool, MAX_SERVICES>,
+    characteristic: &Characteristic<[u8]>,
+    value: &[u8],
+    without_response: bool,
+) -> AppResult<()> {
+    ensure_write_supported(characteristic, without_response)?;
+    if without_response {
+        client
+            .write_characteristic_without_response(characteristic, value)
+            .await
+            .map_err(debug_error)
+    } else {
+        client
+            .write_characteristic(characteristic, value)
+            .await
+            .map_err(debug_error)
+    }
+}
+
+fn ensure_write_supported(
+    characteristic: &Characteristic<[u8]>,
+    without_response: bool,
+) -> AppResult<()> {
+    let required = if without_response {
+        CharacteristicProp::WriteWithoutResponse
+    } else {
+        CharacteristicProp::Write
+    };
+    if characteristic.props.any(&[required]) {
+        Ok(())
+    } else {
+        Err(format!(
+            "WriteModeNotSupported: characteristic {} does not declare {}",
+            format_uuid(characteristic.uuid),
+            if without_response {
+                "Write Without Response"
+            } else {
+                "Write"
+            }
+        )
+        .into())
+    }
+}
+
+fn ensure_passive_listen_supported(characteristic: &Characteristic<[u8]>) -> AppResult<()> {
+    if characteristic
+        .props
+        .any(&[CharacteristicProp::Notify, CharacteristicProp::Indicate])
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "PassiveListenNotSupported: characteristic {} declares neither Notify nor Indicate",
+            format_uuid(characteristic.uuid)
+        )
+        .into())
+    }
+}
+
+async fn receive_notifications<const MTU: usize>(
+    client: &GattClient<'_, DirectHciController, DefaultPacketPool, MAX_SERVICES>,
+    listener: &mut NotificationListener<'_, MTU>,
+    seconds: u64,
+) -> AppResult<()> {
+    let deadline = tokio::time::Instant::now() + StdDuration::from_secs(seconds);
+    loop {
+        match tokio::time::timeout_at(deadline, listener.next()).await {
+            Ok(value) => {
+                println!(
+                    "timestamp_ms={} handle=0x{:04x} kind={} length={} value={}",
+                    timestamp_millis(),
+                    value.handle(),
+                    if value.is_indication() {
+                        "indication"
+                    } else {
+                        "notification"
+                    },
+                    value.as_ref().len(),
+                    hex(value.as_ref())
+                );
+                if value.is_indication() {
+                    client.confirm_indication().await.map_err(debug_error)?;
+                }
+            }
+            Err(_) => return Ok(()),
+        }
     }
 }
 
@@ -431,12 +627,41 @@ fn parse_args() -> AppResult<(Option<String>, Command)> {
             indications: args.iter().any(|v| v == "--indications"),
             seconds: option_u64(&args, "--seconds", 30)?,
         },
+        Some("listen") if args.len() >= 3 => Command::Listen {
+            peer: parse_address(&args[1])?,
+            uuid: parse_uuid(&args[2])?,
+            seconds: option_u64(&args, "--seconds", 30)?,
+        },
+        Some("listen-all") if args.len() >= 2 => Command::ListenAll {
+            peer: parse_address(&args[1])?,
+            seconds: option_u64(&args, "--seconds", 30)?,
+        },
+        Some("exchange") if args.len() >= 4 => {
+            let write_uuid = parse_uuid(&args[2])?;
+            let listen_uuid = option_value(&args, "--listen")?.map(parse_uuid).transpose()?;
+            let listen_all = args.iter().any(|value| value == "--listen-all");
+            if listen_uuid.is_some() && listen_all {
+                return Err("--listen and --listen-all are mutually exclusive".into());
+            }
+            Command::Exchange {
+                peer: parse_address(&args[1])?,
+                write_uuid,
+                value: parse_hex(&args[3])?,
+                without_response: args.iter().any(|v| v == "--without-response"),
+                listen: if listen_all {
+                    ListenTarget::All
+                } else {
+                    ListenTarget::Characteristic(listen_uuid.unwrap_or(write_uuid))
+                },
+                seconds: option_u64(&args, "--seconds", 30)?,
+            }
+        }
         _ => return Err(usage().into()),
     };
     Ok((controller, command))
 }
 fn usage() -> &'static str {
-    "usage: directhci-ble [--controller ID] scan [--seconds N]\n       directhci-ble [--controller ID] connect <public|random:AA:BB:CC:DD:EE:FF> [--seconds N]\n       directhci-ble [--controller ID] inspect <address>\n       directhci-ble [--controller ID] read <address> <16-or-128-bit-uuid>\n       directhci-ble [--controller ID] write <address> <uuid> <hex> [--without-response]\n       directhci-ble [--controller ID] subscribe <address> <uuid> [--indications] [--seconds N]"
+    "usage: directhci-ble [--controller ID] scan [--seconds N]\n       directhci-ble [--controller ID] connect <public|random:AA:BB:CC:DD:EE:FF> [--seconds N]\n       directhci-ble [--controller ID] inspect <address>\n       directhci-ble [--controller ID] read <address> <16-or-128-bit-uuid>\n       directhci-ble [--controller ID] write <address> <uuid> <hex> [--without-response]\n       directhci-ble [--controller ID] subscribe <address> <uuid> [--indications] [--seconds N]\n       directhci-ble [--controller ID] listen <address> <uuid> [--seconds N]\n       directhci-ble [--controller ID] listen-all <address> [--seconds N]\n       directhci-ble [--controller ID] exchange <address> <write-uuid> <hex> [--listen <uuid> | --listen-all] [--without-response] [--seconds N]"
 }
 fn option_u64(args: &[String], option: &str, default: u64) -> AppResult<u64> {
     match args.iter().position(|v| v == option) {
@@ -445,6 +670,16 @@ fn option_u64(args: &[String], option: &str, default: u64) -> AppResult<u64> {
             .ok_or_else(|| format!("{option} requires a value").into())
             .and_then(|v| v.parse().map_err(Into::into)),
         None => Ok(default),
+    }
+}
+fn option_value<'a>(args: &'a [String], option: &str) -> AppResult<Option<&'a str>> {
+    match args.iter().position(|value| value == option) {
+        Some(index) => args
+            .get(index + 1)
+            .map(String::as_str)
+            .map(Some)
+            .ok_or_else(|| format!("{option} requires a value").into()),
+        None => Ok(None),
     }
 }
 
@@ -557,6 +792,12 @@ fn local_address() -> Address {
     bytes.copy_from_slice(&now.to_le_bytes()[..6]);
     bytes[5] = (bytes[5] & 0x3f) | 0xc0;
     Address::random(bytes)
+}
+fn timestamp_millis() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
 }
 fn debug_error(error: impl std::fmt::Debug) -> Box<dyn std::error::Error + Send + Sync> {
     format!("{error:?}").into()
