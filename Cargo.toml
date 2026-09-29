@@ -1,6 +1,10 @@
 [workspace]
 members = [
     "apps/directhci",
+    "apps/directhci-ble",
+    "apps/directhcid",
+    "crates/directhci-bt-hci",
+    "crates/directhci-client",
     "crates/directhci-core",
     "crates/directhci-windows",
 ]
@@ -9,12 +13,18 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0-alpha.1"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 publish = false
 
 [workspace.dependencies]
 directhci-core = { path = "crates/directhci-core" }
+directhci-client = { path = "crates/directhci-client" }
+directhci-bt-hci = { path = "crates/directhci-bt-hci" }
 directhci-windows = { path = "crates/directhci-windows" }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 windows = "0.62.2"
+bt-hci = "0.10.1"
+embedded-io = "0.7.1"
+tokio = "1.47.1"
+trouble-host = { version = "0.8.0", default-features = false }

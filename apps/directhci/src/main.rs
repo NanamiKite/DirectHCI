@@ -1,12 +1,16 @@
 use std::process::ExitCode;
 
-use directhci_core::ControllerObservation;
+use directhci_client::DirectHciClient;
+use directhci_core::{
+    ControllerObservation, HCI_READ_LOCAL_VERSION_INFORMATION, HCI_RESET,
+    parse_local_version_information, parse_reset_response,
+};
 use directhci_windows::{
     DedicatedWinUsbProbeReport, DedicatedWinUsbProbeStatus, DedicatedWinUsbReadinessStatus,
-    DirectHciPackageReadiness, OfflineRecoveryReport, OfflineRecoveryStatus, RoundTripStatus,
-    TakeoverPreflightReport, TakeoverRoundTripReport, TemporaryRebindPlan, UsbDkApiStatus,
-    UsbDkControllerCorrelationStatus, UsbDkEnumerationStatus, UsbDkHelperStatus, UsbDkProbeReport,
-    UsbDkServiceStatus,
+    DirectHciPackageReadiness, HciInformationReport, OfflineRecoveryReport, OfflineRecoveryStatus,
+    RoundTripStatus, TakeoverPreflightReport, TakeoverRoundTripReport, TemporaryRebindPlan,
+    UsbDkApiStatus, UsbDkControllerCorrelationStatus, UsbDkEnumerationStatus, UsbDkHelperStatus,
+    UsbDkProbeReport, UsbDkServiceStatus,
 };
 
 fn main() -> ExitCode {
@@ -21,8 +25,22 @@ fn main() -> ExitCode {
 
 fn run(arguments: Vec<String>) -> Result<(), String> {
     match arguments.as_slice() {
-        [command] if command == "controllers" => list_controllers(false),
-        [command, flag] if command == "controllers" && flag == "--json" => list_controllers(true),
+        [command] if command == "controllers" => list_controllers(false, false),
+        [command, flag] if command == "controllers" && flag == "--json" => {
+            list_controllers(true, false)
+        }
+        [command, flag] if command == "controllers" && flag == "--direct" => {
+            list_controllers(false, true)
+        }
+        [command, first, second]
+            if command == "controllers"
+                && ((first == "--direct" && second == "--json")
+                    || (first == "--json" && second == "--direct")) =>
+        {
+            list_controllers(true, true)
+        }
+        [command] if command == "status" => runtime_status(false),
+        [command, flag] if command == "status" && flag == "--json" => runtime_status(true),
         [group, command, id] if group == "controller" && command == "show" => {
             show_controller(id, false)
         }
@@ -54,6 +72,29 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
         {
             takeover_roundtrip(id, true)
         }
+        [group, command, id, flag]
+            if group == "takeover" && command == "hci-info" && flag == "--execute" =>
+        {
+            takeover_hci_info(id, false)
+        }
+        [group, command, id, execute, json]
+            if group == "takeover"
+                && command == "hci-info"
+                && ((execute == "--execute" && json == "--json")
+                    || (execute == "--json" && json == "--execute")) =>
+        {
+            takeover_hci_info(id, true)
+        }
+        [command, id, flag] if command == "hci-info" && flag == "--execute" => {
+            runtime_hci_info(id, false)
+        }
+        [command, id, execute, json]
+            if command == "hci-info"
+                && ((execute == "--execute" && json == "--json")
+                    || (execute == "--json" && json == "--execute")) =>
+        {
+            runtime_hci_info(id, true)
+        }
         [command, flag] if command == "recover" && flag == "--offline" => recover_offline(false),
         [command, offline, json]
             if command == "recover" && offline == "--offline" && json == "--json" =>
@@ -76,8 +117,14 @@ fn run(arguments: Vec<String>) -> Result<(), String> {
     }
 }
 
-fn list_controllers(json: bool) -> Result<(), String> {
-    let controllers = enumerate()?;
+fn list_controllers(json: bool, direct: bool) -> Result<(), String> {
+    let controllers = if direct {
+        enumerate()?
+    } else {
+        runtime_client()?
+            .list_controllers()
+            .map_err(|error| error.to_string())?
+    };
     if json {
         println!(
             "{}",
@@ -105,6 +152,89 @@ fn list_controllers(json: bool) -> Result<(), String> {
                 .unwrap_or("unknown"),
             description(&controller),
         );
+    }
+    Ok(())
+}
+
+fn runtime_client() -> Result<DirectHciClient, String> {
+    DirectHciClient::connect("directhci-cli", Some(env!("CARGO_PKG_VERSION").into()))
+        .map_err(|error| format!("connect to directhcid: {error}"))
+}
+
+fn runtime_status(json: bool) -> Result<(), String> {
+    let status = runtime_client()?
+        .runtime_status()
+        .map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("DirectHCI Runtime {}", status.runtime_version);
+        println!("  recovery required: {}", yes_no(status.recovery_required));
+        if let Some(message) = &status.recovery_message {
+            println!("  recovery message:  {message}");
+        }
+        match &status.active_session {
+            Some(session) => println!(
+                "  active session:    {} client={} controller={}",
+                session.session_id, session.client_name, session.controller_id
+            ),
+            None => println!("  active session:    none"),
+        }
+        for controller in &status.controllers {
+            println!("  {}: {:?}", controller.controller.id, controller.state);
+        }
+    }
+    Ok(())
+}
+
+fn runtime_hci_info(id: &str, json: bool) -> Result<(), String> {
+    let client = runtime_client()?;
+    let mut session = client
+        .acquire_raw_hci(id)
+        .map_err(|error| error.to_string())?;
+    let reset = session
+        .send_command(HCI_RESET, &[])
+        .map_err(|error| error.to_string())?;
+    let reset_status = parse_reset_response(&reset).map_err(|error| error.to_string())?;
+    let version_response = session
+        .send_command(HCI_READ_LOCAL_VERSION_INFORMATION, &[])
+        .map_err(|error| error.to_string())?;
+    let version =
+        parse_local_version_information(&version_response).map_err(|error| error.to_string())?;
+    let session_id = session.session_id();
+    let controller = session.controller().clone();
+    let transport = session.transport().clone();
+    let restored = session.release().map_err(|error| error.to_string())?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "session_id": session_id,
+                "controller": controller,
+                "transport": transport,
+                "hci": { "reset_status": reset_status, "local_version": version },
+                "restore": { "windows_owned": true, "controller": restored },
+            }))
+            .map_err(|error| error.to_string())?
+        );
+    } else {
+        println!("DirectHCI runtime HCI information");
+        println!("  session:        {session_id}");
+        println!("  controller:     {}", controller.id);
+        println!("  reset status:   {reset_status:#04x}");
+        println!("  HCI version:    {:#04x}", version.hci_version);
+        println!("  HCI revision:   {:#06x}", version.hci_revision);
+        println!("  manufacturer:   {:#06x}", version.manufacturer_name);
+        println!("  LMP version:    {:#04x}", version.lmp_pal_version);
+        println!("  LMP subversion: {:#06x}", version.lmp_pal_subversion);
+        println!(
+            "  transport:      event=0x{:02X} ACL_IN=0x{:02X} ACL_OUT=0x{:02X}",
+            transport.event_pipe, transport.acl_in_pipe, transport.acl_out_pipe
+        );
+        println!("  restore:        WindowsOwned");
     }
     Ok(())
 }
@@ -220,6 +350,31 @@ fn takeover_roundtrip(id: &str, json: bool) -> Result<(), String> {
         RoundTripStatus::Refused => Err("takeover was refused before any driver mutation".into()),
         RoundTripStatus::RecoveryRequired => Err(
             "takeover recovery is required; run `directhci recover --offline` as administrator"
+                .into(),
+        ),
+    }
+}
+
+fn takeover_hci_info(id: &str, json: bool) -> Result<(), String> {
+    let report = directhci_windows::execute_takeover_hci_info(id);
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|error| error.to_string())?
+        );
+    } else {
+        print_hci_information_report(&report);
+    }
+    match report.takeover.status {
+        RoundTripStatus::Completed => Ok(()),
+        RoundTripStatus::FailedButWindowsRestored => {
+            Err("Raw HCI bring-up failed, but Windows Bluetooth was restored".into())
+        }
+        RoundTripStatus::Refused => {
+            Err("HCI takeover was refused before any driver mutation".into())
+        }
+        RoundTripStatus::RecoveryRequired => Err(
+            "HCI takeover recovery is required; run `directhci recover --offline` as administrator"
                 .into(),
         ),
     }
@@ -410,6 +565,83 @@ fn print_roundtrip_report(report: &TakeoverRoundTripReport) {
     if let Some(error) = &report.recovery_error {
         println!("  recovery error: {error}");
     }
+}
+
+fn print_hci_information_report(report: &HciInformationReport) {
+    println!("DirectHCI Raw HCI information session");
+    print_roundtrip_report(&report.takeover);
+    let Some(hci) = &report.hci else {
+        println!("HCI: not started");
+        return;
+    };
+    println!("HCI");
+    if let Some(transport) = &hci.transport {
+        println!(
+            "  transport: interface={} alt={} event=0x{:02X} ACL_IN=0x{:02X} ACL_OUT=0x{:02X}",
+            transport.interface_number,
+            transport.alternate_setting,
+            transport.event_pipe,
+            transport.acl_in_pipe,
+            transport.acl_out_pipe,
+        );
+    }
+    println!(
+        "  receive workers: event={} ACL={}",
+        yes_no(hci.event_rx_started),
+        yes_no(hci.acl_rx_started)
+    );
+    match hci.reset_status {
+        Some(status) => println!("  Reset: status=0x{status:02X}"),
+        None => println!("  Reset: not completed"),
+    }
+    if let Some(version) = &hci.local_version {
+        println!(
+            "  Local Version: HCI=0x{:02X} revision=0x{:04X} LMP/PAL=0x{:02X} manufacturer=0x{:04X} subversion=0x{:04X}",
+            version.hci_version,
+            version.hci_revision,
+            version.lmp_pal_version,
+            version.manufacturer_name,
+            version.lmp_pal_subversion,
+        );
+    }
+    if let Some(commands) = &hci.local_supported_commands {
+        println!("  Supported Commands: {} bytes", commands.commands.len());
+    }
+    if let Some(features) = &hci.local_supported_features {
+        println!("  Supported Features: {}", hex_bytes(&features.features));
+    }
+    if let Some(buffer) = &hci.buffer_size {
+        println!(
+            "  Buffer Size: ACL length={} packets={} synchronous length={} packets={}",
+            buffer.acl_data_packet_length,
+            buffer.total_num_acl_data_packets,
+            buffer.synchronous_data_packet_length,
+            buffer.total_num_synchronous_data_packets,
+        );
+    }
+    if let Some(shutdown) = &hci.shutdown {
+        println!(
+            "  shutdown: event_joined={} ACL_joined={} handles_released={} cancellation_errors={}",
+            yes_no(shutdown.event_rx_joined),
+            yes_no(shutdown.acl_rx_joined),
+            yes_no(shutdown.handles_released),
+            shutdown.cancellation_errors.len(),
+        );
+        for error in &shutdown.cancellation_errors {
+            println!("    - {error}");
+        }
+    }
+    if let Some(error) = &hci.error {
+        println!("  HCI error: {error}");
+    }
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn print_offline_recovery_report(report: &OfflineRecoveryReport) {
@@ -663,12 +895,16 @@ fn print_help() {
     println!(
         "DirectHCI read-only controller diagnostics\n\n\
          Usage:\n  \
-           directhci controllers [--json]\n  \
+           directhci controllers [--json] [--direct]\n  \
+           directhci status [--json]\n  \
            directhci controller show <id> [--json]\n  \
            directhci doctor [--json]\n  \
            directhci takeover plan <id> [--json]\n  \
            directhci takeover roundtrip <id> --execute [--json]\n  \
+           directhci takeover hci-info <id> --execute [--json]\n  \
+           directhci hci-info <id> --execute [--json]\n  \
            directhci recover --offline [--json]\n\n\
-         Only `takeover roundtrip ... --execute` changes driver/ownership state."
+         Normal controller/HCI commands use directhcid. `--direct`, takeover, and\n  \
+         offline recovery are explicit development/recovery paths."
     );
 }

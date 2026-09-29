@@ -7,12 +7,19 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use directhci_core::{
-    ControllerIdentity, ControllerObservation, DriverObservation, DriverPackageIdentity, LeaseId,
-    LeaseOwnerMetadata, OwnershipJournal, OwnershipPhase,
+    ControllerBufferSize, ControllerIdentity, ControllerObservation, DriverObservation,
+    DriverPackageIdentity, HCI_READ_BUFFER_SIZE, HCI_READ_LOCAL_SUPPORTED_COMMANDS,
+    HCI_READ_LOCAL_SUPPORTED_FEATURES, HCI_READ_LOCAL_VERSION_INFORMATION, HCI_RESET, LeaseId,
+    LeaseOwnerMetadata, LocalSupportedCommands, LocalSupportedFeatures, LocalVersionInformation,
+    OwnershipJournal, OwnershipPhase, parse_controller_buffer_size, parse_local_supported_commands,
+    parse_local_supported_features, parse_local_version_information, parse_reset_response,
 };
 use serde::Serialize;
 
 use crate::journal::unix_time_ms;
+use crate::raw_hci::{
+    RawHciSession, RawHciSessionOptions, RawHciShutdownReport, RawHciTransportSummary,
+};
 use crate::rebind::{
     CompatibleDriverObservation, DirectHciPackageReadiness, DirectHciWinUsbPackageSpec,
     DriverInstallOutcome, RebindSafetyPrerequisites, TemporaryRebindPlan,
@@ -82,6 +89,101 @@ pub struct TakeoverRoundTripReport {
     pub final_state: Option<ControllerObservation>,
     pub primary_error: Option<String>,
     pub recovery_error: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct HciInformationReport {
+    pub takeover: TakeoverRoundTripReport,
+    pub hci: Option<HciBringUpReport>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct HciBringUpReport {
+    pub transport: Option<RawHciTransportSummary>,
+    pub event_rx_started: bool,
+    pub acl_rx_started: bool,
+    pub reset_status: Option<u8>,
+    pub local_version: Option<LocalVersionInformation>,
+    pub local_supported_commands: Option<LocalSupportedCommands>,
+    pub local_supported_features: Option<LocalSupportedFeatures>,
+    pub buffer_size: Option<ControllerBufferSize>,
+    pub shutdown: Option<RawHciShutdownReport>,
+    pub error: Option<String>,
+}
+
+/// A live temporary-takeover session intended to be owned by `directhcid`.
+/// Dropping it is a recovery fallback; callers should use `release` and check
+/// the resulting report.
+pub struct RuntimeControllerSession {
+    report: TakeoverRoundTripReport,
+    store: JournalStore,
+    journal: OwnershipJournal,
+    raw_hci: Option<RawHciSession>,
+}
+
+impl RuntimeControllerSession {
+    pub fn controller(&self) -> &ControllerObservation {
+        self.report
+            .directhci_state
+            .as_ref()
+            .expect("a live runtime session has a DirectHCI observation")
+    }
+
+    pub fn raw_hci(&self) -> &RawHciSession {
+        self.raw_hci
+            .as_ref()
+            .expect("a live runtime session has RawHciSession")
+    }
+
+    pub fn release(mut self) -> TakeoverRoundTripReport {
+        self.release_inner()
+    }
+
+    fn release_inner(&mut self) -> TakeoverRoundTripReport {
+        let Some(mut raw_hci) = self.raw_hci.take() else {
+            return self.report.clone();
+        };
+        let shutdown = raw_hci.shutdown();
+        drop(raw_hci);
+        if !shutdown.event_rx_joined
+            || !shutdown.acl_rx_joined
+            || !shutdown.handles_released
+            || !shutdown.cancellation_errors.is_empty()
+        {
+            self.report.primary_error = Some(format!(
+                "RawHciSession shutdown was not clean: {:?}",
+                shutdown.cancellation_errors
+            ));
+        }
+        match restore_windows(&self.store, &mut self.journal) {
+            Ok(restored) => {
+                self.report.restore = Some(restored.install);
+                self.report.final_state = Some(restored.final_state);
+                self.report.journal_cleared = true;
+                self.report.journal_retained = false;
+                self.report.status = if self.report.primary_error.is_some() {
+                    RoundTripStatus::FailedButWindowsRestored
+                } else {
+                    RoundTripStatus::Completed
+                };
+            }
+            Err(failure) => {
+                self.report.restore = failure.install;
+                self.report.final_state = failure.final_state;
+                self.report.recovery_error = Some(failure.message);
+                self.report.status = RoundTripStatus::RecoveryRequired;
+            }
+        }
+        self.report.clone()
+    }
+}
+
+impl Drop for RuntimeControllerSession {
+    fn drop(&mut self) {
+        if self.raw_hci.is_some() {
+            let _ = self.release_inner();
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -198,6 +300,25 @@ pub fn plan_takeover(controller_id: &str) -> TakeoverPreflightReport {
 }
 
 pub fn execute_takeover_roundtrip(controller_id: &str) -> TakeoverRoundTripReport {
+    execute_takeover_operation(controller_id, "directhci takeover roundtrip", |_| {
+        ((), Ok(()))
+    })
+    .0
+}
+
+pub fn execute_takeover_hci_info(controller_id: &str) -> HciInformationReport {
+    let (takeover, hci) = execute_takeover_operation(
+        controller_id,
+        "directhci takeover hci-info",
+        run_hci_bring_up,
+    );
+    HciInformationReport { takeover, hci }
+}
+
+pub fn acquire_runtime_controller_session(
+    controller_id: &str,
+    client_label: &str,
+) -> Result<RuntimeControllerSession, TakeoverRoundTripReport> {
     let preflight = plan_takeover(controller_id);
     let mut report = TakeoverRoundTripReport {
         status: RoundTripStatus::Refused,
@@ -216,32 +337,192 @@ pub fn execute_takeover_roundtrip(controller_id: &str) -> TakeoverRoundTripRepor
     };
     if !report.preflight.safe_to_execute {
         report.primary_error = Some("takeover preflight refused execution".into());
-        return report;
+        return Err(report);
     }
-
     let Some(pre_state) = report.pre_state.clone() else {
         report.primary_error = Some("preflight did not produce a controller observation".into());
-        return report;
+        return Err(report);
     };
     let direct_candidate = match &report.preflight.rebind.directhci_package {
         DirectHciPackageReadiness::Ready { candidate, .. } => candidate.clone(),
         _ => {
             report.primary_error = Some("DirectHCI package is not uniquely ready".into());
-            return report;
+            return Err(report);
         }
     };
     let store = match JournalStore::program_data() {
         Ok(store) => store,
         Err(error) => {
             report.primary_error = Some(error.to_string());
-            return report;
+            return Err(report);
         }
     };
     let now = match unix_time_ms() {
         Ok(now) => now,
         Err(error) => {
             report.primary_error = Some(error.to_string());
-            return report;
+            return Err(report);
+        }
+    };
+    let lease_id = LeaseId::new(format!(
+        "m3-{}-{}-{}",
+        now,
+        std::process::id(),
+        pre_state.id
+    ))
+    .expect("generated lease ID is non-empty");
+    let mut journal = OwnershipJournal::new(
+        lease_id,
+        pre_state.identity.clone(),
+        pre_state.clone(),
+        DriverPackageIdentity {
+            provider: direct_candidate.provider.clone(),
+            description: direct_candidate.description.clone(),
+            published_inf: Some(direct_candidate.inf_path.clone()),
+            version: Some(direct_candidate.version.clone()),
+            device_interface_guid: DirectHciWinUsbPackageSpec::ax201_development()
+                .device_interface_guid,
+        },
+        now,
+        now,
+        LeaseOwnerMetadata {
+            process_id: Some(std::process::id()),
+            session_id: None,
+            client_label: Some(client_label.into()),
+        },
+    );
+    if let Err(error) = store.create(&journal) {
+        report.primary_error = Some(format!("persist AcquirePrepared journal: {error}"));
+        return Err(report);
+    }
+    report.journal_created = true;
+    report.journal_retained = true;
+
+    if let Err(error) = validate_pre_rebind(&journal, &direct_candidate) {
+        report.primary_error = Some(format!("final pre-rebind validation failed: {error}"));
+        return Err(cancel_before_rebind(report, journal, &store));
+    }
+    if let Err(error) = persist_phase(&store, &mut journal, OwnershipPhase::RebindingToDirectHci) {
+        report.primary_error = Some(error);
+        return Err(cancel_before_rebind(report, journal, &store));
+    }
+    match install_driver_for_controller(&journal.controller_identity, &direct_candidate) {
+        Ok(outcome) => {
+            report.rebind = Some(successful_step(&outcome));
+            if outcome.need_reboot {
+                report.primary_error =
+                    Some("DirectHCI rebind requires reboot; runtime session was not opened".into());
+                mark_recovery_required(&store, &mut journal, &mut report.recovery_error);
+                report.status = RoundTripStatus::RecoveryRequired;
+                return Err(report);
+            }
+        }
+        Err(error) => {
+            report.rebind = Some(failed_step(direct_candidate, &error));
+            report.primary_error = Some(error);
+            return Err(recover_after_primary_failure(report, journal, &store));
+        }
+    }
+    let direct_state = match wait_for_controller(&journal.controller_identity, |controller| {
+        is_directhci_ready(controller, &journal.directhci_driver_package)
+    }) {
+        Ok(controller) => controller,
+        Err(error) => {
+            report.primary_error = Some(format!("post-rebind observation failed: {error}"));
+            return Err(recover_after_primary_failure(report, journal, &store));
+        }
+    };
+    report.directhci_state = Some(direct_state.clone());
+    if let Err(error) = persist_phase(&store, &mut journal, OwnershipPhase::DirectHciReady) {
+        report.primary_error = Some(error);
+        return Err(recover_after_primary_failure(report, journal, &store));
+    }
+    let readiness = match probe_winusb_controller(direct_state.id.as_str()) {
+        Ok(readiness) if matches!(readiness.status, DedicatedWinUsbReadinessStatus::Ready) => {
+            readiness
+        }
+        Ok(readiness) => {
+            report.winusb_readiness = Some(readiness);
+            report.primary_error = Some("WinUSB readiness did not reach Ready".into());
+            return Err(recover_after_primary_failure(report, journal, &store));
+        }
+        Err(error) => {
+            report.primary_error = Some(format!("WinUSB readiness probe failed: {error}"));
+            return Err(recover_after_primary_failure(report, journal, &store));
+        }
+    };
+    report.winusb_readiness = Some(readiness.clone());
+    if let Err(error) = persist_phase(&store, &mut journal, OwnershipPhase::DirectHciOwned) {
+        report.primary_error = Some(error);
+        return Err(recover_after_primary_failure(report, journal, &store));
+    }
+    let raw_hci = match RawHciSession::open(&readiness, RawHciSessionOptions::default()) {
+        Ok(session) => session,
+        Err(error) => {
+            report.primary_error = Some(format!("open RawHciSession: {error}"));
+            return Err(recover_after_primary_failure(report, journal, &store));
+        }
+    };
+    Ok(RuntimeControllerSession {
+        report,
+        store,
+        journal,
+        raw_hci: Some(raw_hci),
+    })
+}
+
+fn execute_takeover_operation<T, F>(
+    controller_id: &str,
+    client_label: &str,
+    action: F,
+) -> (TakeoverRoundTripReport, Option<T>)
+where
+    F: FnOnce(&DedicatedWinUsbControllerReadiness) -> (T, Result<(), String>),
+{
+    let preflight = plan_takeover(controller_id);
+    let mut report = TakeoverRoundTripReport {
+        status: RoundTripStatus::Refused,
+        pre_state: preflight.rebind.controller.clone(),
+        preflight,
+        journal_created: false,
+        journal_cleared: false,
+        journal_retained: false,
+        rebind: None,
+        directhci_state: None,
+        winusb_readiness: None,
+        restore: None,
+        final_state: None,
+        primary_error: None,
+        recovery_error: None,
+    };
+    if !report.preflight.safe_to_execute {
+        report.primary_error = Some("takeover preflight refused execution".into());
+        return (report, None);
+    }
+
+    let Some(pre_state) = report.pre_state.clone() else {
+        report.primary_error = Some("preflight did not produce a controller observation".into());
+        return (report, None);
+    };
+    let direct_candidate = match &report.preflight.rebind.directhci_package {
+        DirectHciPackageReadiness::Ready { candidate, .. } => candidate.clone(),
+        _ => {
+            report.primary_error = Some("DirectHCI package is not uniquely ready".into());
+            return (report, None);
+        }
+    };
+    let store = match JournalStore::program_data() {
+        Ok(store) => store,
+        Err(error) => {
+            report.primary_error = Some(error.to_string());
+            return (report, None);
+        }
+    };
+    let now = match unix_time_ms() {
+        Ok(now) => now,
+        Err(error) => {
+            report.primary_error = Some(error.to_string());
+            return (report, None);
         }
     };
     let lease_id = LeaseId::new(format!(
@@ -268,24 +549,24 @@ pub fn execute_takeover_roundtrip(controller_id: &str) -> TakeoverRoundTripRepor
         LeaseOwnerMetadata {
             process_id: Some(std::process::id()),
             session_id: None,
-            client_label: Some("directhci takeover roundtrip".into()),
+            client_label: Some(client_label.into()),
         },
     );
     if let Err(error) = store.create(&journal) {
         report.primary_error = Some(format!("persist AcquirePrepared journal: {error}"));
-        return report;
+        return (report, None);
     }
     report.journal_created = true;
     report.journal_retained = true;
 
     if let Err(error) = validate_pre_rebind(&journal, &direct_candidate) {
         report.primary_error = Some(format!("final pre-rebind validation failed: {error}"));
-        return cancel_before_rebind(report, journal, &store);
+        return (cancel_before_rebind(report, journal, &store), None);
     }
 
     if let Err(error) = persist_phase(&store, &mut journal, OwnershipPhase::RebindingToDirectHci) {
         report.primary_error = Some(error);
-        return cancel_before_rebind(report, journal, &store);
+        return (cancel_before_rebind(report, journal, &store), None);
     }
 
     match install_driver_for_controller(&journal.controller_identity, &direct_candidate) {
@@ -298,13 +579,13 @@ pub fn execute_takeover_roundtrip(controller_id: &str) -> TakeoverRoundTripRepor
                 );
                 mark_recovery_required(&store, &mut journal, &mut report.recovery_error);
                 report.status = RoundTripStatus::RecoveryRequired;
-                return report;
+                return (report, None);
             }
         }
         Err(error) => {
             report.rebind = Some(failed_step(direct_candidate, &error));
             report.primary_error = Some(error);
-            return recover_after_primary_failure(report, journal, &store);
+            return (recover_after_primary_failure(report, journal, &store), None);
         }
     }
 
@@ -314,33 +595,43 @@ pub fn execute_takeover_roundtrip(controller_id: &str) -> TakeoverRoundTripRepor
         Ok(controller) => controller,
         Err(error) => {
             report.primary_error = Some(format!("post-rebind observation failed: {error}"));
-            return recover_after_primary_failure(report, journal, &store);
+            return (recover_after_primary_failure(report, journal, &store), None);
         }
     };
     report.directhci_state = Some(direct_state.clone());
     if let Err(error) = persist_phase(&store, &mut journal, OwnershipPhase::DirectHciReady) {
         report.primary_error = Some(error);
-        return recover_after_primary_failure(report, journal, &store);
+        return (recover_after_primary_failure(report, journal, &store), None);
     }
 
-    match probe_winusb_controller(direct_state.id.as_str()) {
+    let readiness = match probe_winusb_controller(direct_state.id.as_str()) {
         Ok(readiness) => {
             let ready = matches!(readiness.status, DedicatedWinUsbReadinessStatus::Ready);
-            report.winusb_readiness = Some(readiness);
+            report.winusb_readiness = Some(readiness.clone());
             if !ready {
                 report.primary_error = Some("WinUSB readiness did not reach Ready".into());
-                return recover_after_primary_failure(report, journal, &store);
+                return (recover_after_primary_failure(report, journal, &store), None);
             }
+            readiness
         }
         Err(error) => {
             report.primary_error = Some(format!("WinUSB readiness probe failed: {error}"));
-            return recover_after_primary_failure(report, journal, &store);
+            return (recover_after_primary_failure(report, journal, &store), None);
         }
-    }
+    };
 
     if let Err(error) = persist_phase(&store, &mut journal, OwnershipPhase::DirectHciOwned) {
         report.primary_error = Some(error);
-        return recover_after_primary_failure(report, journal, &store);
+        return (recover_after_primary_failure(report, journal, &store), None);
+    }
+
+    let (action_output, action_result) = action(&readiness);
+    if let Err(error) = action_result {
+        report.primary_error = Some(error);
+        return (
+            recover_after_primary_failure(report, journal, &store),
+            Some(action_output),
+        );
     }
 
     match restore_windows(&store, &mut journal) {
@@ -358,7 +649,86 @@ pub fn execute_takeover_roundtrip(controller_id: &str) -> TakeoverRoundTripRepor
             report.status = RoundTripStatus::RecoveryRequired;
         }
     }
-    report
+    (report, Some(action_output))
+}
+
+fn run_hci_bring_up(
+    readiness: &DedicatedWinUsbControllerReadiness,
+) -> (HciBringUpReport, Result<(), String>) {
+    let mut report = HciBringUpReport::default();
+    let mut session = match RawHciSession::open(readiness, RawHciSessionOptions::default()) {
+        Ok(session) => session,
+        Err(error) => {
+            let message = format!("open RawHciSession: {error}");
+            report.error = Some(message.clone());
+            return (report, Err(message));
+        }
+    };
+    report.transport = Some(session.transport().clone());
+    report.event_rx_started = true;
+    report.acl_rx_started = true;
+
+    let result = (|| -> Result<(), String> {
+        let reset = session
+            .send_command(HCI_RESET, &[])
+            .map_err(|error| format!("HCI Reset transaction: {error}"))?;
+        report.reset_status = Some(
+            parse_reset_response(&reset).map_err(|error| format!("HCI Reset response: {error}"))?,
+        );
+
+        let version = session
+            .send_command(HCI_READ_LOCAL_VERSION_INFORMATION, &[])
+            .map_err(|error| format!("Read Local Version transaction: {error}"))?;
+        report.local_version = Some(
+            parse_local_version_information(&version)
+                .map_err(|error| format!("Read Local Version response: {error}"))?,
+        );
+
+        let commands = session
+            .send_command(HCI_READ_LOCAL_SUPPORTED_COMMANDS, &[])
+            .map_err(|error| format!("Read Local Supported Commands transaction: {error}"))?;
+        report.local_supported_commands = Some(
+            parse_local_supported_commands(&commands)
+                .map_err(|error| format!("Read Local Supported Commands response: {error}"))?,
+        );
+
+        let features = session
+            .send_command(HCI_READ_LOCAL_SUPPORTED_FEATURES, &[])
+            .map_err(|error| format!("Read Local Supported Features transaction: {error}"))?;
+        report.local_supported_features = Some(
+            parse_local_supported_features(&features)
+                .map_err(|error| format!("Read Local Supported Features response: {error}"))?,
+        );
+
+        let buffer_size = session
+            .send_command(HCI_READ_BUFFER_SIZE, &[])
+            .map_err(|error| format!("Read Buffer Size transaction: {error}"))?;
+        report.buffer_size = Some(
+            parse_controller_buffer_size(&buffer_size)
+                .map_err(|error| format!("Read Buffer Size response: {error}"))?,
+        );
+        Ok(())
+    })();
+
+    let shutdown = session.shutdown();
+    let clean_shutdown = shutdown.event_rx_joined
+        && shutdown.acl_rx_joined
+        && shutdown.handles_released
+        && shutdown.cancellation_errors.is_empty();
+    report.shutdown = Some(shutdown);
+
+    let result = match (result, clean_shutdown) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err("RawHciSession shutdown did not complete cleanly".into()),
+        (Err(primary), true) => Err(primary),
+        (Err(primary), false) => Err(format!(
+            "{primary}; RawHciSession shutdown also did not complete cleanly"
+        )),
+    };
+    if let Err(error) = &result {
+        report.error = Some(error.clone());
+    }
+    (report, result)
 }
 
 pub fn recover_offline() -> OfflineRecoveryReport {

@@ -1,12 +1,13 @@
 [package]
-name = "directhci"
+name = "directhci-bt-hci"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+bt-hci.workspace = true
 directhci-client.workspace = true
 directhci-core.workspace = true
-directhci-windows.workspace = true
-serde_json.workspace = true
+embedded-io.workspace = true
+tokio = { workspace = true, features = ["sync"] }

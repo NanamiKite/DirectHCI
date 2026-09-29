@@ -24,12 +24,18 @@ impl std::error::Error for Error {}
 #[cfg(windows)]
 mod enumeration;
 mod journal;
+mod raw_hci;
 mod rebind;
 mod takeover;
 mod usbdk;
 mod winusb;
 
 pub use journal::{JournalError, JournalLoad, JournalStore};
+pub use raw_hci::{
+    DEFAULT_COMMAND_TIMEOUT, HciTraceCallback, HciTraceDirection, HciTracePacketType,
+    HciTraceRecord, RawHciError, RawHciSession, RawHciSessionOptions, RawHciShutdownReport,
+    RawHciTransportSummary,
+};
 pub use rebind::{
     CompatibleDriverObservation, DIRECTHCI_WINUSB_INTERFACE_GUID, DirectHciDefaultSelectionRisk,
     DirectHciPackageReadiness, DirectHciWinUsbPackageSpec, DriverInstallOutcome,
@@ -37,9 +43,10 @@ pub use rebind::{
     plan_temporary_winusb_rebind,
 };
 pub use takeover::{
-    DriverInstallStep, OfflineRecoveryReport, OfflineRecoveryStatus, PreflightJournalStatus,
-    RoundTripStatus, TakeoverPreflightReport, TakeoverRoundTripReport, execute_takeover_roundtrip,
-    plan_takeover, recover_offline,
+    DriverInstallStep, HciBringUpReport, HciInformationReport, OfflineRecoveryReport,
+    OfflineRecoveryStatus, PreflightJournalStatus, RoundTripStatus, RuntimeControllerSession,
+    TakeoverPreflightReport, TakeoverRoundTripReport, acquire_runtime_controller_session,
+    execute_takeover_hci_info, execute_takeover_roundtrip, plan_takeover, recover_offline,
 };
 pub use usbdk::{
     UsbDkAmbiguityReason, UsbDkApiStatus, UsbDkControllerCorrelation,

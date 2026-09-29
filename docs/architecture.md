@@ -111,9 +111,11 @@ next action. See [`temporary-rebind.md`](temporary-rebind.md).
 
 ## Runtime and client boundary
 
-The development CLI currently calls the Windows backend directly, including
-the explicitly destructive `takeover roundtrip --execute` command. That is a
-temporary implementation shape, not the product ownership boundary.
+`directhcid` is now the product ownership boundary. Normal controller queries
+and Raw HCI sessions use the versioned local named-pipe protocol through
+`directhci-client`. Explicit development takeover commands and offline
+recovery remain direct library entry points so recovery does not depend on a
+healthy runtime service.
 
 ```text
 CLI / Client SDK / Consumer / optional Control Panel
@@ -125,12 +127,20 @@ CLI / Client SDK / Consumer / optional Control Panel
           controller session and backend
 ```
 
-The future runtime owns controller handles, leases, and I/O workers. A GUI or
-CLI process exiting must not implicitly decide controller ownership. A future
-Control Panel only needs to query controllers, enrolled mode, backend,
-ownership/status, health, active consumer, and recovery state.
+The runtime owns the temporary takeover object, `RawHciSession`, WinUSB
+handles, and I/O workers. One client connection may own the single active
+writer session. A broken owning pipe, explicit release, console shutdown, or
+SCM stop closes Raw HCI before restoring Windows ownership. On startup, the
+runtime reconciles an unresolved M1 journal before accepting acquisition.
+
+The v1 pipe is byte-framed and bounded. Control messages use small JSON
+payloads; HCI Command/Event and ACL payloads stay binary. Authenticated local
+users may query diagnostics, while administrator group membership is required
+for acquire and Raw HCI operations. No network listener is created.
+
+A future Control Panel is only another `directhci-client` consumer. It does
+not own the controller lifecycle.
 
 Windows PnP and WinUSB APIs remain outside `directhci-core`. Vendor-specific
 code must not enter controller identity or generic USB transport. This
-direction does not authorize implementing service, IPC, or GUI in the current
-milestone.
+boundary remains independent of any future GUI or Bluetooth Host Stack.

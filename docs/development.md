@@ -36,3 +36,24 @@ The development command `takeover roundtrip <id> --execute` and
 elevated terminal. Follow [temporary-rebind.md](temporary-rebind.md) and
 [windows-test-plan.md](windows-test-plan.md); never add `/install` to the
 manual `pnputil /add-driver` staging command.
+
+## M3 runtime
+
+Run the development console host from an elevated Windows terminal:
+
+```powershell
+directhcid run
+```
+
+Normal product-path commands connect to `\\.\pipe\DirectHCI\v1`:
+
+```powershell
+directhci status
+directhci controllers
+directhci hci-info <controller-id> --execute
+```
+
+`directhcid install-service` registers the current executable as the manual
+start `DirectHCI` Windows service. It does not stage the WinUSB package or
+modify controller drivers. `controllers --direct`, `takeover ... --execute`,
+and `recover --offline` remain explicit development/disaster-recovery paths.
