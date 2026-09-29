@@ -1,21 +1,14 @@
 [package]
-name = "directhci-ble"
+name = "directhci-ble-cli"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
-bt-hci.workspace = true
-critical-section = { version = "1", features = ["std"] }
-directhci-bt-hci.workspace = true
-directhci-client.workspace = true
-embassy-time = { version = "0.5.0", features = ["std", "generic-queue-8"] }
+directhci-ble.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
-trouble-host = { workspace = true, default-features = false, features = [
-    "central",
-    "gatt",
-    "scan",
-    "default-packet-pool",
-    "default-packet-pool-mtu-251",
-] }
+
+[[bin]]
+name = "directhci-ble"
+path = "src/main.rs"

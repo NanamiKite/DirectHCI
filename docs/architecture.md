@@ -144,3 +144,43 @@ not own the controller lifecycle.
 Windows PnP and WinUSB APIs remain outside `directhci-core`. Vendor-specific
 code must not enter controller identity or generic USB transport. This
 boundary remains independent of any future GUI or Bluetooth Host Stack.
+
+## Reusable BLE Central boundary
+
+The `directhci-ble` library is the generic Rust BLE Central/GATT consumer
+layer. It owns the DirectHCI client session, the `directhci-bt-hci` adapter,
+the TrouBLE runner and GATT task, and an active BLE connection. Its public API
+returns structured advertisements, discovered GATT attributes, raw
+characteristic values, and notification/indication events.
+
+```text
+Rust consumer
+    |
+directhci-ble                 generic BLE Central / GATT API
+    |
+directhci-bt-hci              bt-hci controller adapter
+    |
+directhci-client              versioned local IPC SDK
+    |
+directhcid                    privileged ownership + Raw HCI runtime
+    |
+Bluetooth controller
+```
+
+The `directhci-ble-cli` package builds the `directhci-ble` executable. It is
+only a command-line frontend: argument parsing, operation selection, and human
+readable formatting remain there. It does not construct a TrouBLE stack or own
+Raw HCI directly.
+
+Standard subscription and passive listening remain separate public
+operations. Subscription writes a discovered CCCD; passive `listen` and
+`listen_all` only observe unsolicited values. A notification stream can
+remain active while the same `BleConnection` performs writes, which lets an
+application compose listener-ready, write, and receive sequences without a
+device-specific protocol in this crate.
+
+`BleConnection::disconnect` and `DirectHciBleCentral::shutdown` are the
+normal awaited teardown paths. Dropping either object only requests
+best-effort shutdown; it is not the primary recovery mechanism. The worker
+owns all TrouBLE borrows and stops its GATT task and connection before
+releasing the DirectHCI Raw HCI session.

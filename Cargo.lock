@@ -78,6 +78,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "directhci-ble-cli"
+version = "0.1.0-alpha.1"
+dependencies = [
+ "directhci-ble",
+ "tokio",
+]
+
+[[package]]
 name = "directhci-bt-hci"
 version = "0.1.0-alpha.1"
 dependencies = [
