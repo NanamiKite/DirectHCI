@@ -91,6 +91,15 @@ impl DirectHciRuntime {
         directhci_windows::enumerate_controllers().map_err(|error| error.to_string())
     }
 
+    pub fn owns_connection(&self, connection_id: u64) -> bool {
+        self.state.lock().ok().is_some_and(|state| {
+            state
+                .active
+                .as_ref()
+                .is_some_and(|active| active.owner_connection == connection_id)
+        })
+    }
+
     pub fn status(&self) -> Result<RuntimeStatus, String> {
         let controllers = self.list_controllers()?;
         let state = self

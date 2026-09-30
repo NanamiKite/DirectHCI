@@ -57,3 +57,12 @@ directhci hci-info <controller-id> --execute
 start `DirectHCI` Windows service. It does not stage the WinUSB package or
 modify controller drivers. `controllers --direct`, `takeover ... --execute`,
 and `recover --offline` remain explicit development/disaster-recovery paths.
+Service installation now refuses non-fixed/remote paths, reparse points, or a
+binary/parent with untrusted owner or write access. Console `directhcid run`
+continues to work from development directories.
+
+The `%ProgramData%\DirectHCI` ownership journal directory is now accepted only
+with a protected SYSTEM/Administrators ACL and trusted owner. An older or
+pre-created directory with broader permissions is deliberately rejected; have
+an administrator inspect and repair it before takeover or offline recovery.
+DirectHCI will not silently adopt an untrusted journal directory.

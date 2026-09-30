@@ -143,6 +143,7 @@ fn set_status(current: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u
 
 fn install_service() -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    directhci_windows::validate_service_executable(&executable)?;
     let binary_path = format!("\"{}\" service", executable.display());
     let service_name = wide(SERVICE_NAME);
     let display_name = wide("DirectHCI Runtime");

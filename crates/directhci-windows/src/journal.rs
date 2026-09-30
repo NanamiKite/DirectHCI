@@ -20,18 +20,21 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct JournalStore {
     directory: PathBuf,
+    secure_program_data: bool,
 }
 
 impl JournalStore {
     pub fn program_data() -> Result<Self, JournalError> {
         platform::program_data_directory().map(|directory| Self {
             directory: directory.join("DirectHCI"),
+            secure_program_data: true,
         })
     }
 
     pub fn at_directory(directory: impl Into<PathBuf>) -> Self {
         Self {
             directory: directory.into(),
+            secure_program_data: false,
         }
     }
 
@@ -71,6 +74,7 @@ impl JournalStore {
     }
 
     pub fn load(&self) -> Result<JournalLoad, JournalError> {
+        self.validate_directory()?;
         let path = self.path();
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
@@ -84,6 +88,12 @@ impl JournalStore {
                 path,
                 message: "journal must be a regular file, not a link or special file".into(),
             });
+        }
+        if self.secure_program_data {
+            platform::reject_reparse(&path).map_err(|message| JournalError::UnsafePath {
+                path: path.clone(),
+                message,
+            })?;
         }
         if metadata.len() > MAX_JOURNAL_BYTES {
             return Err(JournalError::Corrupt {
@@ -198,7 +208,22 @@ impl JournalStore {
     /// A crash before removal merely leaves a recoverable, already-satisfied
     /// record behind.
     pub fn clear(&self) -> Result<(), JournalError> {
+        self.validate_directory()?;
         let path = self.path();
+        if self.secure_program_data {
+            match fs::symlink_metadata(&path) {
+                Ok(_) => {
+                    platform::reject_reparse(&path).map_err(|message| JournalError::UnsafePath {
+                        path: path.clone(),
+                        message,
+                    })?
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => {
+                    return Err(JournalError::io("inspect journal metadata", &path, error));
+                }
+            }
+        }
         match fs::remove_file(&path) {
             Ok(()) => platform::sync_directory(&self.directory),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -216,9 +241,33 @@ impl JournalStore {
     }
 
     fn ensure_directory(&self) -> Result<(), JournalError> {
-        fs::create_dir_all(&self.directory).map_err(|error| {
-            JournalError::io("create journal directory", &self.directory, error)
-        })?;
+        if self.secure_program_data {
+            platform::ensure_secure_directory(&self.directory).map_err(|message| {
+                JournalError::UnsafePath {
+                    path: self.directory.clone(),
+                    message,
+                }
+            })?;
+        } else {
+            fs::create_dir_all(&self.directory).map_err(|error| {
+                JournalError::io("create journal directory", &self.directory, error)
+            })?;
+        }
+        self.validate_directory()
+    }
+
+    fn validate_directory(&self) -> Result<(), JournalError> {
+        if self.secure_program_data {
+            platform::validate_secure_directory(&self.directory).map_err(|message| {
+                JournalError::UnsafePath {
+                    path: self.directory.clone(),
+                    message,
+                }
+            })?;
+        }
+        if !self.directory.exists() {
+            return Ok(());
+        }
         let metadata = fs::symlink_metadata(&self.directory).map_err(|error| {
             JournalError::io("inspect journal directory", &self.directory, error)
         })?;
@@ -362,6 +411,18 @@ mod platform {
 
     use super::*;
 
+    pub(super) fn ensure_secure_directory(path: &Path) -> Result<(), String> {
+        crate::security::ensure_secure_journal_directory(path)
+    }
+
+    pub(super) fn validate_secure_directory(path: &Path) -> Result<(), String> {
+        crate::security::validate_secure_journal_directory(path)
+    }
+
+    pub(super) fn reject_reparse(path: &Path) -> Result<(), String> {
+        crate::security::reject_reparse(path)
+    }
+
     pub(super) fn program_data_directory() -> Result<PathBuf, JournalError> {
         let raw = unsafe { SHGetKnownFolderPath(&FOLDERID_ProgramData, KF_FLAG_DEFAULT, None) }
             .map_err(|error| JournalError::Io {
@@ -436,6 +497,16 @@ mod platform {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
+
+    pub(super) fn ensure_secure_directory(_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
+    pub(super) fn validate_secure_directory(_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
+    pub(super) fn reject_reparse(_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
 
     pub(super) fn program_data_directory() -> Result<PathBuf, JournalError> {
         Err(JournalError::UnsupportedPlatform)

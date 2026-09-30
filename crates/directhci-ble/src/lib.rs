@@ -963,6 +963,9 @@ async fn connected_loop<'reference>(
     }));
 
     let mut active: Option<ActiveListener<'_>> = None;
+    // Discovery results belong to this connection only. Reuse verified value
+    // handles for later writes instead of rediscovering the full GATT table.
+    let mut discovered_services: Vec<GattService> = Vec::new();
     let mut next_listener_id = 1u64;
     let exit = loop {
         tokio::select! {
@@ -977,6 +980,7 @@ async fn connected_loop<'reference>(
                 match request {
                     WorkerRequest::Discover { reply } => {
                         eprintln!("directhci-ble worker: request discover");
+                        discovered_services.clear();
                         match drive_operation(
                             task.as_mut(),
                             &client,
@@ -987,6 +991,9 @@ async fn connected_loop<'reference>(
                         {
                             Ok(result) => {
                                 eprintln!("directhci-ble worker: discover completed: {}", if result.is_ok() { "ok" } else { "error" });
+                                if let Ok(services) = &result {
+                                    discovered_services = services.clone();
+                                }
                                 let _ = reply.send(result);
                             }
                             Err(error) => {
@@ -1031,11 +1038,14 @@ async fn connected_loop<'reference>(
                         reply,
                     } => {
                         eprintln!("directhci-ble worker: request write");
+                        let discovered_here = discovered_services.iter().any(|service| {
+                            service.characteristics.contains(&characteristic)
+                        });
                         match drive_operation(
                             task.as_mut(),
                             &client,
                             &mut active,
-                            write_value(&client, &characteristic, &value, mode),
+                            write_value(&client, &characteristic, &value, mode, discovered_here),
                         )
                         .await
                         {
@@ -1044,6 +1054,9 @@ async fn connected_loop<'reference>(
                                 let _ = reply.send(result);
                             }
                             Err(error) => {
+                                eprintln!(
+                                    "directhci-ble worker: write aborted source=gatt_task_ended error={error}"
+                                );
                                 let _ = reply.send(Err(error.clone()));
                                 break WorkerExit {
                                     primary: Some(error),
@@ -1170,11 +1183,17 @@ async fn connected_loop<'reference>(
     if let (Some(listener), Some(error)) = (active.as_ref(), exit.primary.as_ref()) {
         let _ = listener.events.try_send(Err(error.clone()));
     }
+    let shutdown_source = match &exit.primary {
+        Some(error) => format!("terminal_error:{error}"),
+        None if exit.reply.is_some() => "sdk_shutdown_request".to_owned(),
+        None => "request_channel_closed".to_owned(),
+    };
     drop(active);
     drop(task);
-    eprintln!("directhci-ble worker: disconnect requested");
+    eprintln!("directhci-ble worker: session shutdown begin source={shutdown_source}");
     connection.disconnect();
     tokio::time::sleep(DISCONNECT_SETTLE_TIME).await;
+    eprintln!("directhci-ble worker: session shutdown complete source={shutdown_source}");
     exit
 }
 
@@ -1440,18 +1459,38 @@ async fn write_value(
     characteristic: &GattCharacteristic,
     value: &[u8],
     mode: WriteMode,
+    discovered_here: bool,
 ) -> Result<(), BleError> {
     ensure_write_supported(characteristic, mode)?;
-    let resolved = resolve_characteristic(client, characteristic).await?;
-    match mode {
-        WriteMode::WithResponse => client.write_characteristic(&resolved, value).await,
-        WriteMode::WithoutResponse => {
-            client
-                .write_characteristic_without_response(&resolved, value)
-                .await
+    if discovered_here {
+        // This handle was verified by discovery on the current connection.
+        // Trouble's write_characteristic delegates to write_handle, so avoid
+        // repeating services()/characteristics() ATT discovery per write.
+        match mode {
+            WriteMode::WithResponse => {
+                client
+                    .write_handle(characteristic.value_handle, value)
+                    .await
+            }
+            WriteMode::WithoutResponse => {
+                client
+                    .write_handle_without_response(characteristic.value_handle, value)
+                    .await
+            }
         }
+        .map_err(|error| BleError::Gatt(format!("{error:?}")))
+    } else {
+        let resolved = resolve_characteristic(client, characteristic).await?;
+        match mode {
+            WriteMode::WithResponse => client.write_characteristic(&resolved, value).await,
+            WriteMode::WithoutResponse => {
+                client
+                    .write_characteristic_without_response(&resolved, value)
+                    .await
+            }
+        }
+        .map_err(|error| BleError::Gatt(format!("{error:?}")))
     }
-    .map_err(|error| BleError::Gatt(format!("{error:?}")))
 }
 
 fn ensure_write_supported(

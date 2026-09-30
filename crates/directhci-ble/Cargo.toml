@@ -19,4 +19,6 @@ trouble-host = { workspace = true, default-features = false, features = [
     "scan",
     "default-packet-pool",
     "default-packet-pool-mtu-251",
+    # TrouBLE's one-slot immediate-publish queue discards burst notifications.
+    "gatt-client-notification-queue-size-16",
 ] }

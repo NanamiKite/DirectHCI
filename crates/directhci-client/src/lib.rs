@@ -185,12 +185,11 @@ mod platform {
     use std::thread::{self, JoinHandle};
 
     use directhci_core::*;
-    use windows::Win32::Foundation::{
-        CloseHandle, ERROR_IO_PENDING, GENERIC_READ, GENERIC_WRITE, HANDLE,
-    };
+    use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
-        ReadFile, SECURITY_IMPERSONATION, SECURITY_SQOS_PRESENT, WriteFile,
+        CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL,
+        ReadFile, SECURITY_IMPERSONATION, SECURITY_SQOS_PRESENT, SYNCHRONIZE, WriteFile,
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Pipes::WaitNamedPipeW;
@@ -744,7 +743,15 @@ mod platform {
         unsafe {
             CreateFileW(
                 PCWSTR(wide.as_ptr()),
-                (GENERIC_READ | GENERIC_WRITE).0,
+                // Match the pipe's narrow AU ACE; GENERIC_WRITE also grants
+                // FILE_CREATE_PIPE_INSTANCE and must not be requested here.
+                (FILE_READ_DATA
+                    | FILE_WRITE_DATA
+                    | FILE_READ_ATTRIBUTES
+                    | FILE_WRITE_ATTRIBUTES
+                    | READ_CONTROL
+                    | SYNCHRONIZE)
+                    .0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 None,
                 OPEN_EXISTING,

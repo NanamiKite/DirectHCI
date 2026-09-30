@@ -31,6 +31,10 @@ AddReg=DirectHCI_DeviceInterface
 
 [DirectHCI_DeviceInterface]
 HKR,,DeviceInterfaceGUIDs,0x00010000,"{CF97AABE-7898-4D73-B044-A481B26747AA}"
+; Device-specific PDO/FDO security. The interface GUID is discovery metadata,
+; not an access-control boundary; only SYSTEM and elevated Administrators may
+; open the WinUSB function for Raw HCI I/O.
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
 
 [Strings]
 ProviderName="DirectHCI Project"

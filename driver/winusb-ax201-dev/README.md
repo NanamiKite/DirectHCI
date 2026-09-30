@@ -4,6 +4,12 @@ This package is development-only and matches exactly
 `USB\VID_8087&PID_0026`. It uses the Windows in-box `WinUSB.sys`; there is no
 DirectHCI `.sys`, filter, co-installer, or firmware payload.
 
+The INF now applies a device-specific DACL allowing only SYSTEM and elevated
+Administrators to open the WinUSB function. Changing the INF invalidates the
+previous catalog signature: rebuild, sign, and stage the revised package
+manually before expecting this ACL on the Windows host. The effective device
+and application-interface ACL still needs read-only verification on Windows.
+
 Build and sign it from an elevated PowerShell on the Windows development host:
 
 ```powershell

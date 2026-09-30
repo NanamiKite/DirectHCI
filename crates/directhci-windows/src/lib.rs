@@ -26,6 +26,8 @@ mod enumeration;
 mod journal;
 mod raw_hci;
 mod rebind;
+#[cfg(windows)]
+mod security;
 mod takeover;
 mod usbdk;
 mod winusb;
@@ -42,6 +44,8 @@ pub use rebind::{
     RebindObservedState, RebindPlanBlocker, RebindSafetyPrerequisites, TemporaryRebindPlan,
     plan_temporary_winusb_rebind,
 };
+#[cfg(windows)]
+pub use security::validate_service_executable;
 pub use takeover::{
     DriverInstallStep, HciBringUpReport, HciInformationReport, OfflineRecoveryReport,
     OfflineRecoveryStatus, PreflightJournalStatus, RoundTripStatus, RuntimeControllerSession,

@@ -2,12 +2,12 @@ use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use directhci_core::*;
 use windows::Win32::Foundation::{
-    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED,
-    GENERIC_READ, GENERIC_WRITE, HANDLE, HLOCAL, LocalFree,
+    CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_CONNECTED, HANDLE,
+    HLOCAL, LocalFree, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
@@ -17,8 +17,7 @@ use windows::Win32::Security::{
     SECURITY_ATTRIBUTES, TOKEN_QUERY, WinBuiltinAdministratorsSid,
 };
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+    FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
@@ -26,7 +25,9 @@ use windows::Win32::System::Pipes::{
     PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
     PIPE_WAIT,
 };
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentThread, OpenThreadToken};
+use windows::Win32::System::Threading::{
+    CreateEventW, GetCurrentThread, OpenThreadToken, WaitForSingleObject,
+};
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
 use crate::runtime::{DirectHciRuntime, Outbound};
@@ -34,23 +35,22 @@ use crate::runtime::{DirectHciRuntime, Outbound};
 const OUTBOUND_DEPTH: usize = 128;
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 const MAX_CLIENT_NAME: usize = 128;
+const MAX_CONNECTIONS: usize = 16;
+const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<(), String> {
     let connections: Arc<Mutex<Vec<Arc<PipeHandle>>>> = Arc::new(Mutex::new(Vec::new()));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
-    let wake_stop = Arc::clone(&stop);
-    let wake_thread = thread::spawn(move || {
-        while !wake_stop.load(Ordering::Acquire) {
-            thread::sleep(Duration::from_millis(100));
-        }
-        wake_listener();
-    });
 
+    let mut first_instance = true;
     while !stop.load(Ordering::Acquire) {
-        let handle = create_pipe()?;
-        if let Err(error) = connect_pipe(handle) {
+        reap_finished(&mut workers);
+        let handle = create_pipe(first_instance)?;
+        first_instance = false;
+        if let Err(error) = connect_pipe(handle, &stop) {
             let _ = unsafe { CloseHandle(handle) };
             if stop.load(Ordering::Acquire) {
                 break;
@@ -62,9 +62,20 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
             let _ = unsafe { CloseHandle(handle) };
             break;
         }
+        if connections
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?
+            .len()
+            >= MAX_CONNECTIONS
+        {
+            let _ = unsafe { DisconnectNamedPipe(handle) };
+            let _ = unsafe { CloseHandle(handle) };
+            continue;
+        }
         let handle = Arc::new(PipeHandle {
             raw: handle,
-            closed: AtomicBool::new(false),
+            stopping: AtomicBool::new(false),
+            submission: Mutex::new(()),
         });
         connections
             .lock()
@@ -83,7 +94,7 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
                         eprintln!("directhcid: IPC connection {connection_id} ended: {error}");
                     }
                     runtime.disconnect(connection_id);
-                    handle.close_once();
+                    handle.request_cancel();
                     if let Ok(mut values) = registry.lock() {
                         values.retain(|value| !Arc::ptr_eq(value, &handle));
                     }
@@ -95,7 +106,7 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
     runtime.shutdown();
     if let Ok(values) = connections.lock() {
         for handle in values.iter() {
-            handle.close_once();
+            handle.request_cancel();
         }
     }
     for worker in workers {
@@ -103,8 +114,18 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
             let _ = worker.join();
         }
     }
-    let _ = wake_thread.join();
     Ok(())
+}
+
+fn reap_finished(workers: &mut Vec<JoinHandle<()>>) {
+    let mut index = 0;
+    while index < workers.len() {
+        if workers[index].is_finished() {
+            let _ = workers.swap_remove(index).join();
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn handle_connection(
@@ -112,9 +133,12 @@ fn handle_connection(
     handle: Arc<PipeHandle>,
     runtime: Arc<DirectHciRuntime>,
 ) -> Result<(), String> {
-    let hello_frame = read_ipc_frame(&mut PipeReader(&handle))
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "client closed before ClientHello".to_owned())?;
+    let hello_frame = read_ipc_frame(&mut PipeReader {
+        handle: &handle,
+        deadline: Some(Instant::now() + HELLO_TIMEOUT),
+    })
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "client closed before ClientHello".to_owned())?;
     if hello_frame.kind != IpcMessageKind::ClientHello {
         return Err("first frame must be ClientHello".into());
     }
@@ -160,32 +184,42 @@ fn handle_connection(
         .spawn(move || writer_loop(writer_handle, outgoing))
         .map_err(|error| error.to_string())?;
 
-    loop {
-        let frame = match read_ipc_frame(&mut PipeReader(&handle)) {
-            Ok(Some(frame)) => frame,
-            Ok(None) => break,
-            Err(error) if is_normal_disconnect(&error) => break,
-            Err(error) => return Err(error.to_string()),
-        };
-        let result = dispatch_frame(
-            connection_id,
-            &hello.client_name,
-            is_admin,
-            &runtime,
-            &outbound,
-            frame,
-        );
-        if let Err((request_id, code, message)) = result {
-            if send_error(&outbound, request_id, code, message).is_err() {
-                break;
+    let request_result = (|| {
+        loop {
+            // A writer session may legitimately stay idle for a long time while
+            // receiving HCI traffic; only diagnostic clients get an idle limit.
+            let deadline = (!runtime.owns_connection(connection_id))
+                .then(|| Instant::now() + DIAGNOSTIC_IDLE_TIMEOUT);
+            let frame = match read_ipc_frame(&mut PipeReader {
+                handle: &handle,
+                deadline,
+            }) {
+                Ok(Some(frame)) => frame,
+                Ok(None) => break,
+                Err(error) if is_normal_disconnect(&error) => break,
+                Err(error) => return Err(error.to_string()),
+            };
+            let result = dispatch_frame(
+                connection_id,
+                &hello.client_name,
+                is_admin,
+                &runtime,
+                &outbound,
+                frame,
+            );
+            if let Err((request_id, code, message)) = result {
+                if send_error(&outbound, request_id, code, message).is_err() {
+                    break;
+                }
             }
         }
-    }
+        Ok(())
+    })();
     runtime.disconnect(connection_id);
     drop(outbound);
-    handle.close_once();
+    handle.request_cancel();
     let _ = writer.join();
-    Ok(())
+    request_result
 }
 
 fn dispatch_frame(
@@ -316,49 +350,76 @@ fn send_error(
 }
 
 fn writer_loop(handle: Arc<PipeHandle>, outgoing: mpsc::Receiver<IpcFrame>) {
-    for frame in outgoing {
+    loop {
+        if handle.stopping.load(Ordering::Acquire) {
+            break;
+        }
+        let frame = match outgoing.recv_timeout(Duration::from_millis(100)) {
+            Ok(frame) => frame,
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
         if write_ipc_frame(&mut PipeWriter(&handle), &frame).is_err() {
             break;
         }
     }
-    handle.close_once();
+    handle.request_cancel();
 }
 
 struct PipeHandle {
     raw: HANDLE,
-    closed: AtomicBool,
+    stopping: AtomicBool,
+    submission: Mutex<()>,
 }
 unsafe impl Send for PipeHandle {}
 unsafe impl Sync for PipeHandle {}
 impl PipeHandle {
-    fn close_once(&self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
-            // SAFETY: this object uniquely owns the pipe handle. Cancellation
-            // wakes the reader/writer before the handle is closed once.
-            let _ = unsafe { CancelIoEx(self.raw, None) };
-            let _ = unsafe { DisconnectNamedPipe(self.raw) };
-            let _ = unsafe { CloseHandle(self.raw) };
-        }
+    fn request_cancel(&self) {
+        self.stopping.store(true, Ordering::Release);
+        // Serialize cancellation with submission: no new OVERLAPPED operation
+        // can start after CancelIoEx has inspected the handle.
+        let _guard = self
+            .submission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _ = unsafe { CancelIoEx(self.raw, None) };
     }
 }
 
-struct PipeReader<'a>(&'a PipeHandle);
+impl Drop for PipeHandle {
+    fn drop(&mut self) {
+        // The last Arc is released only after all reader/writer calls return.
+        // Pending operations drain completion before releasing their storage.
+        self.request_cancel();
+        let _ = unsafe { DisconnectNamedPipe(self.raw) };
+        let _ = unsafe { CloseHandle(self.raw) };
+    }
+}
+
+struct PipeReader<'a> {
+    handle: &'a PipeHandle,
+    deadline: Option<Instant>,
+}
 struct PipeWriter<'a>(&'a PipeHandle);
 impl Read for PipeReader<'_> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        overlapped_pipe_io(self.0.raw, |overlapped, transferred| unsafe {
-            ReadFile(
-                self.0.raw,
-                Some(buffer),
-                Some(transferred),
-                Some(overlapped),
-            )
-        })
+        overlapped_pipe_io(
+            self.handle,
+            self.deadline,
+            |overlapped, transferred| unsafe {
+                ReadFile(
+                    self.handle.raw,
+                    Some(buffer),
+                    Some(transferred),
+                    Some(overlapped),
+                )
+            },
+        )
     }
 }
 impl Write for PipeWriter<'_> {
     fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        overlapped_pipe_io(self.0.raw, |overlapped, transferred| unsafe {
+        overlapped_pipe_io(self.0, None, |overlapped, transferred| unsafe {
             WriteFile(
                 self.0.raw,
                 Some(buffer),
@@ -372,9 +433,11 @@ impl Write for PipeWriter<'_> {
     }
 }
 
-fn create_pipe() -> Result<HANDLE, String> {
+fn create_pipe(first_instance: bool) -> Result<HANDLE, String> {
     let name = wide(IPC_PIPE_NAME);
-    let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;AU)");
+    // AU: SYNCHRONIZE | READ_CONTROL | READ/WRITE_DATA |
+    // READ/WRITE_ATTRIBUTES. 0x0004 (FILE_CREATE_PIPE_INSTANCE) is excluded.
+    let sddl = wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00120183;;;AU)");
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
     // SAFETY: SDDL is NUL-terminated; Windows allocates descriptor memory,
     // which is released with LocalFree after CreateNamedPipe consumes it.
@@ -396,7 +459,13 @@ fn create_pipe() -> Result<HANDLE, String> {
     let handle = unsafe {
         CreateNamedPipeW(
             PCWSTR(name.as_ptr()),
-            PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_ACCESS_DUPLEX
+                | FILE_FLAG_OVERLAPPED
+                | if first_instance {
+                    FILE_FLAG_FIRST_PIPE_INSTANCE
+                } else {
+                    Default::default()
+                },
             PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_UNLIMITED_INSTANCES,
             PIPE_BUFFER_SIZE,
@@ -417,7 +486,7 @@ fn create_pipe() -> Result<HANDLE, String> {
     }
 }
 
-fn connect_pipe(handle: HANDLE) -> Result<(), String> {
+fn connect_pipe(handle: HANDLE, stop: &AtomicBool) -> Result<(), String> {
     // SAFETY: the event and OVERLAPPED remain live until the connect completes.
     let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }
         .map_err(|error| format!("create pipe connect event: {error}"))?;
@@ -426,23 +495,49 @@ fn connect_pipe(handle: HANDLE) -> Result<(), String> {
         ..Default::default()
     };
     let initial = unsafe { ConnectNamedPipe(handle, Some(&mut overlapped)) };
-    let result = match initial {
+    let result: Result<(), String> = match initial {
         Ok(()) => Ok(()),
         Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
             let mut transferred = 0;
-            // SAFETY: handle, OVERLAPPED, and event remain valid while waiting.
-            unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, true) }
+            loop {
+                if stop.load(Ordering::Acquire) {
+                    let _ = unsafe { CancelIoEx(handle, Some(&overlapped)) };
+                    // Cancellation is asynchronous; drain before releasing the
+                    // stack-owned OVERLAPPED and event.
+                    let _ =
+                        unsafe { GetOverlappedResult(handle, &overlapped, &mut transferred, true) };
+                    break Err("pipe accept cancelled by shutdown".into());
+                }
+                match unsafe { WaitForSingleObject(event, 100) } {
+                    WAIT_OBJECT_0 => {
+                        break unsafe {
+                            GetOverlappedResult(handle, &overlapped, &mut transferred, true)
+                        }
+                        .map_err(|error| format!("ConnectNamedPipe: {error}"));
+                    }
+                    WAIT_TIMEOUT => continue,
+                    _ => {
+                        let error = windows::core::Error::from_thread();
+                        let _ = unsafe { CancelIoEx(handle, Some(&overlapped)) };
+                        let _ = unsafe {
+                            GetOverlappedResult(handle, &overlapped, &mut transferred, true)
+                        };
+                        break Err(format!("wait for ConnectNamedPipe: {error}"));
+                    }
+                }
+            }
         }
         Err(error) if error.code() == HRESULT::from_win32(ERROR_PIPE_CONNECTED.0) => Ok(()),
-        Err(error) => Err(error),
+        Err(error) => Err(format!("ConnectNamedPipe: {error}")),
     };
     // SAFETY: the connect is complete (or failed), so the event is no longer in use.
     let _ = unsafe { CloseHandle(event) };
-    result.map_err(|error| format!("ConnectNamedPipe: {error}"))
+    result
 }
 
 fn overlapped_pipe_io(
-    handle: HANDLE,
+    handle: &PipeHandle,
+    deadline: Option<Instant>,
     operation: impl FnOnce(*mut OVERLAPPED, *mut u32) -> windows::core::Result<()>,
 ) -> std::io::Result<usize> {
     // Each simultaneous read/write owns an independent manual-reset event and
@@ -453,12 +548,36 @@ fn overlapped_pipe_io(
         ..Default::default()
     };
     let mut transferred = 0u32;
-    let initial = operation(&mut overlapped, &mut transferred);
+    let initial = {
+        let _guard = handle
+            .submission
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if handle.stopping.load(Ordering::Acquire) {
+            let _ = unsafe { CloseHandle(event) };
+            return Err(std::io::ErrorKind::BrokenPipe.into());
+        }
+        operation(&mut overlapped, &mut transferred)
+    };
     let result = match initial {
         Ok(()) => Ok(()),
-        Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => unsafe {
-            GetOverlappedResult(handle, &overlapped, &mut transferred, true)
-        },
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
+            if let Some(deadline) = deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                let wait_ms = remaining.as_millis().min(u32::MAX as u128) as u32;
+                if unsafe { WaitForSingleObject(event, wait_ms) } == WAIT_TIMEOUT {
+                    let _ = unsafe { CancelIoEx(handle.raw, Some(&overlapped)) };
+                    // CancelIoEx only requests cancellation. Do not free the
+                    // stack-owned OVERLAPPED/event/buffer until completion.
+                    let _ = unsafe {
+                        GetOverlappedResult(handle.raw, &overlapped, &mut transferred, true)
+                    };
+                    let _ = unsafe { CloseHandle(event) };
+                    return Err(std::io::ErrorKind::TimedOut.into());
+                }
+            }
+            unsafe { GetOverlappedResult(handle.raw, &overlapped, &mut transferred, true) }
+        }
         Err(error) => Err(error),
     };
     // SAFETY: GetOverlappedResult has completed/cancelled the operation before
@@ -531,24 +650,6 @@ impl Drop for TokenHandle {
     fn drop(&mut self) {
         // SAFETY: this wrapper exclusively owns the OpenThreadToken handle.
         let _ = unsafe { CloseHandle(self.0) };
-    }
-}
-
-fn wake_listener() {
-    let name = wide(IPC_PIPE_NAME);
-    // SAFETY: this only opens the local pipe to release ConnectNamedPipe.
-    if let Ok(handle) = unsafe {
-        CreateFileW(
-            PCWSTR(name.as_ptr()),
-            (GENERIC_READ | GENERIC_WRITE).0,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            None,
-        )
-    } {
-        let _ = unsafe { CloseHandle(handle) };
     }
 }
 
