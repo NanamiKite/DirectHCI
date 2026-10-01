@@ -4,6 +4,11 @@ No third-party implementation source has been copied into DirectHCI. Minimal
 public ABI declarations that are required for FFI are recorded explicitly
 below.
 
+DirectHCI's current, provisional first-party license choice is GNU GPL v3 only
+(`GPL-3.0-only`; see [LICENSE.txt](../LICENSE.txt)). This does not relicense
+third-party dependencies or external tools, nor does it change the
+reference-only restrictions recorded below.
+
 The M1 implementation additionally follows Microsoft's documented
 `DiInstallDevice` `NeedReboot` contract, uses
 [`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
@@ -27,6 +32,33 @@ tool flow. These are API/tool contracts, not copied implementation code.
 | `bt-hci` 0.10.1 | [`Controller`, `ControllerCmdSync`, and `ControllerCmdAsync`](https://docs.rs/bt-hci/0.10.1/bt_hci/controller/index.html) | Direct dependency defining the typed HCI controller boundary used by `directhci-bt-hci` | MIT OR Apache-2.0; DirectHCI independently adapts its own IPC SDK and does not copy a transport implementation |
 | TrouBLE (`trouble-host`) 0.8.0 | [repository and current examples](https://github.com/embassy-rs/trouble/tree/trouble-host-v0.8.0/examples), [crate source](https://docs.rs/crate/trouble-host/0.8.0/source/) | Direct dependency behind the reusable `directhci-ble` library for GAP Central, L2CAP, ATT, GATT discovery/read/write, and notification/indication handling; `apps/directhci-ble` is only its CLI frontend | MIT OR Apache-2.0; used as an upstream dependency, not forked or copied into DirectHCI |
 
+## Control Panel and installer references
+
+- [Native Windows GUI](https://github.com/gabdube/native-windows-gui/blob/master/readme.md)
+  1.0.13 is a direct MIT-licensed dependency of
+  `apps/directhci-control-panel`; DirectHCI uses its native controls rather
+  than copying GUI framework code.
+- [Inno Setup](https://github.com/jrsoftware/issrc/blob/HEAD/license.txt)
+  is an external installer compiler, not a runtime dependency. The project
+  owns `installer/directhci.iss` and does not copy Inno Setup implementation
+  code. Its license is the Inno Setup License.
+- [Inno Setup `PrivilegesRequired`](https://jrsoftware.org/ishelp/topic_setup_privilegesrequired.htm)
+  controls Setup's admin install mode.
+  [Microsoft's UAC guidance](https://learn.microsoft.com/en-us/windows/win32/secbp/running-with-administrator-privileges)
+  explains that a later GUI process has its own execution level. The Control
+  Panel currently checks the effective token and uses the documented
+  [`ShellExecuteW` `runas` verb](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew)
+  when elevation is needed. This source-level behavior still needs a fresh
+  host acceptance run after rebuilding the installer.
+
+- [`bt-hci-usb` 0.2.0](https://github.com/embassy-rs/bt-hci/tree/main/bt-hci-usb)
+  is an upstream USB HCI transport in the same ecosystem. Its README requires
+  WinUSB binding on Windows. It is **not** a DirectHCI dependency or a reason
+  to replace the already validated WinUSB implementation in this documentation
+  update. Inference from its documented scope: a raw USB transport alone
+  does not supply DirectHCI's Windows ownership journal, temporary driver
+  rebind, service IPC, or Windows restore contract. No code was copied.
+
 ## Confirmed compatibility notes
 
 - `bt-hci` 0.10.1 declares `link_control::Disconnect` (opcode `0x0406`)
@@ -46,6 +78,7 @@ the application path for the same PnP instance; `CreateFileW` uses
 `FILE_FLAG_OVERLAPPED`; and `WinUsb_Initialize`,
 `WinUsb_QueryInterfaceSettings`, `WinUsb_QueryPipe`, and `WinUsb_Free`
 perform the open/inspect/close probe. No reference implementation code was used.
+
 ## Dependency classification for Dedicated WinUSB
 
 

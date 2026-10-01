@@ -1,4 +1,4 @@
-//! Small Windows file-security checks for the privileged service and journal.
+//! Windows file-security checks for the privileged service and journal.
 
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
@@ -10,12 +10,13 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT,
+    GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, DACL_SECURITY_INFORMATION, GetAce, GetSecurityDescriptorControl,
-    INHERIT_ONLY_ACE, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
-    PSID, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    GetSecurityDescriptorDacl, INHERIT_ONLY_ACE, IsValidSid, IsWellKnownSid,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, WinBuiltinAdministratorsSid, WinLocalSystemSid,
 };
 use windows::Win32::Storage::FileSystem::{
     CreateDirectoryW, DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DELETE_CHILD,
@@ -31,6 +32,8 @@ const WRITE_RIGHTS: u32 = GENERIC_ALL.0 | GENERIC_WRITE.0 | FILE_WRITE_DATA.0
     | DELETE.0 | WRITE_DAC.0 | WRITE_OWNER.0;
 const REPLACE_RIGHTS: u32 =
     GENERIC_ALL.0 | DELETE.0 | FILE_DELETE_CHILD.0 | WRITE_DAC.0 | WRITE_OWNER.0;
+const CONFIG_FILE: &str = "config.json";
+const JOURNAL_FILE: &str = "ownership-journal-v1.json";
 
 pub fn validate_service_executable(path: &Path) -> Result<(), String> {
     let canonical = path
@@ -124,6 +127,160 @@ pub(crate) fn validate_secure_journal_directory(path: &Path) -> Result<(), Strin
     check_acl(path, WRITE_RIGHTS, true)
 }
 
+/// Repair a legacy state directory only if it has a trusted owner and no
+/// ownership journal. Never turn a user-writable journal into trusted input.
+pub fn repair_program_data_directory() -> Result<(), String> {
+    let journal = crate::JournalStore::program_data().map_err(|error| error.to_string())?;
+    let journal_path = journal.path();
+    let directory = journal_path.parent().ok_or("journal path has no parent")?;
+    validate_journal_parent(directory)?;
+    match fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ensure_secure_journal_directory(directory);
+        }
+        Err(error) => return Err(format!("inspect DirectHCI state directory: {error}")),
+        Ok(metadata) if !metadata.is_dir() => {
+            return Err("DirectHCI state path is not a directory".into());
+        }
+        Ok(_) => {}
+    }
+    reject_reparse(directory)?;
+    if validate_secure_journal_directory(directory).is_ok() {
+        return quarantine_unsafe_config(directory, false);
+    }
+    // Validate the owner and ACE shapes, but allow the user-write ACE that we
+    // are repairing. A user-owned or unusual security descriptor fails closed.
+    check_acl(directory, 0, false)?;
+    inspect_legacy_contents(directory)?;
+    // Quarantine before changing the DACL. ACL inheritance propagation can
+    // make a previously user-writable file appear safe after the change.
+    quarantine_unsafe_config(directory, true)?;
+    replace_directory_dacl(directory)?;
+    validate_secure_journal_directory(directory)?;
+    // Recheck after revoking user writes: an entry may have appeared meanwhile.
+    inspect_legacy_contents(directory)?;
+    quarantine_unsafe_config(directory, false)
+}
+
+fn quarantine_unsafe_config(
+    directory: &Path,
+    formerly_writable_directory: bool,
+) -> Result<(), String> {
+    let config = directory.join(CONFIG_FILE);
+    match fs::symlink_metadata(&config) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("inspect preferences file: {error}")),
+        Ok(metadata) if !metadata.is_file() => {
+            return Err("preferences path is not a regular file".into());
+        }
+        Ok(_) => {}
+    }
+    reject_reparse(&config)?;
+    if formerly_writable_directory || check_acl(&config, WRITE_RIGHTS, false).is_err() {
+        // Preserve formerly user-writable preferences but never load them.
+        let backup = directory.join(format!(
+            ".config.json.untrusted-backup.{}",
+            std::process::id()
+        ));
+        if backup.exists() {
+            return Err("untrusted config backup already exists; refusing to overwrite".into());
+        }
+        fs::rename(&config, &backup)
+            .map_err(|error| format!("quarantine formerly writable config: {error}"))?;
+        eprintln!(
+            "DirectHCI: quarantined unsafe preferences at {}",
+            backup.display()
+        );
+    }
+    Ok(())
+}
+
+fn inspect_legacy_contents(directory: &Path) -> Result<(), String> {
+    for entry in fs::read_dir(directory)
+        .map_err(|error| format!("inspect DirectHCI state directory contents: {error}"))?
+    {
+        let entry = entry.map_err(|error| format!("inspect state entry: {error}"))?;
+        let name = entry.file_name();
+        if name == JOURNAL_FILE {
+            return Err("ownership journal exists; refusing automatic ACL repair".into());
+        }
+        if name
+            .to_string_lossy()
+            .starts_with(".config.json.untrusted-backup.")
+        {
+            let metadata = fs::symlink_metadata(entry.path())
+                .map_err(|error| format!("inspect quarantined config: {error}"))?;
+            if !metadata.is_file() {
+                return Err("quarantined config is not a regular file".into());
+            }
+            reject_reparse(&entry.path())?;
+            continue;
+        }
+        if name != CONFIG_FILE {
+            return Err(format!(
+                "unexpected state entry {}; refusing automatic ACL repair",
+                entry.path().display()
+            ));
+        }
+        let metadata = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("inspect config metadata: {error}"))?;
+        if !metadata.is_file() {
+            return Err("legacy config is not a regular file".into());
+        }
+        reject_reparse(&entry.path())?;
+    }
+    Ok(())
+}
+
+fn replace_directory_dacl(path: &Path) -> Result<(), String> {
+    let sddl = wide_text("D:P(A;OICI;GA;;;SY)(A;OICI;GA;;;BA)");
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: the SDDL is terminated and the descriptor remains live until
+    // after the replacement DACL has been applied.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            PCWSTR(sddl.as_ptr()),
+            SDDL_REVISION_1,
+            &mut descriptor,
+            None,
+        )
+    }
+    .map_err(|error| format!("build replacement state directory ACL: {error}"))?;
+    let result = (|| {
+        let mut present = false.into();
+        let mut defaulted = false.into();
+        let mut dacl = std::ptr::null_mut();
+        // SAFETY: the descriptor and all output pointers remain valid.
+        unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) }
+            .map_err(|error| format!("read replacement DACL: {error}"))?;
+        if !bool::from(present) || dacl.is_null() {
+            return Err("replacement state directory DACL is missing".into());
+        }
+        let mut name = wide(path);
+        // SAFETY: the directory name and DACL remain live for this call.
+        let status = unsafe {
+            SetNamedSecurityInfoW(
+                PWSTR(name.as_mut_ptr()),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(dacl),
+                None,
+            )
+        };
+        if status.0 != 0 {
+            return Err(format!(
+                "secure DirectHCI state directory ACL: {}",
+                status.0
+            ));
+        }
+        Ok(())
+    })();
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    result
+}
+
 fn validate_journal_parent(path: &Path) -> Result<(), String> {
     let parent = path.parent().ok_or("journal directory has no parent")?;
     reject_reparse(parent)?;
@@ -138,6 +295,11 @@ pub(crate) fn reject_reparse(path: &Path) -> Result<(), String> {
         return Err(format!("reparse point is not trusted: {}", path.display()));
     }
     Ok(())
+}
+
+pub(crate) fn validate_secure_data_file(path: &Path) -> Result<(), String> {
+    reject_reparse(path)?;
+    check_acl(path, WRITE_RIGHTS, false)
 }
 
 fn check_acl(path: &Path, unsafe_rights: u32, require_protected: bool) -> Result<(), String> {

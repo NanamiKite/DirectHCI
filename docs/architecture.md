@@ -1,19 +1,22 @@
 # Architecture
 
-## Phase 1 boundary
+## Current implementation boundaries
 
-Phase 1 establishes Windows Bluetooth Controller identity, current observation,
-exclusive ownership transitions, release, recovery, and diagnostics. Raw HCI,
-vendor initialization, IPC, and Bluetooth Host protocols remain outside this
-phase.
+DirectHCI now contains Windows controller discovery, M1 temporary ownership,
+M2 Raw HCI, an M3 named-pipe runtime/client SDK, a generic BLE Central library,
+and a native Windows Control Panel. The AX201 takeover/restore and Raw HCI path
+have been exercised on a Windows host; the current revision's BLE library and
+installer/GUI changes still need separate regression acceptance (see
+[compatibility.md](compatibility.md)).
 
 ```text
 ControllerIdentity       Physical-controller matching evidence
 ControllerObservation    Current Windows PnP/driver view
-OwnershipBackend         One concrete ownership transition mechanism
-ControllerLease          Lifetime root of DirectHCI-owned access
-RecoveryRecord           Durable transition intent, never the source of truth
-Reconciler               Observe current state and approach desired state
+OwnershipJournal         Durable transition intent, not the source of truth
+RuntimeControllerSession Owns takeover and RawHciSession during one lease window
+directhcid               Privileged, single-active-writer runtime
+directhci-client          Versioned local IPC client SDK
+directhci-ble             Generic BLE Central/GATT consumer library
 ```
 
 Identity and observation are separate because driver changes and PnP
@@ -29,7 +32,8 @@ VID/PID. Driver, INF, service, status, and interface path never participate.
 
 ## Product modes and ownership invariant
 
-DirectHCI formally supports both Dedicated Controller Mode and Takeover Mode.
+The product model distinguishes Dedicated Controller Mode and Takeover Mode.
+Only Takeover Mode has current AX201 hardware acceptance.
 
 ```text
 Dedicated:
@@ -44,21 +48,17 @@ WinUSB but has no active client write lease. It does not mean that Windows
 Bluetooth should reclaim it. In takeover mode the available desired state is
 `WindowsOwned`.
 
-At most one active writer can exist. If ownership is transitioning, missing,
-unexpected, or ambiguous, HCI I/O is not permitted. Mode is durable enrollment
-policy, not something inferred from a transient interface path.
+The current runtime allows one active writer session globally. If ownership
+is transitioning, missing, unexpected, or ambiguous, HCI I/O is not
+permitted. Dedicated Mode is a documented auxiliary design, not a validated
+provisioning or parallel-ownership implementation.
 
-## Controller lease
+## Runtime controller session
 
-The M1 ownership journal and transition executor reserve one controller across
-the temporary rebind. `ControllerLease` will become the runtime root once HCI
-sessions are introduced; a future transport and all of its workers must borrow
-or be owned by that lease and stop before the backend ownership guard is
-released.
-
-The privileged controller manager creates leases. A client receives a lease
-identifier or capability through IPC later; it does not construct the lease or
-own the underlying OS handle directly.
+The implemented `RuntimeControllerSession` in `directhci-windows` owns
+takeover plus `RawHciSession`. `directhcid` owns that session on behalf of
+one named-pipe client; the client SDK never receives WinUSB or driver handles.
+The durable M1 journal covers interruption before or after driver rebinding.
 
 Release is a desired-state operation and must be idempotent:
 
@@ -118,7 +118,7 @@ recovery remain direct library entry points so recovery does not depend on a
 healthy runtime service.
 
 ```text
-CLI / Client SDK / Consumer / optional Control Panel
+CLI / Control Panel / Client SDK / Consumer
                          |
                   versioned local IPC
                          |
@@ -138,12 +138,23 @@ payloads; HCI Command/Event and ACL payloads stay binary. Authenticated local
 users may query diagnostics, while administrator group membership is required
 for acquire and Raw HCI operations. No network listener is created.
 
-A future Control Panel is only another `directhci-client` consumer. It does
-not own the controller lifecycle.
+The Windows Control Panel is another `directhci-client` consumer. It reads
+runtime/controller state through IPC, queries service status through SCM, and
+does not own the controller lifecycle. It requests administrator approval
+when launched without an elevated token. It refreshes status periodically on
+a background worker. Closing the panel requests a service stop and waits for
+SCM to report `Stopped`; an owning client disconnect restores Windows
+Bluetooth without stopping the service. The daemon validates and persists the
+single preferred ControllerId
+in `%ProgramData%\DirectHCI\config.json`; this
+preference never substitutes for fresh identity validation during takeover.
+Changing it while an active session exists is refused. The Control Panel's
+Restore Windows action delegates to the runtime's existing offline recovery
+path after stopping an active session.
 
 Windows PnP and WinUSB APIs remain outside `directhci-core`. Vendor-specific
 code must not enter controller identity or generic USB transport. This
-boundary remains independent of any future GUI or Bluetooth Host Stack.
+boundary remains independent of the Control Panel and consumer Host Stack.
 
 ## Reusable BLE Central boundary
 

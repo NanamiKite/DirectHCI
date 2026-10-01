@@ -5,13 +5,16 @@ installation, driver changes, controller capture, or Raw HCI I/O. Statements
 are classified as Microsoft documentation, upstream behavior, current host
 observation, or DirectHCI design decision.
 
-Survey updated: 2026-09-26.
+Survey reviewed: 2026-10-01. This is the historical route-selection
+analysis, not the current milestone/status page. The temporary-rebind route
+has since passed an AX201 hardware round trip and powers the Raw HCI runtime.
+See [compatibility.md](compatibility.md) for verified versus pending results.
 
 ## Product modes and non-goals
 
 DirectHCI supports two equally formal modes. They share controller identity,
-diagnostics, the future Raw HCI contract, and the single-writer invariant, but
-they have different desired available states.
+diagnostics, the implemented Raw HCI contract, and the single-writer
+invariant, but they have different desired available states.
 
 Dedicated Controller Mode uses a separate USB controller intentionally
 provisioned for WinUSB:
@@ -41,10 +44,11 @@ The route priority is:
 3. UsbDk runtime capture as an experimental takeover candidate.
 4. A custom driver only if the preceding routes are proven insufficient.
 
-Raw HCI, service/IPC, vendor initialization, and a custom driver remain outside
-this milestone. The survey's selected temporary-rebind route is now implemented
-as the M1 development round trip; package trust and staging remain explicit
-user operations, and hardware validation is still pending.
+At the time of the survey Raw HCI and service/IPC were future milestones.
+They are now implemented; Intel vendor initialization and a custom driver
+remain outside the current implementation. Package trust and driver staging
+remain explicit user operations. The AX201 M1 round trip has been observed
+on the Windows host.
 
 Current host observation: the system controller is an Intel AX201 USB
 Bluetooth function at `8087:0026`, using `BTHUSB`. Those values describe the
@@ -181,10 +185,10 @@ needed yet. The minimum implementation units are:
    shutdown;
 6. structured errors and trace hooks without a Host Stack dependency.
 
-Backend/runtime logic must remain below the CLI. The future service owns the
-session and workers; CLI, SDK, consumer applications, and a possible Control
-Panel are clients. Closing a GUI must never release or retain controller
-ownership implicitly.
+Backend/runtime logic remains below the CLI. The implemented `directhcid`
+service owns the session and workers; CLI, SDK, consumer applications, and
+the Control Panel are clients. The Control Panel does not own the controller
+and currently requires the service to be stopped before its window closes.
 
 ## B. Temporary device-specific WinUSB rebind — current Phase 1 mainline
 
@@ -248,7 +252,7 @@ requirements. No such evidence currently exists.
 | Property | Dedicated WinUSB | Temporary WinUSB rebind | UsbDk capture |
 | --- | --- | --- | --- |
 | Formal mode | Dedicated | Takeover | Experimental takeover |
-| Meets AX201 takeover cycle | No | In principle | Intended to; unsafe/unknown here |
+| Meets AX201 takeover cycle | No | Yes, observed on the recorded host | Intended to; unsafe/unknown here |
 | Runtime driver mutation | None after provisioning | Yes | Redirect through installed filter |
 | Desired available state | `DirectHciReady` | `WindowsOwned` | `WindowsOwned` |
 | Crash recovery | Close/cancel I/O; keep WinUSB binding | Persistent binding requires reconciler | Handle return contract plus lab validation |
@@ -261,18 +265,16 @@ current AX201**. Dedicated Controller Mode remains a useful future auxiliary
 path, but it does not replace the required Windows-owned takeover/release
 cycle. Both eventually feed the same runtime-facing WinUSB transport boundary.
 
-The read-only WinUSB readiness/open probe is now implemented inside
-`directhci-windows`: select a freshly observed WinUSB-bound Bluetooth controller,
-discover its provisioned application-interface GUID from the devnode, require
-an exact instance-ID correlation, open with overlapped I/O, initialize WinUSB,
-query interface and pipe descriptors, return a safe endpoint summary, and close
-all handles. It sends no HCI command and transfers no ownership. Hardware
-acceptance remains pending a separate WinUSB-bound Bluetooth dongle; the
-Windows-owned AX201 is not a test target for this gate.
+The read-only WinUSB readiness/open probe is implemented inside
+`directhci-windows`. It discovers the registered application interface,
+requires exact instance-ID correlation, opens with overlapped I/O, and
+validates descriptor/pipe topology. The AX201 subsequently passed this gate
+**after the temporary takeover**, including E0/01/01 and event/ACL pipes.
+A separate Dedicated WinUSB dongle still has not been validated.
 
-Takeover planning is now active and precedes any Raw HCI work. The read-only
-planner, durable intent, offline recovery, and verified Windows-driver
-reconcile path are required before the first real AX201 rebind. See
+The read-only planner, durable intent, offline recovery, and verified
+Windows-driver reconcile path were built before the first AX201 rebind. The
+takeover round trip and Raw HCI are now implemented. See
 [`temporary-rebind.md`](temporary-rebind.md).
 
 The existing `directhci doctor` UsbDk gate remains read-only. The current host

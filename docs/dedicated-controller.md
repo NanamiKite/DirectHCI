@@ -4,9 +4,11 @@ This procedure is a development-only acceptance path for a separate,
 expendable USB Bluetooth controller. It does not provision the controller
 automatically, and it is not the future DirectHCI product installer.
 
-## Permanent exclusion: system AX201
+## Exclusion from Dedicated provisioning: system AX201
 
-Never provision or rebind the current system controller:
+Never use this Dedicated/Zadig procedure to provision or permanently rebind
+the current system controller. Its separately documented M1 temporary
+takeover/recovery flow is different:
 
 ~~~text
 Intel AX201 Bluetooth
@@ -124,11 +126,10 @@ Do not mechanically replay the pre-provisioning INF snapshot, and never apply
 this procedure to the AX201. Windows driver selection or Windows Update may
 have changed since the snapshot was taken.
 
-## Gate to Raw HCI work
+## Dedicated hardware acceptance
 
-Do not implement or run HCI traffic until a real external controller reports
-Ready with the expected descriptor topology. After the user provides that
-evidence, review it before starting the next milestone. The subsequent minimal
-command experiment must arm interrupt-IN event reception before sending HCI
-Reset; that sequencing is recorded here but is not implemented by this
-milestone.
+Dedicated-mode Raw HCI still requires a real external controller with
+`Ready` descriptor topology. This is **not** a gate on M2 generally:
+Raw HCI and BLE operation have already been exercised through the AX201
+temporary-takeover mode. Dedicated hardware must pass its own identity,
+interface, pipe, and lifecycle acceptance before its results are claimed.

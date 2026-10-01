@@ -3,6 +3,10 @@
 Generic asynchronous BLE Central and GATT client API backed by the local
 DirectHCI runtime.
 
+This first-party crate currently uses `GPL-3.0-only`; see
+[LICENSE.txt](../../LICENSE.txt). Its upstream dependencies retain their own
+licenses.
+
 The library acquires Raw HCI through `directhci-client`, adapts it through
 `directhci-bt-hci`, and owns the TrouBLE Host lifecycle. It does not access
 WinUSB or switch Windows drivers itself.

@@ -21,8 +21,9 @@ away; location topology is the current identity basis.
 
 Its instance is `USB\\VID_8087&PID_0026\\5&310905D1&0&14`. This is the system
 controller and is permanently excluded from Dedicated Mode provisioning. It is
-the explicit M1 takeover target, but must not be rebound until the
-temporary-rebind safety gate below is complete.
+the explicit M1 takeover target. The first temporary-rebind safety gate was
+completed for the recorded host; reapply it before a new destructive run,
+package revision, or different machine.
 
 ## Stage 2: read-only UsbDk compatibility gate
 
@@ -132,23 +133,25 @@ to guess another interface GUID.
 
 ## Future auxiliary: Dedicated Raw HCI acceptance
 
-Future work, not implemented. Begin only after Stage 4 passes. It will cover
-command/event/ACL mapping, cancellation, surprise removal, suspend/resume, and
-deterministic shutdown. SCO and vendor firmware initialization are separate
-capabilities, not implied by basic HCI success.
+Dedicated-mode HCI hardware acceptance is still future work because no
+separate WinUSB-bound dongle was tested. M2 command/event/ACL transport has
+instead been exercised through the temporary AX201 takeover. SCO and vendor
+firmware initialization are separate capabilities, not implied by basic
+HCI success.
 
 ## Stage 4: first takeover round-trip
 
-The code path now includes durable journal persistence, offline recovery,
+The code path includes durable journal persistence, offline recovery,
 device-specific `DiInstallDevice` selection, WinUSB readiness reuse, and
-explicit Windows-driver restore. Hardware execution remains blocked until the
-development package is built/signed/trusted/staged and the planner passes on
-the Windows host. Dedicated-controller validation is not a prerequisite.
+explicit Windows-driver restore. This gate was completed on the recorded host:
+`BTHUSB/oem69.inf` → `WinUSB/oem183.inf` → readiness `Ready` →
+`BTHUSB/oem69.inf`. Dedicated-controller validation was not required.
+A changed package or different host must pass its own gate again.
 
-When separately authorized, the first round trip binds only the exact AX201
-devnode with `DiInstallDevice`, re-observes and runs the existing WinUSB
-readiness check, sends no HCI traffic, then explicitly binds the freshly
-selected non-DirectHCI Windows candidate and verifies Windows Bluetooth. The
+The M1-only roundtrip binds only the exact AX201 devnode with
+`DiInstallDevice`, re-observes and runs the existing WinUSB readiness check,
+sends no HCI traffic, then explicitly binds a freshly selected non-DirectHCI
+Windows candidate and verifies Windows Bluetooth. The
 historical `oem69.inf` is evidence, not the desired state or an unconditional
 restore instruction.
 
@@ -174,3 +177,33 @@ recoverable Windows system, non-Bluetooth input, recovery media, crash
 dumps/kernel debugging, explicitly recorded UsbDk/Windows/HVCI configuration,
 and a noncritical controller. VM results are useful diagnostics but do not
 prove physical USB-stack safety.
+
+## Recorded M2/M3/BLE results and regression gate
+
+Earlier AX201 host acceptance observed HCI Reset status `0x00`, Local
+Version `0x0b` / revision `0x375b`, LE connect, ACL TX/RX through ATT MTU
+exchange (MTU 131), GATT discovery, unsolicited notification reception,
+clean disconnect, and `WindowsOwned` restore. These are recorded hardware
+observations, not a guarantee for a later build.
+
+After the BLE CLI implementation was extracted into `crates/directhci-ble`,
+host reports showed GATT timeout and then disconnect regressions. Before
+claiming the **current** BLE library build accepted, repeat only the
+smallest sequence: connect, inspect, passive listen, then check
+`directhci status` and `directhci controllers` for no active session and
+`WindowsOwned`. Do not infer that Cargo compilation resolves a lifecycle
+regression.
+
+## Installer and Control Panel acceptance (pending)
+
+Build a fresh installer without `-SkipBuild`; verify the installed binary
+rather than a release-tree or Downloads copy. From a non-elevated Start Menu
+launch, confirm Control Panel UAC approval is requested, SCM status is
+displayed, service Start/Stop works, preferred controller persists, and the
+panel refreshes service/controller/session status without a manual Refresh.
+Confirm a normal client disconnect restores Windows Bluetooth while the
+service stays Running, and a second client connection works without restarting
+it. Confirm explicit Stop Service leaves the panel open; restart the service,
+then close the panel and verify it waits for SCM Stopped before exiting.
+Then separately check upgrade and safe uninstall. These packaging/UAC
+checks have not yet been reported as passing on the Windows host.

@@ -1,13 +1,22 @@
 # Temporary device-specific WinUSB rebind
 
-This document defines the executable AX201 M1 takeover path. Driver package
-build, certificate trust, and Driver Store staging remain explicit user
-operations. DirectHCI never stages/removes a package, disables the device, or
-changes boot policy. The only destructive development command is:
+This document describes the implemented AX201 M1 takeover path and its
+safety contract. The Windows host has completed a BTHUSB / `oem69.inf` →
+DirectHCI WinUSB / `oem183.inf` → BTHUSB / `oem69.inf` round trip, including
+WinUSB readiness and verified Windows restore. Those INF names are historical
+observations, not hard-coded recovery targets.
+
+Driver package build, certificate trust, and Driver Store staging remain
+explicit user operations. DirectHCI does not stage/remove a package, disable
+the device, or change boot policy. The M1-only diagnostic command is:
 
 ```text
 directhci takeover roundtrip <controller-id> --execute
 ```
+
+Normal Raw HCI ownership now runs inside `directhcid`; the explicit
+`takeover hci-info ... --execute` and `recover --offline` commands remain
+development/recovery entry points. See [architecture.md](architecture.md).
 
 ## Scope and invariant
 
@@ -96,7 +105,11 @@ that:
   `{CF97AABE-7898-4D73-B044-A481B26747AA}` through
   `DeviceInterfaceGUIDs`;
 - contains no custom `.sys`, co-installer, filter, firmware, or persistent
-  hardware operation.
+  hardware operation;
+- declares a protected device security descriptor granting SYSTEM and
+  Administrators access, with no ordinary-user Raw WinUSB access. The
+  *effective* device/interface ACL still requires Windows-host verification
+  after any rebuilt package is staged.
 
 The target hardware ID belongs in this deployment artifact, not generic core
 logic. The first package version should be deliberately lower preference than
@@ -211,7 +224,11 @@ missing device keeps the journal pending. An ambiguous identity or driver
 choice produces `RecoveryRequired` without modifying any candidate. It also
 refuses to run while the journal's owning process is still active.
 
-## First destructive acceptance gate
+## Original destructive acceptance gate
+
+These were the prerequisites for the first AX201 rebind; that round trip has
+since been completed on the recorded Windows host. Reapply the gate on any
+new host, changed package, or driver/security configuration:
 
 No AX201 rebind is permitted until all of these are complete:
 

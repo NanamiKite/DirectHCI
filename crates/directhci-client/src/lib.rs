@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use directhci_core::{
     ControllerObservation, HciAclPacket, HciCommandResponse, HciEventPacket,
-    RuntimeControllerStatus, RuntimeStatus,
+    RuntimeControllerStatus, RuntimePreferences, RuntimeStatus,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -53,6 +53,31 @@ impl DirectHciClient {
             inner: platform::Client::connect(client_name.into(), client_version)?,
         })
     }
+
+    /// Connect to the local runtime, starting the demand-start Windows service
+    /// if it is not listening. Starting the service still requires Windows
+    /// SERVICE_START permission; this does not broaden Raw HCI authorization.
+    pub fn connect_or_start(
+        client_name: impl Into<String>,
+        client_version: Option<String>,
+    ) -> Result<Self, ClientError> {
+        let client_name = client_name.into();
+        match Self::connect(client_name.clone(), client_version.clone()) {
+            Ok(client) => return Ok(client),
+            Err(ClientError::Connection(_)) => platform::start_service()?,
+            Err(error) => return Err(error),
+        }
+        let mut last_error = ClientError::Connection("runtime service did not become ready".into());
+        for _ in 0..6 {
+            match Self::connect(client_name.clone(), client_version.clone()) {
+                Ok(client) => return Ok(client),
+                Err(error @ ClientError::Connection(_)) => last_error = error,
+                Err(error) => return Err(error),
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        Err(last_error)
+    }
     pub fn server_hello(&self) -> &directhci_core::ServerHello {
         self.inner.server_hello()
     }
@@ -61,6 +86,18 @@ impl DirectHciClient {
     }
     pub fn runtime_status(&self) -> Result<RuntimeStatus, ClientError> {
         self.inner.runtime_status()
+    }
+    pub fn preferences(&self) -> Result<RuntimePreferences, ClientError> {
+        self.inner.preferences()
+    }
+    pub fn set_preferred_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<RuntimePreferences, ClientError> {
+        self.inner.set_preferred_controller(controller_id)
+    }
+    pub fn restore_windows(&self) -> Result<(), ClientError> {
+        self.inner.restore_windows()
     }
     pub fn controller_status(
         &self,
@@ -122,6 +159,9 @@ impl RawHciClientSession {
 #[cfg(not(windows))]
 mod platform {
     use super::*;
+    pub(super) fn start_service() -> Result<(), ClientError> {
+        Err(ClientError::UnsupportedPlatform)
+    }
     pub(super) struct Client;
     pub(super) struct Session;
     impl Client {
@@ -135,6 +175,18 @@ mod platform {
             Err(ClientError::UnsupportedPlatform)
         }
         pub(super) fn runtime_status(&self) -> Result<RuntimeStatus, ClientError> {
+            Err(ClientError::UnsupportedPlatform)
+        }
+        pub(super) fn preferences(&self) -> Result<RuntimePreferences, ClientError> {
+            Err(ClientError::UnsupportedPlatform)
+        }
+        pub(super) fn set_preferred_controller(
+            &self,
+            _: &str,
+        ) -> Result<RuntimePreferences, ClientError> {
+            Err(ClientError::UnsupportedPlatform)
+        }
+        pub(super) fn restore_windows(&self) -> Result<(), ClientError> {
             Err(ClientError::UnsupportedPlatform)
         }
         pub(super) fn acquire_raw_hci(&self, _: &str) -> Result<Session, ClientError> {
@@ -185,7 +237,9 @@ mod platform {
     use std::thread::{self, JoinHandle};
 
     use directhci_core::*;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_IO_PENDING, HANDLE};
+    use windows::Win32::Foundation::{
+        CloseHandle, ERROR_IO_PENDING, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
+    };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
         FILE_SHARE_WRITE, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA, OPEN_EXISTING, READ_CONTROL,
@@ -193,6 +247,10 @@ mod platform {
     };
     use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
     use windows::Win32::System::Pipes::WaitNamedPipeW;
+    use windows::Win32::System::Services::{
+        CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_START,
+        StartServiceW,
+    };
     use windows::Win32::System::Threading::CreateEventW;
     use windows::core::{HRESULT, PCWSTR};
 
@@ -200,6 +258,30 @@ mod platform {
 
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
     const STREAM_QUEUE_DEPTH: usize = 128;
+
+    pub(super) fn start_service() -> Result<(), ClientError> {
+        let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+            .map_err(|error| ClientError::Connection(format!("open service manager: {error}")))?;
+        let name: Vec<u16> = "DirectHCI".encode_utf16().chain(Some(0)).collect();
+        let service = unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), SERVICE_START) };
+        let _ = unsafe { CloseServiceHandle(manager) };
+        let service = service.map_err(|error| {
+            ClientError::Connection(format!(
+                "open DirectHCI service for on-demand start (SERVICE_START permission required): {error}"
+            ))
+        })?;
+        let result = unsafe { StartServiceW(service, None) };
+        let _ = unsafe { CloseServiceHandle(service) };
+        match result {
+            Ok(()) => Ok(()),
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_ALREADY_RUNNING.0) => {
+                Ok(())
+            }
+            Err(error) => Err(ClientError::Connection(format!(
+                "start DirectHCI service (administrator or SERVICE_START permission required): {error}"
+            ))),
+        }
+    }
 
     struct HandleState {
         handle: HANDLE,
@@ -436,6 +518,31 @@ mod platform {
             match self.connection.control(&ControlRequest::RuntimeStatus)? {
                 ControlResponse::RuntimeStatus { status } => Ok(status),
                 _ => Err(protocol("unexpected runtime_status response")),
+            }
+        }
+        pub(super) fn preferences(&self) -> Result<RuntimePreferences, ClientError> {
+            match self.connection.control(&ControlRequest::GetPreferences)? {
+                ControlResponse::Preferences { preferences } => Ok(preferences),
+                _ => Err(protocol("unexpected preferences response")),
+            }
+        }
+        pub(super) fn set_preferred_controller(
+            &self,
+            controller_id: &str,
+        ) -> Result<RuntimePreferences, ClientError> {
+            match self
+                .connection
+                .control(&ControlRequest::SetPreferredController {
+                    controller_id: controller_id.into(),
+                })? {
+                ControlResponse::Preferences { preferences } => Ok(preferences),
+                _ => Err(protocol("unexpected preferences response")),
+            }
+        }
+        pub(super) fn restore_windows(&self) -> Result<(), ClientError> {
+            match self.connection.control(&ControlRequest::RestoreWindows)? {
+                ControlResponse::Accepted => Ok(()),
+                _ => Err(protocol("unexpected restore response")),
             }
         }
         pub(super) fn acquire_raw_hci(&self, controller_id: &str) -> Result<Session, ClientError> {

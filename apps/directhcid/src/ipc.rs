@@ -44,7 +44,6 @@ static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<(), String> {
     let connections: Arc<Mutex<Vec<Arc<PipeHandle>>>> = Arc::new(Mutex::new(Vec::new()));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
-
     let mut first_instance = true;
     while !stop.load(Ordering::Acquire) {
         reap_finished(&mut workers);
@@ -263,6 +262,34 @@ fn dispatch_frame(
                         &ControlResponse::RuntimeStatus { status },
                     )
                 }
+                ControlRequest::GetPreferences => {
+                    let preferences = runtime
+                        .preferences()
+                        .map_err(|error| (request_id, IpcErrorCode::Runtime, error))?;
+                    send_json(
+                        outbound,
+                        request_id,
+                        &ControlResponse::Preferences { preferences },
+                    )
+                }
+                ControlRequest::SetPreferredController { controller_id } => {
+                    require_admin(is_admin, request_id)?;
+                    let preferences = runtime
+                        .set_preferred_controller(&controller_id)
+                        .map_err(|(code, message)| (request_id, code, message))?;
+                    send_json(
+                        outbound,
+                        request_id,
+                        &ControlResponse::Preferences { preferences },
+                    )
+                }
+                ControlRequest::RestoreWindows => {
+                    require_admin(is_admin, request_id)?;
+                    runtime
+                        .restore_windows()
+                        .map_err(|(code, message)| (request_id, code, message))?;
+                    send_json(outbound, request_id, &ControlResponse::Accepted)
+                }
                 ControlRequest::AcquireRawHci { controller_id } => {
                     require_admin(is_admin, request_id)?;
                     let response = runtime
@@ -314,7 +341,7 @@ fn require_admin(is_admin: bool, request_id: u32) -> Result<(), (u32, IpcErrorCo
         Err((
             request_id,
             IpcErrorCode::Unauthorized,
-            "administrator membership is required for ownership and Raw HCI".into(),
+            "administrator membership is required for this operation".into(),
         ))
     }
 }

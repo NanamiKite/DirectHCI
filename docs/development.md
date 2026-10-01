@@ -27,8 +27,17 @@ directory, for example in PowerShell:
 
 ```powershell
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
-cargo build --workspace --target x86_64-pc-windows-gnu
+cargo build --locked --release --target x86_64-pc-windows-gnu -p directhci -p directhcid -p directhci-control-panel -p directhci-ble-cli
+$bin = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-gnu\release'
+Get-Item (Join-Path $bin 'directhci.exe'), (Join-Path $bin 'directhcid.exe'), (Join-Path $bin 'directhci-control-panel.exe'), (Join-Path $bin 'directhci-ble.exe')
 ```
+
+These four executables are in `$bin`, not in the source tree and not in
+`C:\Program Files\DirectHCI`. Keep the same `CARGO_TARGET_DIR` for build and
+run. The installer copies them to Program Files only after a separate installer
+build and installation. If the build fails, the executable may not exist.
+Without this environment
+variable, Cargo instead uses the repository's `target` directory.
 
 Controller discovery, `doctor`, and `takeover plan` are non-device-mutating.
 The development command `takeover roundtrip <id> --execute` and
@@ -42,15 +51,14 @@ manual `pnputil /add-driver` staging command.
 Run the development console host from an elevated Windows terminal:
 
 ```powershell
-directhcid run
+& (Join-Path $bin 'directhcid.exe') run
 ```
 
 Normal product-path commands connect to `\\.\pipe\DirectHCI\v1`:
 
 ```powershell
-directhci status
-directhci controllers
-directhci hci-info <controller-id> --execute
+& (Join-Path $bin 'directhci.exe') status
+& (Join-Path $bin 'directhci.exe') controllers
 ```
 
 `directhcid install-service` registers the current executable as the manual
@@ -62,7 +70,53 @@ binary/parent with untrusted owner or write access. Console `directhcid run`
 continues to work from development directories.
 
 The `%ProgramData%\DirectHCI` ownership journal directory is now accepted only
-with a protected SYSTEM/Administrators ACL and trusted owner. An older or
-pre-created directory with broader permissions is deliberately rejected; have
-an administrator inspect and repair it before takeover or offline recovery.
-DirectHCI will not silently adopt an untrusted journal directory.
+with a protected SYSTEM/Administrators ACL and trusted owner. Service
+installation/startup safely creates it when missing. A legacy directory with
+an Administrators/SYSTEM owner, no reparse point, and no ownership journal is
+automatically tightened; a formerly user-writable `config.json` is
+quarantined and the daemon recreates preferences. An existing journal,
+untrusted owner, reparse point, or unexpected directory content still blocks
+automatic repair. DirectHCI never adopts an untrusted ownership journal.
+
+## Control Panel
+
+For normal Windows installation and uninstallation, use the installer build
+and safety procedure in [installation.md](installation.md). The commands below
+are for development builds only.
+
+Once the `DirectHCI` service is installed, everyday use is simply opening
+`directhci-control-panel.exe` and, if needed, clicking **Start Service**. No
+terminal is needed for status, controller selection, recovery, or diagnostics.
+The panel checks its effective token on startup and requests UAC elevation
+when necessary. If approval is declined, it does not open. This does not
+elevate the separate CLI, SDK, or BLE consumer. The panel does not install the
+service; that is a one-time development/setup action, not something to repeat
+every launch.
+
+For developers building from source, use the `$bin` path from the Windows host
+build above. If building only the panel:
+
+```powershell
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
+cargo build --release --target x86_64-pc-windows-gnu -p directhci-control-panel
+$bin = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-gnu\release'
+& (Join-Path $bin 'directhci-control-panel.exe')
+```
+
+Launch the resulting executable directly; it does not install or start a
+service implicitly. It opens even when the `DirectHCI` service is stopped or
+missing. Start/Stop Service use Windows SCM, while runtime diagnostics, preferred
+controller changes, and Restore Windows use the existing local named pipe.
+
+Ordinary local users can query diagnostics through the SDK/CLI while the
+service is available. The Control Panel requests elevation for its SCM and
+preference/recovery operations. Status refreshes automatically about every
+two seconds on a background worker. Closing the panel requests an SCM stop,
+waits for `Stopped`, then exits; the **Stop Service** button does the same
+without closing the panel. Stopping an active session requires confirmation
+and runs the existing Windows Bluetooth restore path. The daemon
+owns `%ProgramData%\DirectHCI\config.json` and writes it atomically; the GUI
+does not edit that file. If exactly one controller exists at daemon startup and
+no preference has been saved, the daemon saves it automatically. With multiple
+controllers, the user must choose one; a missing saved controller is not silently
+replaced.

@@ -185,6 +185,9 @@ pub struct ServerHello {
 pub enum ControlRequest {
     ListControllers,
     RuntimeStatus,
+    GetPreferences,
+    SetPreferredController { controller_id: String },
+    RestoreWindows,
     AcquireRawHci { controller_id: String },
     ReleaseSession { session_id: u64 },
 }
@@ -198,6 +201,9 @@ pub enum ControlResponse {
     RuntimeStatus {
         status: RuntimeStatus,
     },
+    Preferences {
+        preferences: RuntimePreferences,
+    },
     SessionReady {
         session_id: u64,
         controller: ControllerObservation,
@@ -208,6 +214,11 @@ pub enum ControlResponse {
         controller: Option<ControllerObservation>,
     },
     Accepted,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct RuntimePreferences {
+    pub preferred_controller_id: Option<ControllerId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

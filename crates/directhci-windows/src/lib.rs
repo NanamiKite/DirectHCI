@@ -24,6 +24,8 @@ impl std::error::Error for Error {}
 #[cfg(windows)]
 mod enumeration;
 mod journal;
+#[cfg(windows)]
+mod preferences;
 mod raw_hci;
 mod rebind;
 #[cfg(windows)]
@@ -33,6 +35,8 @@ mod usbdk;
 mod winusb;
 
 pub use journal::{JournalError, JournalLoad, JournalStore};
+#[cfg(windows)]
+pub use preferences::PreferencesStore;
 pub use raw_hci::{
     DEFAULT_COMMAND_TIMEOUT, HciTraceCallback, HciTraceDirection, HciTracePacketType,
     HciTraceRecord, RawHciError, RawHciSession, RawHciSessionOptions, RawHciShutdownReport,
@@ -45,7 +49,7 @@ pub use rebind::{
     plan_temporary_winusb_rebind,
 };
 #[cfg(windows)]
-pub use security::validate_service_executable;
+pub use security::{repair_program_data_directory, validate_service_executable};
 pub use takeover::{
     DriverInstallStep, HciBringUpReport, HciInformationReport, OfflineRecoveryReport,
     OfflineRecoveryStatus, PreflightJournalStatus, RoundTripStatus, RuntimeControllerSession,

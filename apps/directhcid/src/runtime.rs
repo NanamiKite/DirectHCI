@@ -6,10 +6,11 @@ use std::time::Duration;
 use directhci_core::{
     ActiveSessionInfo, ControlResponse, ControllerObservation, IpcErrorCode, IpcFrame,
     IpcMessageKind, IpcTransportInfo, RuntimeControllerState, RuntimeControllerStatus,
-    RuntimeStatus, encode_acl_packet, encode_hci_command_response, encode_hci_event,
+    RuntimePreferences, RuntimeStatus, encode_acl_packet, encode_hci_command_response,
+    encode_hci_event,
 };
 use directhci_windows::{
-    OfflineRecoveryStatus, RoundTripStatus, RuntimeControllerSession,
+    OfflineRecoveryStatus, PreferencesStore, RoundTripStatus, RuntimeControllerSession,
     acquire_runtime_controller_session,
 };
 
@@ -46,19 +47,47 @@ struct ActiveSession {
 
 struct State {
     active: Option<ActiveSession>,
+    maintenance: bool,
+    preferences: Result<RuntimePreferences, String>,
     recovery_required: bool,
     recovery_message: Option<String>,
 }
 
 pub struct DirectHciRuntime {
     state: Mutex<State>,
+    preferences_store: Result<PreferencesStore, String>,
     next_session: AtomicU64,
     shutting_down: AtomicBool,
 }
 
 impl DirectHciRuntime {
     pub fn start() -> Arc<Self> {
+        let directory_repair = directhci_windows::repair_program_data_directory();
+        if let Err(error) = &directory_repair {
+            eprintln!("directhcid: state directory is unsafe: {error}");
+        }
+        let preferences_store = PreferencesStore::program_data();
+        let mut preferences = directory_repair.and_then(|_| {
+            preferences_store
+                .as_ref()
+                .map_err(Clone::clone)
+                .and_then(PreferencesStore::load)
+        });
         let recovery = directhci_windows::recover_offline();
+        // An empty preference may be initialized once during privileged daemon
+        // startup. A read-only IPC request must never persist configuration.
+        if matches!(&preferences, Ok(value) if value.preferred_controller_id.is_none()) {
+            if let Ok(controllers) = directhci_windows::enumerate_controllers() {
+                if controllers.len() == 1 {
+                    let selected = RuntimePreferences {
+                        preferred_controller_id: Some(controllers[0].id.clone()),
+                    };
+                    if let Ok(store) = &preferences_store {
+                        preferences = store.save(&selected).map(|()| selected);
+                    }
+                }
+            }
+        }
         let recovery_required = matches!(
             recovery.status,
             OfflineRecoveryStatus::DeviceMissing
@@ -79,9 +108,12 @@ impl DirectHciRuntime {
         Arc::new(Self {
             state: Mutex::new(State {
                 active: None,
+                maintenance: false,
+                preferences,
                 recovery_required,
                 recovery_message,
             }),
+            preferences_store,
             next_session: AtomicU64::new(1),
             shutting_down: AtomicBool::new(false),
         })
@@ -98,6 +130,134 @@ impl DirectHciRuntime {
                 .as_ref()
                 .is_some_and(|active| active.owner_connection == connection_id)
         })
+    }
+
+    pub fn preferences(&self) -> Result<RuntimePreferences, String> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| "runtime state lock poisoned")?;
+        state.preferences.clone()
+    }
+
+    pub fn set_preferred_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<RuntimePreferences, (IpcErrorCode, String)> {
+        let controllers = self
+            .list_controllers()
+            .map_err(|error| (IpcErrorCode::Runtime, error))?;
+        let mut matching = controllers
+            .iter()
+            .filter(|controller| controller.id.as_str().eq_ignore_ascii_case(controller_id));
+        let controller = matching.next().ok_or_else(|| {
+            (
+                IpcErrorCode::ControllerNotFound,
+                "preferred controller is not present".into(),
+            )
+        })?;
+        if matching.next().is_some() {
+            return Err((
+                IpcErrorCode::ControllerBusy,
+                "controller identity is ambiguous".into(),
+            ));
+        }
+        let selected = RuntimePreferences {
+            preferred_controller_id: Some(controller.id.clone()),
+        };
+        let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
+        if state.active.is_some() || state.maintenance {
+            return Err((
+                IpcErrorCode::ControllerBusy,
+                "controller is currently in use".into(),
+            ));
+        }
+        state
+            .preferences
+            .as_ref()
+            .map_err(|error| (IpcErrorCode::Runtime, error.clone()))?;
+        self.preferences_store
+            .as_ref()
+            .map_err(|error| (IpcErrorCode::Runtime, error.clone()))?
+            .save(&selected)
+            .map_err(|error| (IpcErrorCode::Runtime, error))?;
+        state.preferences = Ok(selected.clone());
+        Ok(selected)
+    }
+
+    pub fn restore_windows(&self) -> Result<(), (IpcErrorCode, String)> {
+        let active = {
+            let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
+            if state.maintenance {
+                return Err((
+                    IpcErrorCode::ControllerBusy,
+                    "recovery is already running".into(),
+                ));
+            }
+            state.maintenance = true;
+            state.active.as_mut().map(|active| {
+                active.phase = RuntimeControllerState::Restoring;
+                active.cancel.store(true, Ordering::Release);
+                (active.requests.clone(), active.info.session_id)
+            })
+        };
+        if let Some((sender, session_id)) = active {
+            let _ = sender.try_send(ControllerRequest::Stop);
+            let deadline = std::time::Instant::now() + SESSION_STOP_TIMEOUT;
+            while std::time::Instant::now() < deadline {
+                if self
+                    .state
+                    .lock()
+                    .map_err(|_| runtime_lock_error())?
+                    .active
+                    .as_ref()
+                    .is_none_or(|active| active.info.session_id != session_id)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            if self
+                .state
+                .lock()
+                .map_err(|_| runtime_lock_error())?
+                .active
+                .is_some()
+            {
+                let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
+                state.recovery_required = true;
+                state.recovery_message =
+                    Some("active session did not stop within the recovery deadline".into());
+                state.maintenance = false;
+                return Err((
+                    IpcErrorCode::RecoveryRequired,
+                    state.recovery_message.clone().unwrap(),
+                ));
+            }
+        }
+        let report = directhci_windows::recover_offline();
+        let success = matches!(
+            report.status,
+            OfflineRecoveryStatus::NoJournal
+                | OfflineRecoveryStatus::AlreadyWindowsOwned
+                | OfflineRecoveryStatus::RestoredWindows
+        );
+        let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
+        state.maintenance = false;
+        state.recovery_required = !success;
+        state.recovery_message = (!success).then(|| {
+            report
+                .error
+                .unwrap_or_else(|| format!("Windows recovery ended in {:?}", report.status))
+        });
+        if success {
+            Ok(())
+        } else {
+            Err((
+                IpcErrorCode::RecoveryRequired,
+                state.recovery_message.clone().unwrap(),
+            ))
+        }
     }
 
     pub fn status(&self) -> Result<RuntimeStatus, String> {
@@ -157,6 +317,12 @@ impl DirectHciRuntime {
                         .recovery_message
                         .clone()
                         .unwrap_or_else(|| "offline recovery is required".into()),
+                ));
+            }
+            if state.maintenance {
+                return Err((
+                    IpcErrorCode::ControllerBusy,
+                    "Windows recovery is in progress".into(),
                 ));
             }
             if state.active.is_some() {

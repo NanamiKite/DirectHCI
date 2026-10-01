@@ -2,19 +2,28 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
 
-use windows::Win32::Foundation::NO_ERROR;
+use windows::Win32::Foundation::{
+    ERROR_SERVICE_DOES_NOT_EXIST, ERROR_SERVICE_MARKED_FOR_DELETE, ERROR_SERVICE_NOT_ACTIVE,
+    NO_ERROR,
+};
 use windows::Win32::System::Console::{
     CTRL_BREAK_EVENT, CTRL_C_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
     SetConsoleCtrlHandler,
 };
 use windows::Win32::System::Services::*;
-use windows::core::{PCWSTR, PWSTR};
+use windows::core::{HRESULT, PCWSTR, PWSTR};
+
+use directhci_windows::OfflineRecoveryStatus;
 
 use crate::ipc;
 use crate::runtime::DirectHciRuntime;
 
 const SERVICE_NAME: &str = "DirectHCI";
+// Standard DELETE access right required by DeleteService/OpenServiceW.
+const DELETE_ACCESS: u32 = 0x0001_0000;
 static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -24,11 +33,15 @@ pub fn dispatch(arguments: Vec<String>) -> Result<(), String> {
         [command] if command == "run" => run_console(),
         [command] if command == "service" => run_service_dispatcher(),
         [command] if command == "install-service" => install_service(),
+        [command] if command == "uninstall-service" => uninstall_service(),
         [command] if command == "--help" || command == "-h" => {
-            println!("directhcid [run|service|install-service]");
+            println!("directhcid [run|service|install-service|uninstall-service]");
             println!("  run              run in the foreground for development");
             println!("  service          enter the Windows SCM dispatcher");
             println!("  install-service  register this executable as DirectHCI (manual start)");
+            println!(
+                "  uninstall-service stop, recover Windows Bluetooth, then remove the service"
+            );
             Ok(())
         }
         _ => Err("invalid command; run `directhcid --help`".into()),
@@ -144,6 +157,7 @@ fn set_status(current: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u
 fn install_service() -> Result<(), String> {
     let executable = std::env::current_exe().map_err(|error| error.to_string())?;
     directhci_windows::validate_service_executable(&executable)?;
+    directhci_windows::repair_program_data_directory()?;
     let binary_path = format!("\"{}\" service", executable.display());
     let service_name = wide(SERVICE_NAME);
     let display_name = wide("DirectHCI Runtime");
@@ -177,6 +191,134 @@ fn install_service() -> Result<(), String> {
     }
     let _ = unsafe { CloseServiceHandle(manager) };
     result.map(|_| println!("DirectHCI service installed (manual start)."))
+}
+
+// The installer calls this before removing any executable. A failed stop or
+// recovery deliberately leaves the service and journal in place for diagnosis.
+fn uninstall_service() -> Result<(), String> {
+    let manager = ServiceHandle(
+        unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
+            .map_err(|error| format!("OpenSCManagerW: {error}"))?,
+    );
+    let name = wide(SERVICE_NAME);
+    let mut deletion_pending = false;
+    let service = match unsafe {
+        OpenServiceW(
+            manager.0,
+            PCWSTR(name.as_ptr()),
+            SERVICE_STOP | SERVICE_QUERY_STATUS | DELETE_ACCESS,
+        )
+    } {
+        Ok(handle) => Some(ServiceHandle(handle)),
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) => None,
+        Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_MARKED_FOR_DELETE.0) => {
+            deletion_pending = true;
+            None
+        }
+        Err(error) => return Err(format!("OpenServiceW: {error}")),
+    };
+
+    if deletion_pending {
+        wait_service_gone(manager.0, &name)?;
+    }
+
+    if let Some(service) = &service {
+        if query_service_state(service.0)? != SERVICE_STOPPED {
+            let mut status = SERVICE_STATUS::default();
+            match unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } {
+                Ok(()) => {}
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_NOT_ACTIVE.0) => {}
+                Err(error) => return Err(format!("ControlService(STOP): {error}")),
+            }
+            let deadline = Instant::now() + Duration::from_secs(90);
+            while query_service_state(service.0)? != SERVICE_STOPPED {
+                if Instant::now() >= deadline {
+                    return Err("DirectHCI service did not stop within 90 seconds; installation files were not removed".into());
+                }
+                thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+
+    directhci_windows::repair_program_data_directory()?;
+    // A clean service stop alone does not prove that an outstanding DirectHCI
+    // ownership journal was reconciled; offline recovery observes it afresh.
+    let recovery = directhci_windows::recover_offline();
+    if !matches!(
+        &recovery.status,
+        OfflineRecoveryStatus::NoJournal
+            | OfflineRecoveryStatus::AlreadyWindowsOwned
+            | OfflineRecoveryStatus::RestoredWindows
+    ) {
+        return Err(format!(
+            "Windows Bluetooth recovery not confirmed ({:?}): {}; service retained; run `directhci recover --offline`",
+            recovery.status,
+            recovery
+                .error
+                .as_deref()
+                .unwrap_or("inspect the ownership journal")
+        ));
+    }
+    if let Some(service) = service {
+        unsafe { DeleteService(service.0) }.map_err(|error| format!("DeleteService: {error}"))?;
+        drop(service);
+        wait_service_gone(manager.0, &name)?;
+        println!(
+            "DirectHCI service removed; offline recovery status: {:?}.",
+            recovery.status
+        );
+    } else {
+        println!(
+            "DirectHCI service is not installed; offline recovery status: {:?}.",
+            recovery.status
+        );
+    }
+    Ok(())
+}
+
+fn wait_service_gone(manager: SC_HANDLE, name: &[u16]) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match unsafe { OpenServiceW(manager, PCWSTR(name.as_ptr()), SERVICE_QUERY_STATUS) } {
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_SERVICE_DOES_NOT_EXIST.0) => {
+                return Ok(());
+            }
+            Ok(service) => {
+                let _ = unsafe { CloseServiceHandle(service) };
+            }
+            Err(error)
+                if error.code() == HRESULT::from_win32(ERROR_SERVICE_MARKED_FOR_DELETE.0) => {}
+            Err(error) => return Err(format!("wait for service deletion: {error}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("DirectHCI service is still pending deletion; close service-management tools and retry".into());
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+struct ServiceHandle(SC_HANDLE);
+
+impl Drop for ServiceHandle {
+    fn drop(&mut self) {
+        // SAFETY: this wrapper owns the SCM handle returned by Open*W.
+        let _ = unsafe { CloseServiceHandle(self.0) };
+    }
+}
+
+fn query_service_state(service: SC_HANDLE) -> Result<SERVICE_STATUS_CURRENT_STATE, String> {
+    let mut status = SERVICE_STATUS_PROCESS::default();
+    let mut needed = 0;
+    // SAFETY: the byte slice covers exactly the live output structure.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            (&mut status as *mut SERVICE_STATUS_PROCESS).cast::<u8>(),
+            std::mem::size_of::<SERVICE_STATUS_PROCESS>(),
+        )
+    };
+    unsafe { QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO, Some(bytes), &mut needed) }
+        .map_err(|error| format!("QueryServiceStatusEx: {error}"))?;
+    Ok(status.dwCurrentState)
 }
 
 fn wide(value: &str) -> Vec<u16> {
