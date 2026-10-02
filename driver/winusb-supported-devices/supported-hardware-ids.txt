@@ -1,0 +1,24 @@
+# One explicit USB PnP Hardware ID per line; all entries share one WinUSB install section.
+# Presence here permits a guarded takeover attempt, NOT a compatibility guarantee.
+# 0026: DirectHCI AX201 ownership/HCI/BLE verified; 0029: observed on another Windows host.
+# Remaining IDs are upstream Linux btusb USB_DEVICE entries, not DirectHCI-verified.
+# Reference: https://github.com/torvalds/linux/blob/master/drivers/bluetooth/btusb.c
+USB\VID_8087&PID_0025
+USB\VID_8087&PID_0026
+USB\VID_8087&PID_0029
+USB\VID_8087&PID_0032
+USB\VID_8087&PID_0033
+USB\VID_8087&PID_0035
+USB\VID_8087&PID_0036
+USB\VID_8087&PID_0037
+USB\VID_8087&PID_0038
+USB\VID_8087&PID_0039
+USB\VID_8087&PID_0040
+USB\VID_8087&PID_0A2B
+USB\VID_8087&PID_0AAA
+USB\VID_0BDA&PID_B00C
+USB\VID_0BDA&PID_C822
+USB\VID_0BDA&PID_B850
+USB\VID_0BDA&PID_2852
+USB\VID_0BDA&PID_C852
+USB\VID_0A12&PID_0001

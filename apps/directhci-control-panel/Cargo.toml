@@ -9,7 +9,7 @@ publish.workspace = true
 [target.'cfg(windows)'.dependencies]
 directhci-client.workspace = true
 directhci-core.workspace = true
-native-windows-gui = { version = "1.0.13", default-features = false, features = ["combobox", "notice", "textbox", "clipboard", "high-dpi", "frame", "embed-resource"] }
+native-windows-gui = { version = "1.0.13", default-features = false, features = ["combobox", "notice", "textbox", "clipboard", "high-dpi", "frame", "embed-resource", "tray-notification", "menu", "cursor"] }
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",

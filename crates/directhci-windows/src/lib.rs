@@ -26,6 +26,9 @@ mod enumeration;
 mod journal;
 #[cfg(windows)]
 mod preferences;
+mod provisioning;
+#[cfg(windows)]
+mod provisioning_windows;
 mod raw_hci;
 mod rebind;
 #[cfg(windows)]
@@ -37,6 +40,15 @@ mod winusb;
 pub use journal::{JournalError, JournalLoad, JournalStore};
 #[cfg(windows)]
 pub use preferences::PreferencesStore;
+pub use provisioning::{
+    DeviceSpecificPackageBlueprint, device_specific_package_blueprint,
+    eligible_device_specific_package,
+};
+#[cfg(windows)]
+pub use provisioning_windows::{
+    ControllerPreparationStatus, PreparedController, controller_preparation_status,
+    prepare_controller,
+};
 pub use raw_hci::{
     DEFAULT_COMMAND_TIMEOUT, HciTraceCallback, HciTraceDirection, HciTracePacketType,
     HciTraceRecord, RawHciError, RawHciSession, RawHciSessionOptions, RawHciShutdownReport,
@@ -46,7 +58,7 @@ pub use rebind::{
     CompatibleDriverObservation, DIRECTHCI_WINUSB_INTERFACE_GUID, DirectHciDefaultSelectionRisk,
     DirectHciPackageReadiness, DirectHciWinUsbPackageSpec, DriverInstallOutcome,
     RebindObservedState, RebindPlanBlocker, RebindSafetyPrerequisites, TemporaryRebindPlan,
-    plan_temporary_winusb_rebind,
+    plan_temporary_device_specific_rebind, plan_temporary_winusb_rebind,
 };
 #[cfg(windows)]
 pub use security::{repair_program_data_directory, validate_service_executable};

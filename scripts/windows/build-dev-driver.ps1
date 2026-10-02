@@ -10,18 +10,24 @@ param(
     [string] $CertificateSubject = 'CN=DirectHCI Development Test',
     [string] $Inf2CatOs = '10_X64,10_CO_X64',
 
-    [string] $OutputDirectory = (Join-Path $env:LOCALAPPDATA 'DirectHCI\driver\winusb-ax201-dev')
+    [string] $OutputDirectory
 )
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $repository = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
-$sourceInf = Join-Path $repository 'driver\winusb-ax201-dev\directhci-ax201-dev.inf'
-$package = [System.IO.Path]::GetFullPath($OutputDirectory)
-$inf = Join-Path $package 'directhci-ax201-dev.inf'
-$catalog = Join-Path $package 'directhci-ax201-dev.cat'
-$certificateFile = Join-Path $package 'directhci-development-test.cer'
+$packageName = 'winusb-supported-devices'
+$infName = 'directhci-winusb-dev.inf'
+if (-not $OutputDirectory) {
+    $OutputDirectory = Join-Path $env:LOCALAPPDATA "DirectHCI\driver\$packageName"
+}
+$templateInf = Join-Path $repository "driver\$packageName\directhci-winusb-dev.inf.in"
+$supportedIds = Join-Path $repository "driver\$packageName\supported-hardware-ids.txt"
+$packageDir = [System.IO.Path]::GetFullPath($OutputDirectory)
+$inf = Join-Path $packageDir $infName
+$catalog = Join-Path $packageDir ([System.IO.Path]::ChangeExtension($infName, '.cat'))
+$certificateFile = Join-Path $packageDir 'directhci-development-test.cer'
 
 function Find-WindowsKitTool {
     param([Parameter(Mandatory = $true)][string] $Name)
@@ -59,12 +65,35 @@ function Invoke-Checked {
     }
 }
 
-if (-not (Test-Path $sourceInf)) {
-    throw "source INF not found: $sourceInf"
+if (-not (Test-Path -LiteralPath $templateInf -PathType Leaf) -or
+    -not (Test-Path -LiteralPath $supportedIds -PathType Leaf)) {
+    throw "Driver template or supported Hardware ID list not found in driver\$packageName."
 }
 
-New-Item -ItemType Directory -Path $package -Force | Out-Null
-Copy-Item -LiteralPath $sourceInf -Destination $inf -Force
+$hardwareIds = [System.Collections.Generic.List[string]]::new()
+$seenIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($entry in (Get-Content -LiteralPath $supportedIds)) {
+    $id = $entry.Trim()
+    if ($id.Length -eq 0 -or $id.StartsWith('#')) { continue }
+    if ($id -cnotmatch '^USB\\VID_[0-9A-Fa-f]{4}&PID_[0-9A-Fa-f]{4}(&MI_[0-9A-Fa-f]{2})?$') {
+        throw ("Invalid PnP Hardware ID in {0}: {1}" -f $supportedIds, $id)
+    }
+    if (-not $seenIds.Add($id)) { throw "Duplicate PnP Hardware ID: $id" }
+    $hardwareIds.Add($id.ToUpperInvariant())
+}
+if ($hardwareIds.Count -eq 0) { throw "Supported Hardware ID list is empty: $supportedIds" }
+$sortedIds = $hardwareIds.ToArray()
+[Array]::Sort($sortedIds, [System.StringComparer]::Ordinal)
+$modelLines = @($sortedIds | ForEach-Object { '%DeviceName%=DirectHCI_Install,' + $_ })
+$template = [System.IO.File]::ReadAllText($templateInf)
+$marker = '; DIRECTHCI_MODELS'
+if (-not $template.Contains($marker) -or
+    $template.IndexOf($marker) -ne $template.LastIndexOf($marker)) {
+    throw "INF template must contain exactly one model marker: $templateInf"
+}
+New-Item -ItemType Directory -Path $packageDir -Force | Out-Null
+[System.IO.File]::WriteAllText($inf, $template.Replace($marker, ($modelLines -join [Environment]::NewLine)), [System.Text.Encoding]::ASCII)
+Write-Host "Generated one INF with $($sortedIds.Length) explicit USB Hardware IDs."
 
 $infVerif = Find-WindowsKitTool 'InfVerif.exe'
 $inf2Cat = Find-WindowsKitTool 'Inf2Cat.exe'
@@ -77,7 +106,7 @@ if (Test-Path $catalog) {
     Remove-Item -LiteralPath $catalog -Force
 }
 Write-Host "Generating catalog for $Inf2CatOs"
-Invoke-Checked $inf2Cat @("/driver:$package", "/os:$Inf2CatOs", '/verbose')
+Invoke-Checked $inf2Cat @("/driver:$packageDir", "/os:$Inf2CatOs", '/verbose')
 
 if ($CreateCertificate) {
     Write-Host 'Creating a current-user development signing certificate (not trusting it automatically)'
@@ -122,13 +151,14 @@ try {
 
 Write-Host ''
 Write-Host 'Development package complete.'
-Write-Host "  Output:      $package"
+Write-Host "  Output:      $packageDir"
 Write-Host "  INF:         $inf"
 Write-Host "  Catalog:     $catalog"
 Write-Host "  Secure Boot: $secureBoot"
 Write-Host "  Test signing: $testSigning"
 Write-Host ''
 Write-Warning 'This script did not trust a certificate, change boot policy, stage the package, or modify any device.'
+Write-Warning 'Listed Hardware IDs are candidates only; unverified devices require runtime topology and HCI validation. Review every matching radio and driver rank before staging.'
 Write-Host 'After manually satisfying the host signing policy, stage only with:'
 Write-Host "  pnputil /add-driver `"$inf`""
 Write-Host 'Do not use /install. Re-run `directhci takeover plan <id>` after staging.'

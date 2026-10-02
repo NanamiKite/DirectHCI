@@ -185,6 +185,65 @@ impl DirectHciRuntime {
         Ok(selected)
     }
 
+    pub fn controller_preparation_status(
+        &self,
+        controller_id: &str,
+    ) -> Result<directhci_core::ControllerPreparationStatus, (IpcErrorCode, String)> {
+        let status = directhci_windows::controller_preparation_status(controller_id)
+            .map_err(|error| (IpcErrorCode::Provisioning, error))?;
+        Ok(directhci_core::ControllerPreparationStatus {
+            hardware_id: status.hardware_id,
+            ready: status.ready,
+            takeover_safe: status.takeover_safe,
+            blockers: status.blockers,
+        })
+    }
+
+    pub fn prepare_controller(
+        &self,
+        controller_id: &str,
+    ) -> Result<directhci_core::PreparedController, (IpcErrorCode, String)> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err((IpcErrorCode::Runtime, "runtime is shutting down".into()));
+        }
+        {
+            let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
+            if state.recovery_required {
+                return Err((
+                    IpcErrorCode::RecoveryRequired,
+                    state
+                        .recovery_message
+                        .clone()
+                        .unwrap_or_else(|| "offline recovery is required".into()),
+                ));
+            }
+            if state.maintenance || state.active.is_some() {
+                return Err((
+                    IpcErrorCode::ControllerBusy,
+                    "controller is currently in use".into(),
+                ));
+            }
+            state.maintenance = true;
+        }
+        let result = directhci_windows::prepare_controller(controller_id);
+        self.state
+            .lock()
+            .map_err(|_| runtime_lock_error())?
+            .maintenance = false;
+        result
+            .map(|result| directhci_core::PreparedController {
+                status: directhci_core::ControllerPreparationStatus {
+                    hardware_id: result.status.hardware_id,
+                    ready: result.status.ready,
+                    takeover_safe: result.status.takeover_safe,
+                    blockers: result.status.blockers,
+                },
+                already_prepared: result.already_prepared,
+                staged_inf: result.staged_inf,
+            })
+            .map_err(|error| (IpcErrorCode::Provisioning, error))
+    }
+
     pub fn restore_windows(&self) -> Result<(), (IpcErrorCode, String)> {
         let active = {
             let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;

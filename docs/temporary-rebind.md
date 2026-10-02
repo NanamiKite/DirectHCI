@@ -1,14 +1,14 @@
 # Temporary device-specific WinUSB rebind
 
-This document describes the implemented AX201 M1 takeover path and its
+This document describes the implemented temporary M1 takeover path and its
 safety contract. The Windows host has completed a BTHUSB / `oem69.inf` →
 DirectHCI WinUSB / `oem183.inf` → BTHUSB / `oem69.inf` round trip, including
 WinUSB readiness and verified Windows restore. Those INF names are historical
 observations, not hard-coded recovery targets.
 
-Driver package build, certificate trust, and Driver Store staging remain
-explicit user operations. DirectHCI does not stage/remove a package, disable
-the device, or change boot policy. The M1-only diagnostic command is:
+Driver package build and certificate trust remain explicit user operations.
+Driver Store staging is optional in Setup; DirectHCI runtime does not stage or
+remove a package, disable the device, or change boot policy. The M1-only diagnostic command is:
 
 ```text
 directhci takeover roundtrip <controller-id> --execute
@@ -20,8 +20,12 @@ development/recovery entry points. See [architecture.md](architecture.md).
 
 ## Scope and invariant
 
-The current target is the present Intel AX201 Bluetooth USB function
-(`USB\VID_8087&PID_0026`) that Windows normally owns through `BTHUSB`:
+The validated target was the Intel AX201 Bluetooth USB function
+(`USB\VID_8087&PID_0026`) that Windows normally owns through `BTHUSB`.
+The new development INF instead lists explicit USB PnP Hardware IDs in one
+shared WinUSB package. A listed ID permits a guarded takeover attempt; it does
+not guarantee firmware bring-up, Raw HCI support, or safe restoration on
+untested hardware:
 
 ```text
 WindowsOwned
@@ -90,55 +94,37 @@ matching remains global eligibility. “Device-specific” describes the binding
 operation, not the scope of package installation. DirectHCI must therefore
 verify rank and staging behavior before the first bind.
 
-## Development WinUSB package
+## Device-specific WinUSB preparation
 
-The development package at
-`driver/winusb-ax201-dev/directhci-ax201-dev.inf` is an INF plus signed catalog
-that:
+The former `USB\Class_E0&SubClass_01&Prot_01` class-compatible-ID INF
+failed Windows Inf2Cat B2.6.4.9 and is not used. The static multi-Hardware-ID
+development package is migration-only. The runtime instead selects one exact
+Hardware ID from a fresh USB Bluetooth controller observation, then, after
+administrator consent, generates a single-model INF. libwdi generates and
+self-signs its CAT with a one-time certificate. The privileged service stages
+it with SetupAPI only; it never calls `/install` or rebinds during preparation.
 
-- matches `USB\VID_8087&PID_0026`;
-- uses the in-box `WinUSB.sys` through `Include=winusb.inf` and
-  `Needs=WINUSB.NT` in the install and services sections;
-- declares provider, driver version/date, manufacturer, architecture, and a
-  clearly development-only device description;
-- registers DirectHCI's application interface GUID
-  `{CF97AABE-7898-4D73-B044-A481B26747AA}` through
-  `DeviceInterfaceGUIDs`;
-- contains no custom `.sys`, co-installer, filter, firmware, or persistent
-  hardware operation;
-- declares a protected device security descriptor granting SYSTEM and
-  Administrators access, with no ordinary-user Raw WinUSB access. The
-  *effective* device/interface ACL still requires Windows-host verification
-  after any rebuilt package is staged.
+The package uses the in-box `WinUSB.sys`, preserves DirectHCI's application
+interface GUID and protected device security descriptor, and includes no
+custom kernel driver. The private key must be destroyed after signing; the
+public Root/TrustedPublisher certificate can remain while the package exists.
+Windows may still refuse staging under its current code-integrity policy;
+`PackageStagingRejectedByWindows` preserves that real SetupAPI error and
+leaves the original Bluetooth binding unchanged.
 
-The target hardware ID belongs in this deployment artifact, not generic core
-logic. The first package version should be deliberately lower preference than
-the valid Intel/Windows Bluetooth package and must be identifiable by provider
-and description, not only by its published `oemNN.inf` name.
+Preparation is not takeover. The planner still requires an applicable
+candidate, safe rank, exact physical identity, Windows recovery driver and
+writable ownership journal before `DiInstallDevice`. After explicit takeover,
+WinUSB E0/01/01 and required endpoint readiness remain mandatory. The legacy
+`build-dev-driver.ps1` flow is retained only for development diagnostics.
 
-The package retains the existing Bluetooth setup class so it can appear in the
-AX201 devnode's compatible-driver list, while the function driver is the in-box
-WinUSB implementation. No DirectHCI `.sys` is present.
-
-`scripts/windows/build-dev-driver.ps1` locates `InfVerif`, `Inf2Cat`, and
-`SignTool`, validates the INF, creates the catalog, signs it using an explicitly
-selected or explicitly created development certificate, and verifies catalog
-membership/signature. It never trusts the certificate, stages the package, or
-changes Secure Boot/test-signing configuration. Its default output is the
-host-local `%LOCALAPPDATA%\DirectHCI\driver\winusb-ax201-dev`, keeping generated
-CAT/CER files out of the VMware shared source directory.
-
-`InfVerif`/INF validation and `Inf2Cat` are WDK packaging steps. `SignTool` and
-a development signing certificate are Windows SDK/WDK signing steps. A local
-self-signed catalog normally requires the certificate in the test host's
-Trusted Root and Trusted Publishers stores plus Windows test mode; Secure Boot
-can block enabling that mode. Every trust, boot-policy, and reboot action is
-manual and is never performed by DirectHCI or its build script. An enterprise
-or production-trusted package follows its applicable signing policy instead.
-These packaging tools are isolated from the Rust workspace: controller
-enumeration, planning, journaling, recovery, and WinUSB runtime code remain
-Rust and continue to support the GNU target; full Visual Studio is not a
-runtime or workspace requirement.
+End-user machines do not need EWDK, MSBuild, Inf2Cat, SignTool, or
+developer PowerShell scripts. The build host prepares the pinned libwdi DLL once; the
+installer bundles it. The service may add one explicitly approved local
+certificate to Root and TrustedPublisher during each package preparation.
+That trust does not guarantee Windows will accept the package under Secure
+Boot. DirectHCI never changes Secure Boot, TESTSIGNING, or BCD, and a Windows
+rejection is reported without initiating takeover.
 
 ## Durable acquire ordering
 

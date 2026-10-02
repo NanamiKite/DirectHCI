@@ -162,7 +162,7 @@ package and ensuring non-Bluetooth input and recovery access:
 .\scripts\windows\build-dev-driver.ps1 -CreateCertificate
 # Manually establish the required certificate trust/signing policy, then rerun
 # with -CertificateThumbprint if signature verification initially fails.
-pnputil /add-driver "$env:LOCALAPPDATA\DirectHCI\driver\winusb-ax201-dev\directhci-ax201-dev.inf"
+pnputil /add-driver "$env:LOCALAPPDATA\DirectHCI\driver\winusb-supported-devices\directhci-winusb-dev.inf"
 .\directhci.exe controllers --json
 .\directhci.exe takeover plan <AX201-ID> --json
 .\directhci.exe recover --offline --json

@@ -1,0 +1,37 @@
+; DirectHCI device-specific WinUSB binding template.
+; The Models entry is filled from one freshly observed PnP Hardware ID.
+
+[Version]
+Signature="$WINDOWS NT$"
+Class=USBDevice
+ClassGuid={88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider=%ProviderName%
+DriverVer=10/02/2026,0.1.0.0
+CatalogFile=directhci-winusb.cat
+PnpLockdown=1
+
+[Manufacturer]
+%ManufacturerName%=DirectHCI,NTamd64
+
+[DirectHCI.NTamd64]
+%DeviceName%=DirectHCI_Install,@HARDWARE_ID@
+
+[DirectHCI_Install]
+Include=winusb.inf
+Needs=WINUSB.NT
+
+[DirectHCI_Install.Services]
+Include=winusb.inf
+Needs=WINUSB.NT.Services
+
+[DirectHCI_Install.HW]
+AddReg=DirectHCI_DeviceInterface
+
+[DirectHCI_DeviceInterface]
+HKR,,DeviceInterfaceGUIDs,0x00010000,"{CF97AABE-7898-4D73-B044-A481B26747AA}"
+HKR,,Security,,"D:P(A;;GA;;;SY)(A;;GA;;;BA)"
+
+[Strings]
+ProviderName="DirectHCI Project"
+ManufacturerName="DirectHCI Project"
+DeviceName="DirectHCI WinUSB Bluetooth Controller (Device-Specific)"

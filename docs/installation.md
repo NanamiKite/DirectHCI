@@ -1,12 +1,22 @@
-# Windows binary installation (development package)
+# Windows binary installation
 
 This installer packages the Rust executables and registers `directhcid` as a
 LocalSystem, demand-start Windows service. It installs a Control Panel shortcut
-and an Add/Remove Programs uninstall entry. It does **not** install, stage,
-remove, or select any Bluetooth driver package, change the AX201 binding,
-change boot signing policy, or run a takeover. On the already validated AX201
-machine, the previously staged, signed development WinUSB package remains a
-separate prerequisite for takeover.
+and an Add/Remove Programs uninstall entry. Setup does not bundle or stage a
+controller-specific INF/CAT and never changes a Bluetooth binding. It bundles
+the pinned libwdi-based provisioning component. The Control Panel's explicit
+**Prepare Controller** action generates and stages an exact-Hardware-ID WinUSB
+package later, when a controller is selected. It does not run takeover.
+
+Preparation requires administrator authorization. libwdi creates a one-time
+self-signed certificate for each package, places its public certificate in
+LocalMachine Root and TrustedPublisher, signs the catalog, and destroys its
+private key. The service stages the package with SetupAPI, verifies a fresh
+DirectHCI driver candidate, and checks that BTHUSB remains bound. If Windows
+rejects the signature, preparation fails with the actual SetupAPI error;
+Secure Boot, TESTSIGNING, BCD, and the current driver remain unchanged.
+Whether a given Windows host accepts local self-signing must be established
+on that host; installation alone does not imply a prepared controller.
 
 The installer includes the project's current GPLv3 license text. Before
 redistributing a binary build, make the corresponding source for that exact
@@ -16,15 +26,29 @@ own notices and licenses. See [LICENSE.txt](../LICENSE.txt) and
 
 ## Build on the Windows host
 
-Install Inno Setup 6.4 or newer (compiler `ISCC.exe`) separately. From the repository in
-PowerShell, run:
+Install Inno Setup 6.4 or newer (`ISCC.exe`) on the build host and
+mount the EWDK ISO. In a `cmd.exe` window, run the EWDK's
+`LaunchBuildEnv.cmd`, then `SetupVSEnv`. From that same window, invoke
+PowerShell in the DirectHCI repository:
 
-```powershell
-.\scripts\windows\build-installer.ps1
+```cmd
+F:\LaunchBuildEnv.cmd
+SetupVSEnv
+cd /d "C:\path\to\DirectHCI"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-libwdi.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-installer.ps1
 ```
 
-The script builds `directhci`, `directhcid`, `directhci-control-panel`, and
-`directhci-ble-cli` for `x86_64-pc-windows-gnu`. Cargo output and the installer
+Replace `F:` with the mounted EWDK drive. The pinned libwdi DLL is built
+from its official Visual Studio projects with EWDK MSVC/MSBuild. The script
+checks the source archive hash and applies DirectHCI's external-INF and
+fail-closed private-key cleanup patches. The installer still uses Inno Setup;
+end-user machines need neither EWDK nor Visual Studio.
+
+The installer build requires the libwdi DLL and its corresponding LGPL source
+archive. It then builds `directhci`, `directhcid`,
+`directhci-control-panel`, and `directhci-ble-cli` for
+`x86_64-pc-windows-gnu`. Cargo output and the installer
 are placed under `%LOCALAPPDATA%\DirectHCI`, not the VMware shared folder.
 After a source change, run the script **without** `-SkipBuild`: that flag only
 checks that four executables exist and may package stale binaries. The installer
@@ -37,10 +61,13 @@ Run the resulting `DirectHCI-Setup-0.1.0-alpha.1.exe` from
 approval, installs under `C:\Program Files\DirectHCI`, registers the service,
 and adds a Start Menu Control Panel shortcut. If Setup is already running with
 an elevated token, Windows need not display another UAC prompt; absence of
-a second prompt is not evidence of a non-administrative install. It does not
-start takeover or
-test the Bluetooth controller. Close any manually running `directhcid run`
-console before setup so it does not retain the named pipe. The service is
+a second prompt is not evidence of a non-administrative install. Start the
+service, select a controller, then use **Prepare Controller** if WinUSB support
+shows Not prepared. A newly attached USB Bluetooth controller can be prepared
+without reinstalling DirectHCI. Preparation does not bypass the existing
+takeover planner, driver-rank, journal, or recovery gates. Close any
+manually running `directhcid run` console before setup so it does not retain
+the named pipe. The service is
 demand-start: use the Control
 Panel's **Start Service** button or the opt-in Rust SDK
 `DirectHciClient::connect_or_start(...)` to start it. The normal
@@ -79,13 +106,10 @@ Setup uses the same preflight before replacing an existing installation. It
 skips service removal on a first install when neither a DirectHCI service nor
 an ownership journal exists. If a preflight fails, Setup shows the runtime's
 specific error instead of only an exit code; rebuild the installer after
-changing its `.iss` source. It
-does not remove the separately staged development WinUSB driver package, the
-development signing certificate, or `%ProgramData%\DirectHCI` state. Those
-are deliberately separate from the runtime installer so an unresolved journal
-is not silently erased. The installer currently has no flow for provisioning a
-fresh, unconfigured PC; driver package enrollment is still a manual,
-privileged procedure documented under `driver/winusb-ax201-dev/`.
+changing its `.iss` source. Uninstall does not remove a staged WinUSB package,
+the development signing certificate, or `%ProgramData%\DirectHCI` state.
+Driver Store and journal lifecycles remain separate so an unresolved ownership
+journal is never silently erased.
 
 The Control Panel and SDK work only through the service. The Control Panel
 requests UAC administrator approval when launched without an elevated token;
@@ -104,3 +128,7 @@ Service, controller, active-client, and recovery status refresh automatically
 about every two seconds while the panel is open; IPC queries stay on its
 background worker. An owning client's disconnect restores Windows Bluetooth
 without stopping the service.
+
+Minimizing the Control Panel hides it in the Windows notification area and
+does not stop the service. Click its tray icon to reopen it; **Exit Control
+Panel** in the tray menu follows the same service-stop safeguard as closing.

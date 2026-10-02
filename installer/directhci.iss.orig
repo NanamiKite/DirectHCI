@@ -37,6 +37,8 @@ Source: "{#DirectHciBinaryDir}\directhci.exe"; DestDir: "{app}"; Flags: ignoreve
 Source: "{#DirectHciBinaryDir}\directhci-control-panel.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DirectHciBinaryDir}\directhci-ble.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#DirectHciLibwdiDir}\libwdi.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#DirectHciLibwdiDir}\libwdi-1.5.1-source.tar.gz"; DestDir: "{app}\licenses"; Flags: ignoreversion
+Source: "..\scripts\windows\build-libwdi.ps1"; DestDir: "{app}\licenses"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\DirectHCI Control Panel"; Filename: "{app}\directhci-control-panel.exe"; IconFilename: "{app}\directhci.ico"

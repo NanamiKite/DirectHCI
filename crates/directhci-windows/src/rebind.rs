@@ -15,16 +15,32 @@ pub const DIRECTHCI_WINUSB_INTERFACE_GUID: &str = "{CF97AABE-7898-4D73-B044-A481
 pub struct DirectHciWinUsbPackageSpec {
     pub provider: String,
     pub description: String,
-    pub target_hardware_id: String,
+    pub supported_hardware_ids: Vec<String>,
     pub device_interface_guid: String,
 }
 
 impl DirectHciWinUsbPackageSpec {
-    pub fn ax201_development() -> Self {
+    pub fn device_specific() -> Self {
         Self {
             provider: "DirectHCI Project".into(),
-            description: "DirectHCI WinUSB Controller (AX201 Development)".into(),
-            target_hardware_id: "USB\\VID_8087&PID_0026".into(),
+            description: "DirectHCI WinUSB Bluetooth Controller (Device-Specific)".into(),
+            supported_hardware_ids: Vec::new(),
+            device_interface_guid: DIRECTHCI_WINUSB_INTERFACE_GUID.into(),
+        }
+    }
+
+    pub fn supported_devices_development() -> Self {
+        Self {
+            provider: "DirectHCI Project".into(),
+            description: "DirectHCI WinUSB Bluetooth Controller (Development)".into(),
+            supported_hardware_ids: include_str!(
+                "../../../driver/winusb-supported-devices/supported-hardware-ids.txt"
+            )
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(str::to_owned)
+            .collect(),
             device_interface_guid: DIRECTHCI_WINUSB_INTERFACE_GUID.into(),
         }
     }
@@ -128,7 +144,11 @@ pub enum RebindPlanBlocker {
     NotWindowsOwned {
         service: Option<String>,
     },
-    PackageTargetMismatch,
+    UnsupportedHardwareId,
+    ControllerNotEligible {
+        reason: String,
+    },
+    ControllerChangedDuringPlanning,
     DriverInspectionFailed {
         message: String,
     },
@@ -158,6 +178,79 @@ pub fn plan_temporary_winusb_rebind(
     platform::plan(controller_id, package, prerequisites)
 }
 
+/// Plan against the exact Hardware ID of a freshly enumerated USB Bluetooth
+/// controller. This only inspects Driver Store candidates; it never prepares
+/// a package or changes the current driver.
+pub fn plan_temporary_device_specific_rebind(
+    controller_id: &str,
+    prerequisites: RebindSafetyPrerequisites,
+) -> TemporaryRebindPlan {
+    let fallback = DirectHciWinUsbPackageSpec::device_specific();
+    let controllers = match crate::enumerate_controllers() {
+        Ok(controllers) => controllers,
+        Err(crate::Error::UnsupportedPlatform) => {
+            return empty_plan(
+                controller_id,
+                fallback,
+                RebindPlanBlocker::UnsupportedPlatform,
+            );
+        }
+        Err(error) => {
+            return empty_plan(
+                controller_id,
+                fallback,
+                RebindPlanBlocker::DriverInspectionFailed {
+                    message: error.to_string(),
+                },
+            );
+        }
+    };
+    let matches: Vec<_> = controllers
+        .into_iter()
+        .filter(|controller| controller.id.as_str().eq_ignore_ascii_case(controller_id))
+        .collect();
+    let controller = match matches.as_slice() {
+        [] => {
+            return empty_plan(
+                controller_id,
+                fallback,
+                RebindPlanBlocker::ControllerNotFound,
+            );
+        }
+        [controller] => controller,
+        others => {
+            return empty_plan(
+                controller_id,
+                fallback,
+                RebindPlanBlocker::AmbiguousControllerId {
+                    observations: others.len(),
+                },
+            );
+        }
+    };
+    let package = match crate::provisioning::eligible_device_specific_package(controller) {
+        Ok(package) => package,
+        Err(reason) => {
+            let mut plan = empty_plan(
+                controller_id,
+                fallback,
+                RebindPlanBlocker::ControllerNotEligible { reason },
+            );
+            plan.controller = Some(controller.clone());
+            return plan;
+        }
+    };
+    let mut plan = plan_temporary_winusb_rebind(controller_id, package, prerequisites);
+    if let Some(refreshed) = &plan.controller {
+        if !same_physical_controller(&controller.identity, &refreshed.identity) {
+            plan.blockers
+                .push(RebindPlanBlocker::ControllerChangedDuringPlanning);
+            plan.safe_to_execute = false;
+            plan.driver_switch_candidate_ready = false;
+        }
+    }
+    plan
+}
 pub(crate) fn observe_controller_and_drivers(
     identity: &directhci_core::ControllerIdentity,
 ) -> Result<(ControllerObservation, Vec<CompatibleDriverObservation>), String> {
@@ -253,19 +346,28 @@ fn evaluate_observed_controller(
             service: controller.service.clone(),
         });
     }
-    let target_matches = controller
+    let matching_hardware_ids: Vec<_> = controller
         .identity
         .hardware_ids
         .iter()
-        .any(|id| id.eq_ignore_ascii_case(&package.target_hardware_id));
-    if !target_matches {
-        blockers.push(RebindPlanBlocker::PackageTargetMismatch);
+        .filter(|id| {
+            package
+                .supported_hardware_ids
+                .iter()
+                .any(|supported| id.eq_ignore_ascii_case(supported))
+        })
+        .collect();
+    if matching_hardware_ids.is_empty() {
+        blockers.push(RebindPlanBlocker::UnsupportedHardwareId);
     }
 
-    let package_candidates = matching_package_candidates(&applicable_drivers, &package);
+    let package_candidates =
+        matching_package_candidates(&applicable_drivers, &package, &matching_hardware_ids);
     let package_readiness = match package_candidates.as_slice() {
         [] => {
-            blockers.push(RebindPlanBlocker::DirectHciPackageMissing);
+            if !matching_hardware_ids.is_empty() {
+                blockers.push(RebindPlanBlocker::DirectHciPackageMissing);
+            }
             DirectHciPackageReadiness::Missing {
                 expected: package.clone(),
             }
@@ -288,7 +390,9 @@ fn evaluate_observed_controller(
 
     let non_directhci: Vec<_> = applicable_drivers
         .iter()
-        .filter(|candidate| !driver_matches_package(candidate, &package))
+        // Any DirectHCI package must never be mistaken for a Windows
+        // recovery driver, including packages previously staged on a host.
+        .filter(|candidate| !candidate.provider.eq_ignore_ascii_case(&package.provider))
         .collect();
     let installed: Vec<_> = non_directhci
         .iter()
@@ -404,10 +508,11 @@ fn classify_current_state(
 fn matching_package_candidates<'a>(
     candidates: &'a [CompatibleDriverObservation],
     package: &DirectHciWinUsbPackageSpec,
+    matching_hardware_ids: &[&String],
 ) -> Vec<&'a CompatibleDriverObservation> {
     candidates
         .iter()
-        .filter(|candidate| driver_matches_package(candidate, package))
+        .filter(|candidate| driver_matches_package(candidate, package, matching_hardware_ids))
         .collect()
 }
 
@@ -415,14 +520,49 @@ fn matching_package_candidates<'a>(
 fn driver_matches_package(
     candidate: &CompatibleDriverObservation,
     package: &DirectHciWinUsbPackageSpec,
+    matching_hardware_ids: &[&String],
 ) -> bool {
     candidate.provider.eq_ignore_ascii_case(&package.provider)
         && candidate
             .description
             .eq_ignore_ascii_case(&package.description)
-        && candidate
-            .hardware_id
-            .eq_ignore_ascii_case(&package.target_hardware_id)
+        && matching_hardware_ids
+            .iter()
+            .any(|id| candidate.hardware_id.eq_ignore_ascii_case(id))
+}
+
+/// Choose the stable device-specific PnP hardware ID from a fresh observation.
+/// This never accepts USB class compatible IDs or revision-only model entries.
+pub fn select_exact_usb_hardware_id(hardware_ids: &[String]) -> Option<String> {
+    let mut selected = None;
+    for value in hardware_ids {
+        let upper = value.to_ascii_uppercase();
+        let Some(rest) = upper.strip_prefix("USB\\VID_") else {
+            continue;
+        };
+        let Some((vendor, rest)) = rest.split_once("&PID_") else {
+            continue;
+        };
+        if vendor.len() != 4 || !vendor.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        if rest.len() < 4 || !rest[..4].bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            continue;
+        }
+        let suffix = &rest[4..];
+        if !suffix.is_empty()
+            && !(suffix.len() == 6
+                && suffix.starts_with("&MI_")
+                && suffix[4..].bytes().all(|byte| byte.is_ascii_hexdigit()))
+        {
+            continue;
+        }
+        if selected.as_ref().is_some_and(|existing| existing != &upper) {
+            return None;
+        }
+        selected = Some(upper);
+    }
+    selected
 }
 
 fn empty_plan(
@@ -1029,7 +1169,7 @@ mod tests {
                 "USB\\VID_8087&PID_0026",
                 true,
             )],
-            DirectHciWinUsbPackageSpec::ax201_development(),
+            DirectHciWinUsbPackageSpec::supported_devices_development(),
             RebindSafetyPrerequisites::default(),
         );
 
@@ -1047,7 +1187,7 @@ mod tests {
 
     #[test]
     fn package_must_be_lower_ranked_than_windows_recovery_driver() {
-        let package = DirectHciWinUsbPackageSpec::ax201_development();
+        let package = DirectHciWinUsbPackageSpec::supported_devices_development();
         let plan = evaluate_observed_controller(
             "controller",
             controller(),
@@ -1065,7 +1205,7 @@ mod tests {
                     50,
                     &package.provider,
                     &package.description,
-                    &package.target_hardware_id,
+                    "USB\\VID_8087&PID_0026",
                     false,
                 ),
             ],
@@ -1091,7 +1231,7 @@ mod tests {
 
     #[test]
     fn complete_safe_inputs_produce_ready_plan_without_applying_changes() {
-        let package = DirectHciWinUsbPackageSpec::ax201_development();
+        let package = DirectHciWinUsbPackageSpec::supported_devices_development();
         let plan = evaluate_observed_controller(
             "controller",
             controller(),
@@ -1109,7 +1249,7 @@ mod tests {
                     100,
                     &package.provider,
                     &package.description,
-                    &package.target_hardware_id,
+                    "USB\\VID_8087&PID_0026",
                     false,
                 ),
             ],

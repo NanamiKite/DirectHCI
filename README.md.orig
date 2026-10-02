@@ -139,18 +139,18 @@ Device interface paths, driver names, and current devnodes are treated as observ
 
 ## Windows and WinUSB
 
-DirectHCI uses Microsoft's in-box `WinUSB.sys`; it ships no custom kernel
-driver. The installer bundles a pinned libwdi-based provisioner, not a static
-Bluetooth driver package. From the Control Panel, **Prepare Controller**
-generates and stages a package for one freshly observed exact USB Bluetooth
-Hardware ID after administrator consent to one-time local certificate trust.
-This does not switch BTHUSB. A newly attached controller can be prepared
-without reinstalling DirectHCI; there is no supported-HWID allowlist. The
-old multi-Hardware-ID development package remains migration-only. Windows
-may reject local self-signed packages under its current policy; DirectHCI
-reports that error and does not change boot policy or controller binding.
-Takeover still requires the existing planner, recovery, and WinUSB capability
-checks.
+The current development package uses Microsoft's in-box `WinUSB.sys`; DirectHCI does not ship a custom kernel driver.
+
+One development package is generated from the explicit Hardware IDs in
+[`driver/winusb-supported-devices/`](driver/winusb-supported-devices/README.md).
+All listed devices share one WinUSB INF/CAT and install section; there is no
+custom kernel driver. The previous class-compatible-ID INF failed Inf2Cat
+B2.6.4.9 and is no longer a build or installer path. The installer bundles the
+signed INF/CAT and offers an unchecked-by-default “准备 DirectHCI WinUSB 支持”
+option to stage it in the Driver Store without switching any controller.
+Signing remains a separate development step; takeover remains explicit. An ID on
+the list permits an attempt, not a compatibility guarantee; runtime WinUSB
+descriptor/pipe validation remains required.
 
 Driver staging, temporary rebind, restoration and recovery are documented in:
 

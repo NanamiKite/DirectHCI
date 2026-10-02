@@ -283,6 +283,39 @@ fn dispatch_frame(
                         &ControlResponse::Preferences { preferences },
                     )
                 }
+                ControlRequest::ControllerPreparationStatus { controller_id } => {
+                    let status = runtime
+                        .controller_preparation_status(&controller_id)
+                        .map_err(|(code, message)| (request_id, code, message))?;
+                    send_json(
+                        outbound,
+                        request_id,
+                        &ControlResponse::ControllerPreparationStatus { status },
+                    )
+                }
+                ControlRequest::PrepareController {
+                    controller_id,
+                    trust_acknowledged,
+                } => {
+                    require_admin(is_admin, request_id)?;
+                    if !trust_acknowledged {
+                        return Err((
+                            request_id,
+                            IpcErrorCode::Unauthorized,
+                            "explicit local certificate trust authorization is required".into(),
+                        ));
+                    }
+                    let result = runtime
+                        .prepare_controller(&controller_id)
+                        .map_err(|(code, message)| (request_id, code, message))?;
+                    send_json(
+                        outbound,
+                        request_id,
+                        &ControlResponse::ControllerPrepared {
+                            preparation: result,
+                        },
+                    )
+                }
                 ControlRequest::RestoreWindows => {
                     require_admin(is_admin, request_id)?;
                     runtime

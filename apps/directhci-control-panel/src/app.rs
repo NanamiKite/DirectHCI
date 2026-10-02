@@ -19,6 +19,10 @@ enum Action {
     StartService,
     StopService,
     SetPreferred(String),
+    Prepare {
+        controller_id: String,
+        trust_acknowledged: bool,
+    },
     RestoreWindows,
 }
 
@@ -26,6 +30,7 @@ struct Snapshot {
     service: Result<ServiceState, String>,
     runtime: Option<RuntimeStatus>,
     preferences: Option<RuntimePreferences>,
+    preparation: Option<Result<directhci_core::ControllerPreparationStatus, String>>,
     runtime_error: Option<String>,
     preferences_error: Option<String>,
 }
@@ -62,6 +67,9 @@ struct Panel {
     usb_value: nwg::Label,
     _driver_caption: nwg::Label,
     driver_value: nwg::Label,
+    _support_caption: nwg::Label,
+    support_value: nwg::Label,
+    prepare_button: nwg::Button,
     _active_frame: nwg::Frame,
     _active_layout: nwg::GridLayout,
     _active_title: nwg::Label,
@@ -74,6 +82,10 @@ struct Panel {
     refresh_button: nwg::Button,
     restore_button: nwg::Button,
     diagnostics_button: nwg::Button,
+    tray: nwg::TrayNotification,
+    tray_menu: nwg::Menu,
+    tray_open: nwg::MenuItem,
+    tray_exit: nwg::MenuItem,
     notice: nwg::Notice,
     diagnostics_window: nwg::Window,
     _diagnostics_layout: nwg::GridLayout,
@@ -136,7 +148,25 @@ pub fn run() -> Result<(), String> {
         &panel.window.handle,
         move |event, data, handle| {
             use nwg::Event as E;
-            if event == E::OnWindowClose && handle == main_panel.window.handle {
+            if event == E::OnWindowMinimize && handle == main_panel.window.handle {
+                main_panel.tray.set_visibility(true);
+                main_panel.diagnostics_window.set_visible(false);
+                main_panel.window.set_visible(false);
+            } else if event == E::OnContextMenu && handle == main_panel.tray.handle {
+                let (x, y) = nwg::GlobalCursor::position();
+                main_panel.tray_menu.popup(x, y);
+            } else if event == E::OnMousePress(nwg::MousePressEvent::MousePressLeftUp)
+                && handle == main_panel.tray.handle
+            {
+                main_panel.show_from_tray();
+            } else if event == E::OnMenuItemSelected {
+                if handle == main_panel.tray_open.handle {
+                    main_panel.show_from_tray();
+                } else if handle == main_panel.tray_exit.handle {
+                    main_panel.show_from_tray();
+                    main_panel.window.close();
+                }
+            } else if event == E::OnWindowClose && handle == main_panel.window.handle {
                 match service::query() {
                     Ok(ServiceState::Stopped | ServiceState::NotInstalled) => {
                         nwg::stop_thread_dispatch();
@@ -198,6 +228,8 @@ pub fn run() -> Result<(), String> {
                     if main_panel.confirm_active_client("Stop DirectHCI service? The active client will be disconnected and Windows Bluetooth restored.") {
                         main_panel.request(Action::StopService);
                     }
+                } else if handle == main_panel.prepare_button.handle {
+                    main_panel.prepare_selected();
                 } else if handle == main_panel.restore_button.handle {
                     if main_panel.confirm_active_client(
                         "Restore Windows Bluetooth? The active client will be disconnected.",
@@ -261,6 +293,24 @@ fn perform(action: Action) -> Result<(), String> {
         .set_preferred_controller(&id)
         .map(|_| ())
         .map_err(|error| error.to_string()),
+        Action::Prepare {
+            controller_id,
+            trust_acknowledged,
+        } => {
+            if !trust_acknowledged {
+                return Err(
+                    "Prepare Controller requires explicit certificate trust consent".into(),
+                );
+            }
+            DirectHciClient::connect(
+                "directhci-control-panel",
+                Some(env!("CARGO_PKG_VERSION").into()),
+            )
+            .map_err(|error| error.to_string())?
+            .prepare_controller(&controller_id, trust_acknowledged)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+        }
         Action::RestoreWindows => DirectHciClient::connect(
             "directhci-control-panel",
             Some(env!("CARGO_PKG_VERSION").into()),
@@ -308,6 +358,7 @@ fn collect_snapshot() -> Snapshot {
             service,
             runtime: None,
             preferences: None,
+            preparation: None,
             runtime_error: None,
             preferences_error: None,
         };
@@ -319,10 +370,28 @@ fn collect_snapshot() -> Snapshot {
         Ok(client) => {
             let status = client.runtime_status();
             let preferences = client.preferences();
+            let preparation = if status
+                .as_ref()
+                .ok()
+                .is_some_and(|value| value.active_session.is_none())
+            {
+                preferences
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.preferred_controller_id.as_ref())
+                    .map(|id| {
+                        client
+                            .controller_preparation_status(id.as_str())
+                            .map_err(|error| error.to_string())
+                    })
+            } else {
+                None
+            };
             Snapshot {
                 service,
                 runtime: status.as_ref().ok().cloned(),
                 preferences: preferences.as_ref().ok().cloned(),
+                preparation,
                 runtime_error: status.err().map(|error| error.to_string()),
                 preferences_error: preferences.err().map(|error| error.to_string()),
             }
@@ -331,6 +400,7 @@ fn collect_snapshot() -> Snapshot {
             service,
             runtime: None,
             preferences: None,
+            preparation: None,
             runtime_error: Some(error.to_string()),
             preferences_error: None,
         },
@@ -338,6 +408,13 @@ fn collect_snapshot() -> Snapshot {
 }
 
 impl Panel {
+    fn show_from_tray(&self) {
+        self.window.set_visible(true);
+        self.window.restore();
+        self.window.set_focus();
+        self.tray.set_visibility(false);
+    }
+
     fn request(&self, action: Action) -> bool {
         if self.busy.replace(true) {
             return false;
@@ -443,6 +520,13 @@ impl Panel {
                     status.controller.service.as_deref().unwrap_or("-"),
                     status.controller.driver.inf_path.as_deref().unwrap_or("-")
                 ));
+                self.support_value.set_text(match &snapshot.preparation {
+                    Some(Ok(preparation)) if preparation.ready => "Ready",
+                    Some(Ok(_)) => "Not prepared",
+                    Some(Err(_)) => "Unavailable",
+                    None if runtime.active_session.is_some() => "In use",
+                    None => "Checking...",
+                });
             } else {
                 self.state_value
                     .set_text(if runtime.controllers.is_empty() {
@@ -452,6 +536,7 @@ impl Panel {
                     });
                 self.usb_value.set_text("-");
                 self.driver_value.set_text("-");
+                self.support_value.set_text("Unavailable");
             }
             self.active_value
                 .set_text(&runtime.active_session.as_ref().map_or_else(
@@ -484,6 +569,7 @@ impl Panel {
             self.state_value.set_text("Unavailable");
             self.usb_value.set_text("-");
             self.driver_value.set_text("-");
+            self.support_value.set_text("Unavailable");
             self.active_value.set_text("None");
             self.recovery_value.set_text("Unknown");
             self.note_value.set_text(match snapshot.service {
@@ -513,6 +599,17 @@ impl Panel {
         self.refresh_button.set_enabled(!busy);
         let runtime = snapshot.as_ref().and_then(|value| value.runtime.as_ref());
         self.restore_button.set_enabled(!busy && runtime.is_some());
+        self.prepare_button.set_enabled(
+            !busy
+                && runtime.is_some_and(|value| {
+                    value.active_session.is_none() && !value.recovery_required
+                })
+                && self.preferred_combo.selection().is_some()
+                && snapshot
+                    .as_ref()
+                    .and_then(|value| value.preparation.as_ref())
+                    .is_some_and(|value| matches!(value, Ok(status) if !status.ready)),
+        );
         self.preferred_combo.set_enabled(
             !busy
                 && runtime.is_some_and(|value| {
@@ -534,6 +631,35 @@ impl Panel {
             .map(|status| status.controller.id.as_str().to_owned());
         if let Some(id) = selected {
             self.request(Action::SetPreferred(id));
+        }
+    }
+
+    fn prepare_selected(&self) {
+        let selected = self.preferred_combo.selection().and_then(|index| {
+            self.snapshot
+                .borrow()
+                .as_ref()
+                .and_then(|snapshot| snapshot.runtime.as_ref())
+                .and_then(|runtime| runtime.controllers.get(index))
+                .map(|status| status.controller.id.as_str().to_owned())
+        });
+        let Some(controller_id) = selected else {
+            return;
+        };
+        let consent = nwg::modal_message(
+            &self.window,
+            &nwg::MessageParams {
+                title: "Prepare DirectHCI WinUSB support",
+                content: "DirectHCI will create a device-specific WinUSB package and a one-time self-signed certificate. The public certificate will be added to LocalMachine Root and TrustedPublisher; its private key will be destroyed after signing. Windows may reject the package. This does not switch the Bluetooth controller. Authorize this trust change?",
+                buttons: nwg::MessageButtons::YesNo,
+                icons: nwg::MessageIcons::Warning,
+            },
+        ) == nwg::MessageChoice::Yes;
+        if consent {
+            self.request(Action::Prepare {
+                controller_id,
+                trust_acknowledged: consent,
+            });
         }
     }
 
@@ -633,6 +759,17 @@ fn format_diagnostics(snapshot: &Snapshot) -> String {
     }
     if let Some(error) = &snapshot.preferences_error {
         lines.push(format!("Preferences error: {error}"));
+    }
+    if let Some(preparation) = &snapshot.preparation {
+        match preparation {
+            Ok(value) => {
+                lines.push(format!("Exact Hardware ID: {}", value.hardware_id));
+                lines.push(format!("DirectHCI package ready: {}", value.ready));
+                lines.push(format!("Takeover safe: {}", value.takeover_safe));
+                lines.push(format!("Takeover blockers: {:?}", value.blockers));
+            }
+            Err(error) => lines.push(format!("Preparation status error: {error}")),
+        }
     }
     if let Some(runtime) = &snapshot.runtime {
         lines.push(format!("Recovery required: {}", runtime.recovery_required));
@@ -759,6 +896,9 @@ fn build_panel(
     let usb_value = build_label(&controller_frame, "-")?;
     let driver_caption = build_label(&controller_frame, "Driver")?;
     let driver_value = build_label(&controller_frame, "-")?;
+    let support_caption = build_label(&controller_frame, "WinUSB support")?;
+    let support_value = build_label(&controller_frame, "Unavailable")?;
+    let prepare_button = build_button(&controller_frame, "Prepare Controller")?;
     let active_frame = build_section(&window)?;
     let active_title = build_label(&active_frame, "Active Client")?;
     let active_value = build_label(&active_frame, "None")?;
@@ -789,7 +929,7 @@ fn build_panel(
     nwg::GridLayout::builder()
         .parent(&controller_frame)
         .max_column(Some(4))
-        .max_row(Some(4))
+        .max_row(Some(5))
         .margin([10, 8, 10, 8])
         .spacing(5)
         .child_item(item(&controller_title, 0, 0, 4, 1))
@@ -801,6 +941,9 @@ fn build_panel(
         .child(3, 2, &usb_value)
         .child(0, 3, &driver_caption)
         .child_item(item(&driver_value, 1, 3, 3, 1))
+        .child(0, 4, &support_caption)
+        .child_item(item(&support_value, 1, 4, 1, 1))
+        .child_item(item(&prepare_button, 2, 4, 2, 1))
         .build(&controller_layout)
         .map_err(|error| error.to_string())?;
     let active_layout = nwg::GridLayout::default();
@@ -829,25 +972,52 @@ fn build_panel(
     nwg::GridLayout::builder()
         .parent(&window)
         .max_column(Some(4))
-        .max_row(Some(14))
+        .max_row(Some(15))
         .margin([10, 10, 10, 10])
         .spacing(5)
         .child_item(item(&title, 0, 0, 4, 1))
         .child_item(item(&subtitle, 0, 1, 4, 1))
         .child_item(item(&runtime_frame, 0, 2, 4, 3))
-        .child_item(item(&controller_frame, 0, 5, 4, 4))
-        .child_item(item(&active_frame, 0, 9, 2, 3))
-        .child_item(item(&recovery_frame, 2, 9, 2, 3))
-        .child_item(item(&note_value, 0, 12, 4, 1))
-        .child(0, 13, &refresh_button)
-        .child_item(item(&restore_button, 1, 13, 2, 1))
-        .child(3, 13, &diagnostics_button)
+        .child_item(item(&controller_frame, 0, 5, 4, 5))
+        .child_item(item(&active_frame, 0, 10, 2, 3))
+        .child_item(item(&recovery_frame, 2, 10, 2, 3))
+        .child_item(item(&note_value, 0, 13, 4, 1))
+        .child(0, 14, &refresh_button)
+        .child_item(item(&restore_button, 1, 14, 2, 1))
+        .child(3, 14, &diagnostics_button)
         .build(&layout)
         .map_err(|error| error.to_string())?;
     let mut notice = nwg::Notice::default();
     nwg::Notice::builder()
         .parent(&window)
         .build(&mut notice)
+        .map_err(|error| error.to_string())?;
+
+    let mut tray = nwg::TrayNotification::default();
+    nwg::TrayNotification::builder()
+        .parent(&window)
+        .icon(Some(&icon))
+        .tip(Some("DirectHCI Control Panel"))
+        .visible(false)
+        .build(&mut tray)
+        .map_err(|error| error.to_string())?;
+    let mut tray_menu = nwg::Menu::default();
+    nwg::Menu::builder()
+        .popup(true)
+        .parent(&window)
+        .build(&mut tray_menu)
+        .map_err(|error| error.to_string())?;
+    let mut tray_open = nwg::MenuItem::default();
+    nwg::MenuItem::builder()
+        .text("Open Control Panel")
+        .parent(&tray_menu)
+        .build(&mut tray_open)
+        .map_err(|error| error.to_string())?;
+    let mut tray_exit = nwg::MenuItem::default();
+    nwg::MenuItem::builder()
+        .text("Exit Control Panel")
+        .parent(&tray_menu)
+        .build(&mut tray_exit)
         .map_err(|error| error.to_string())?;
 
     let mut diagnostics_window = nwg::Window::default();
@@ -905,6 +1075,9 @@ fn build_panel(
         usb_value,
         _driver_caption: driver_caption,
         driver_value,
+        _support_caption: support_caption,
+        support_value,
+        prepare_button,
         _active_frame: active_frame,
         _active_layout: active_layout,
         _active_title: active_title,
@@ -917,6 +1090,10 @@ fn build_panel(
         refresh_button,
         restore_button,
         diagnostics_button,
+        tray,
+        tray_menu,
+        tray_open,
+        tray_exit,
         notice,
         diagnostics_window,
         _diagnostics_layout: diagnostics_layout,

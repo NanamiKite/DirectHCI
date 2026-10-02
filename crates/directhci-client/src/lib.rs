@@ -96,6 +96,22 @@ impl DirectHciClient {
     ) -> Result<RuntimePreferences, ClientError> {
         self.inner.set_preferred_controller(controller_id)
     }
+    pub fn controller_preparation_status(
+        &self,
+        controller_id: &str,
+    ) -> Result<directhci_core::ControllerPreparationStatus, ClientError> {
+        self.inner.controller_preparation_status(controller_id)
+    }
+    /// Requires an administrator and an explicit acknowledgement that libwdi
+    /// will temporarily trust a one-time package-signing certificate.
+    pub fn prepare_controller(
+        &self,
+        controller_id: &str,
+        trust_acknowledged: bool,
+    ) -> Result<directhci_core::PreparedController, ClientError> {
+        self.inner
+            .prepare_controller(controller_id, trust_acknowledged)
+    }
     pub fn restore_windows(&self) -> Result<(), ClientError> {
         self.inner.restore_windows()
     }
@@ -186,6 +202,19 @@ mod platform {
         ) -> Result<RuntimePreferences, ClientError> {
             Err(ClientError::UnsupportedPlatform)
         }
+        pub(super) fn controller_preparation_status(
+            &self,
+            _: &str,
+        ) -> Result<directhci_core::ControllerPreparationStatus, ClientError> {
+            Err(ClientError::UnsupportedPlatform)
+        }
+        pub(super) fn prepare_controller(
+            &self,
+            _: &str,
+            _: bool,
+        ) -> Result<directhci_core::PreparedController, ClientError> {
+            Err(ClientError::UnsupportedPlatform)
+        }
         pub(super) fn restore_windows(&self) -> Result<(), ClientError> {
             Err(ClientError::UnsupportedPlatform)
         }
@@ -257,6 +286,7 @@ mod platform {
     use super::*;
 
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+    const PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
     const STREAM_QUEUE_DEPTH: usize = 128;
 
     pub(super) fn start_service() -> Result<(), ClientError> {
@@ -322,6 +352,15 @@ mod platform {
 
     impl Connection {
         fn request(&self, kind: IpcMessageKind, payload: Vec<u8>) -> Result<IpcFrame, ClientError> {
+            self.request_with_timeout(kind, payload, REQUEST_TIMEOUT)
+        }
+
+        fn request_with_timeout(
+            &self,
+            kind: IpcMessageKind,
+            payload: Vec<u8>,
+            timeout: Duration,
+        ) -> Result<IpcFrame, ClientError> {
             if let Some(error) = self
                 .state
                 .terminal
@@ -360,7 +399,7 @@ mod platform {
                     .and_then(|mut map| map.remove(&request_id));
                 return Err(error);
             }
-            let response = match receiver.recv_timeout(REQUEST_TIMEOUT) {
+            let response = match receiver.recv_timeout(timeout) {
                 Ok(response) => response?,
                 Err(error) => {
                     self.state
@@ -391,7 +430,13 @@ mod platform {
 
         fn control(&self, request: &ControlRequest) -> Result<ControlResponse, ClientError> {
             let payload = encode_ipc_json(request).map_err(frame_error)?;
-            let response = self.request(IpcMessageKind::ControlRequest, payload)?;
+            let timeout = if matches!(request, ControlRequest::PrepareController { .. }) {
+                PREPARE_TIMEOUT
+            } else {
+                REQUEST_TIMEOUT
+            };
+            let response =
+                self.request_with_timeout(IpcMessageKind::ControlRequest, payload, timeout)?;
             if response.kind != IpcMessageKind::ControlResponse {
                 return Err(protocol("expected ControlResponse"));
             }
@@ -537,6 +582,36 @@ mod platform {
                 })? {
                 ControlResponse::Preferences { preferences } => Ok(preferences),
                 _ => Err(protocol("unexpected preferences response")),
+            }
+        }
+        pub(super) fn controller_preparation_status(
+            &self,
+            controller_id: &str,
+        ) -> Result<directhci_core::ControllerPreparationStatus, ClientError> {
+            match self
+                .connection
+                .control(&ControlRequest::ControllerPreparationStatus {
+                    controller_id: controller_id.into(),
+                })? {
+                ControlResponse::ControllerPreparationStatus { status } => Ok(status),
+                _ => Err(protocol(
+                    "unexpected controller preparation status response",
+                )),
+            }
+        }
+        pub(super) fn prepare_controller(
+            &self,
+            controller_id: &str,
+            trust_acknowledged: bool,
+        ) -> Result<directhci_core::PreparedController, ClientError> {
+            match self
+                .connection
+                .control(&ControlRequest::PrepareController {
+                    controller_id: controller_id.into(),
+                    trust_acknowledged,
+                })? {
+                ControlResponse::ControllerPrepared { preparation } => Ok(preparation),
+                _ => Err(protocol("unexpected prepare controller response")),
             }
         }
         pub(super) fn restore_windows(&self) -> Result<(), ClientError> {

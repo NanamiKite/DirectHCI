@@ -21,11 +21,11 @@ use crate::raw_hci::{
     RawHciSession, RawHciSessionOptions, RawHciShutdownReport, RawHciTransportSummary,
 };
 use crate::rebind::{
-    CompatibleDriverObservation, DirectHciPackageReadiness, DirectHciWinUsbPackageSpec,
+    CompatibleDriverObservation, DIRECTHCI_WINUSB_INTERFACE_GUID, DirectHciPackageReadiness,
     DriverInstallOutcome, RebindSafetyPrerequisites, TemporaryRebindPlan,
-    install_driver_for_controller, observe_controller_and_drivers, plan_temporary_winusb_rebind,
-    process_is_elevated, process_is_running, same_driver_candidate, same_inf_name,
-    same_physical_controller,
+    install_driver_for_controller, observe_controller_and_drivers,
+    plan_temporary_device_specific_rebind, plan_temporary_winusb_rebind, process_is_elevated,
+    process_is_running, same_driver_candidate, same_inf_name, same_physical_controller,
 };
 use crate::winusb::{
     DedicatedWinUsbControllerReadiness, DedicatedWinUsbReadinessStatus,
@@ -219,11 +219,33 @@ enum RestoreCandidateDecision {
 }
 
 pub fn plan_takeover(controller_id: &str) -> TakeoverPreflightReport {
-    let rebind = plan_temporary_winusb_rebind(
+    let mut rebind = plan_temporary_device_specific_rebind(
         controller_id,
-        DirectHciWinUsbPackageSpec::ax201_development(),
         RebindSafetyPrerequisites::m1_implemented(),
     );
+    // Migration compatibility only: an already-staged multi-HWID development
+    // package may still be used for this freshly observed exact Hardware ID.
+    // No static device list is consulted and no package is staged here.
+    if let (Some(original), DirectHciPackageReadiness::Missing { expected }) =
+        (&rebind.controller, &rebind.directhci_package)
+    {
+        if expected.supported_hardware_ids.len() == 1 {
+            let mut legacy = expected.clone();
+            legacy.description = "DirectHCI WinUSB Bluetooth Controller (Development)".into();
+            let legacy_plan = plan_temporary_winusb_rebind(
+                controller_id,
+                legacy,
+                RebindSafetyPrerequisites::m1_implemented(),
+            );
+            if legacy_plan.package_accepted_by_driver_store
+                && legacy_plan.controller.as_ref().is_some_and(|current| {
+                    same_physical_controller(&original.identity, &current.identity)
+                })
+            {
+                rebind = legacy_plan;
+            }
+        }
+    }
     let mut blockers: Vec<String> = rebind
         .blockers
         .iter()
@@ -380,8 +402,7 @@ pub fn acquire_runtime_controller_session(
             description: direct_candidate.description.clone(),
             published_inf: Some(direct_candidate.inf_path.clone()),
             version: Some(direct_candidate.version.clone()),
-            device_interface_guid: DirectHciWinUsbPackageSpec::ax201_development()
-                .device_interface_guid,
+            device_interface_guid: DIRECTHCI_WINUSB_INTERFACE_GUID.into(),
         },
         now,
         now,
@@ -541,8 +562,7 @@ where
             description: direct_candidate.description.clone(),
             published_inf: Some(direct_candidate.inf_path.clone()),
             version: Some(direct_candidate.version.clone()),
-            device_interface_guid: DirectHciWinUsbPackageSpec::ax201_development()
-                .device_interface_guid,
+            device_interface_guid: DIRECTHCI_WINUSB_INTERFACE_GUID.into(),
         },
         now,
         now,
@@ -1193,7 +1213,13 @@ fn select_restore_candidate(
 
     let non_directhci: Vec<_> = candidates
         .iter()
-        .filter(|candidate| !candidate_matches_journal_package(candidate, directhci_package))
+        // The journal names the active DirectHCI package. A second staged
+        // DirectHCI package is still not a Windows recovery driver.
+        .filter(|candidate| {
+            !candidate
+                .provider
+                .eq_ignore_ascii_case(&directhci_package.provider)
+        })
         .filter_map(|candidate| candidate.rank.map(|rank| (rank, candidate)))
         .collect();
     let Some(best_rank) = non_directhci.iter().map(|(rank, _)| *rank).min() else {
@@ -1209,20 +1235,6 @@ fn select_restore_candidate(
         [] => RestoreCandidateDecision::Missing,
         _ => RestoreCandidateDecision::Ambiguous,
     }
-}
-
-fn candidate_matches_journal_package(
-    candidate: &CompatibleDriverObservation,
-    package: &DriverPackageIdentity,
-) -> bool {
-    candidate.provider.eq_ignore_ascii_case(&package.provider)
-        && candidate
-            .description
-            .eq_ignore_ascii_case(&package.description)
-        && package
-            .published_inf
-            .as_deref()
-            .is_none_or(|inf| same_inf_name(&candidate.inf_path, inf))
 }
 
 fn is_directhci_ready(controller: &ControllerObservation, package: &DriverPackageIdentity) -> bool {

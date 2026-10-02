@@ -62,8 +62,9 @@ Normal product-path commands connect to `\\.\pipe\DirectHCI\v1`:
 ```
 
 `directhcid install-service` registers the current executable as the manual
-start `DirectHCI` Windows service. It does not stage the WinUSB package or
-modify controller drivers. `controllers --direct`, `takeover ... --execute`,
+start `DirectHCI` Windows service. That command does not stage the WinUSB
+package or modify controller drivers; the separate installer offers optional
+Driver Store staging. `controllers --direct`, `takeover ... --execute`,
 and `recover --offline` remain explicit development/disaster-recovery paths.
 Service installation now refuses non-fixed/remote paths, reparse points, or a
 binary/parent with untrusted owner or write access. Console `directhcid run`

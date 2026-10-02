@@ -54,16 +54,25 @@ timeout/disconnect 生命周期回归。较早的成功不等于最新 BLE 构�
 
 ## Windows 安装与使用
 
-当前安装器只安装 Rust 可执行程序、注册 `DirectHCI` 服务并建立控制面板
-快捷方式；它**不会**安装/签名/暂存开发用 AX201 WinUSB 驱动包，不会自动
-改绑 AX201，也不会关闭 Secure Boot 或修改测试签名。新的 Windows 机器
-若缺少已信任的开发包，不能仅凭运行安装器就获得 takeover 能力。
+当前安装器安装 Rust 可执行程序、注册 `DirectHCI` 服务、建立控制面板
+快捷方式，并携带构建机编译的 libwdi 准备组件。安装时不会预先为所有蓝牙
+控制器生成或暂存 WinUSB 包；用户在面板中选择控制器后按需 Prepare，
+准备与实际接管仍然分离。Windows 可以因签名策略拒绝暂存，DirectHCI 不会
+关闭 Secure Boot、启用测试签名或修改 BCD。
 
-在 Windows 宿主机安装 Inno Setup 6.4 或更新版，进入仓库后运行：
+Windows 构建机需要挂载 EWDK，并安装 Inno Setup 6.4 或更新版。在
+`cmd.exe` 中运行 EWDK 的 `LaunchBuildEnv.cmd`、`SetupVSEnv`，
+然后从同一窗口进入仓库并执行：
 
-```powershell
-.\scripts\windows\build-installer.ps1
+```cmd
+F:\LaunchBuildEnv.cmd
+SetupVSEnv
+cd /d "C:\path\to\DirectHCI"
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-libwdi.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-installer.ps1
 ```
+
+将 `F:` 和仓库路径替换为实际位置。普通用户电脑不需要 EWDK 或 MSBuild。
 
 不要在修改源码后使用 `-SkipBuild`：它只检查 exe 是否存在，可能把旧版本
 打进安装包。Cargo 构建目标默认在
@@ -92,6 +101,10 @@ IPC 查询在后台执行，不阻塞窗口。正常关闭面板时，会先请�
 并尝试恢复 Windows 蓝牙；停止失败时面板保持打开并显示错误。普通客户端
 断开只释放会话和恢复 Windows 蓝牙，**不会**自动停止服务。前台开发模式
 `directhcid run` 仍由其自身的显式关闭操作结束。
+
+最小化控制面板会将其隐藏到系统托盘，不会停止服务；点击托盘图标可恢复
+窗口。托盘菜单的“Exit Control Panel”与关闭窗口一样，仍需先安全停止
+服务，不能绕过 Windows 蓝牙恢复检查。
 
 ### 首选控制器
 
@@ -135,10 +148,16 @@ cargo check --workspace --target x86_64-pc-windows-gnu
 Windows 宿主机构建时让 `CARGO_TARGET_DIR` 指向本地磁盘，例如
 `$env:LOCALAPPDATA\DirectHCI\target`。构建 exe 不等于已经安装服务；
 构建目录 exe 也不等于 `C:\Program Files\DirectHCI` 中的已安装版本。
-开发版 WinUSB INF、签名、证书信任与仅暂存 Driver Store 的流程见
-[临时重绑定专题](temporary-rebind.md) 和
-[驱动包说明](../driver/winusb-ax201-dev/README.md)；不应自动对系统 AX201
-运行 Zadig，也不应把 `pnputil /add-driver` 改成带 `/install` 的命令。
+当前 WinUSB 准备流程见 [临时重绑定专题](temporary-rebind.md) 和
+[按设备生成的 INF 模板](../driver/winusb-device-specific/README.md)。安装包
+只携带 libwdi 准备组件，不预先生成或暂存任何蓝牙设备驱动包。面板中选择
+控制器并明确同意本机证书信任后，**Prepare Controller** 才根据新鲜枚举的
+精确 PnP Hardware ID 生成单设备 INF/CAT、一次性自签并仅暂存 Driver Store。
+私钥签名后销毁；若 Windows 拒绝本机自签包，则显示真实错误，BTHUSB 不变。
+新控制器不需要更新静态 HWID 清单，也不需要重装 DirectHCI。旧多 HWID
+开发包仅保留迁移兼容；USB class compatible ID INF 因 Inf2Cat B2.6.4.9
+不再使用。准备不会自动接管，后续仍需 planner、journal 和 WinUSB/HCI
+验证；程序不会修改 Secure Boot、TESTSIGNING 或 BCD。
 
 通用 BLE 库可被另一个 Rust consumer 依赖：
 `DirectHciBleCentral → BleConnection` 提供 scan、discover、read/write、

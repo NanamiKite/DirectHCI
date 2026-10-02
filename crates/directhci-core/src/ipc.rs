@@ -186,10 +186,23 @@ pub enum ControlRequest {
     ListControllers,
     RuntimeStatus,
     GetPreferences,
-    SetPreferredController { controller_id: String },
+    SetPreferredController {
+        controller_id: String,
+    },
+    ControllerPreparationStatus {
+        controller_id: String,
+    },
+    PrepareController {
+        controller_id: String,
+        trust_acknowledged: bool,
+    },
     RestoreWindows,
-    AcquireRawHci { controller_id: String },
-    ReleaseSession { session_id: u64 },
+    AcquireRawHci {
+        controller_id: String,
+    },
+    ReleaseSession {
+        session_id: u64,
+    },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -203,6 +216,12 @@ pub enum ControlResponse {
     },
     Preferences {
         preferences: RuntimePreferences,
+    },
+    ControllerPreparationStatus {
+        status: ControllerPreparationStatus,
+    },
+    ControllerPrepared {
+        preparation: PreparedController,
     },
     SessionReady {
         session_id: u64,
@@ -219,6 +238,21 @@ pub enum ControlResponse {
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct RuntimePreferences {
     pub preferred_controller_id: Option<ControllerId>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ControllerPreparationStatus {
+    pub hardware_id: String,
+    pub ready: bool,
+    pub takeover_safe: bool,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PreparedController {
+    pub status: ControllerPreparationStatus,
+    pub already_prepared: bool,
+    pub staged_inf: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -275,6 +309,7 @@ pub enum IpcErrorCode {
     Ownership,
     RawHci,
     Runtime,
+    Provisioning,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
