@@ -261,8 +261,8 @@ mod platform {
 mod platform {
     use std::collections::HashMap;
     use std::io::{Read, Write};
-    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
 
     use directhci_core::*;
@@ -315,20 +315,50 @@ mod platform {
 
     struct HandleState {
         handle: HANDLE,
-        closed: AtomicBool,
+        lifecycle: Mutex<HandleLifecycle>,
+        completed: Condvar,
     }
-    // SAFETY: access is synchronized; close_once cancels I/O and the owning
-    // Connection joins the reader before memory containing this value drops.
+    struct HandleLifecycle {
+        closing: bool,
+        closed: bool,
+        active: usize,
+    }
+    // SAFETY: the lifecycle mutex serializes submission with cancellation.
+    // The handle is closed only after every tracked overlapped I/O completes.
     unsafe impl Send for HandleState {}
     unsafe impl Sync for HandleState {}
     impl HandleState {
         fn close_once(&self) {
-            if !self.closed.swap(true, Ordering::AcqRel) {
-                // SAFETY: handle is still owned here; closing it intentionally
-                // wakes the pending reader and breaks the server connection.
-                let _ = unsafe { CancelIoEx(self.handle, None) };
-                let _ = unsafe { CloseHandle(self.handle) };
+            let mut lifecycle = self
+                .lifecycle
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if lifecycle.closing {
+                while !lifecycle.closed {
+                    lifecycle = self
+                        .completed
+                        .wait(lifecycle)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                }
+                return;
             }
+            lifecycle.closing = true;
+            // No new submission can pass the mutex after this point.
+            let _ = unsafe { CancelIoEx(self.handle, None) };
+            while lifecycle.active != 0 {
+                lifecycle = self
+                    .completed
+                    .wait(lifecycle)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+            let _ = unsafe { CloseHandle(self.handle) };
+            lifecycle.closed = true;
+            self.completed.notify_all();
+        }
+    }
+    impl Drop for HandleState {
+        fn drop(&mut self) {
+            self.close_once();
         }
     }
 
@@ -472,7 +502,12 @@ mod platform {
             let handle = open_pipe()?;
             let handle = Arc::new(HandleState {
                 handle,
-                closed: AtomicBool::new(false),
+                lifecycle: Mutex::new(HandleLifecycle {
+                    closing: false,
+                    closed: false,
+                    active: 0,
+                }),
+                completed: Condvar::new(),
             });
             let hello = ClientHello {
                 protocol_version: IPC_PROTOCOL_VERSION,
@@ -749,6 +784,25 @@ mod platform {
                     session_id,
                     controller,
                 }) if session_id == self.session_id => {
+                    // The release response follows every event from this worker
+                    // on the same pipe. The reader has already queued any old
+                    // stream frames before delivering this response.
+                    {
+                        let receiver = self
+                            .connection
+                            .event_rx
+                            .lock()
+                            .map_err(|_| protocol("event receiver poisoned"))?;
+                        while receiver.try_recv().is_ok() {}
+                    }
+                    {
+                        let receiver = self
+                            .connection
+                            .acl_rx
+                            .lock()
+                            .map_err(|_| protocol("ACL receiver poisoned"))?;
+                        while receiver.try_recv().is_ok() {}
+                    }
                     self.released = true;
                     *self
                         .connection
@@ -889,20 +943,28 @@ mod platform {
         handle: &HandleState,
         operation: impl FnOnce(*mut OVERLAPPED, *mut u32) -> windows::core::Result<()>,
     ) -> std::io::Result<usize> {
-        if handle.closed.load(Ordering::Acquire) {
+        // Hold the gate through submission only. close_once first blocks new
+        // submissions, then cancels and waits for every active completion.
+        let mut lifecycle = handle
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if lifecycle.closing {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "pipe closed",
             ));
         }
-        // SAFETY: event and OVERLAPPED live until GetOverlappedResult returns.
+        // SAFETY: event, OVERLAPPED and caller buffer live until completion.
         let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_err(win_io)?;
         let mut overlapped = OVERLAPPED {
             hEvent: event,
             ..Default::default()
         };
         let mut transferred = 0u32;
+        lifecycle.active += 1;
         let initial = operation(&mut overlapped, &mut transferred);
+        drop(lifecycle);
         let result = match initial {
             Ok(()) => Ok(()),
             Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => unsafe {
@@ -911,6 +973,15 @@ mod platform {
             Err(error) => Err(error),
         };
         let _ = unsafe { CloseHandle(event) };
+        let mut lifecycle = handle
+            .lifecycle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        lifecycle.active -= 1;
+        if lifecycle.active == 0 {
+            handle.completed.notify_all();
+        }
+        drop(lifecycle);
         result.map_err(win_io)?;
         Ok(transferred as usize)
     }

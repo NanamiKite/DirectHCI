@@ -203,6 +203,7 @@ fn handle_connection(
                 &hello.client_name,
                 is_admin,
                 &runtime,
+                &handle,
                 &outbound,
                 frame,
             );
@@ -226,6 +227,7 @@ fn dispatch_frame(
     client_name: &str,
     is_admin: bool,
     runtime: &Arc<DirectHciRuntime>,
+    handle: &Arc<PipeHandle>,
     outbound: &Outbound,
     frame: IpcFrame,
 ) -> Result<(), (u32, IpcErrorCode, String)> {
@@ -325,12 +327,16 @@ fn dispatch_frame(
                 }
                 ControlRequest::AcquireRawHci { controller_id } => {
                     require_admin(is_admin, request_id)?;
+                    let owner_pipe = Arc::clone(handle);
+                    let disconnect_owner: crate::runtime::DisconnectOwner =
+                        Arc::new(move || owner_pipe.request_cancel());
                     let response = runtime
                         .acquire(
                             connection_id,
                             client_name.into(),
                             &controller_id,
                             outbound.clone(),
+                            disconnect_owner,
                         )
                         .map_err(|(code, message)| (request_id, code, message))?;
                     send_json(outbound, request_id, &response)

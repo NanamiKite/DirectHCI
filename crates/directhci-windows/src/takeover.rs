@@ -752,6 +752,17 @@ fn run_hci_bring_up(
 }
 
 pub fn recover_offline() -> OfflineRecoveryReport {
+    recover_with_owner_policy(false)
+}
+
+/// Retry a journal left by this process after its controller session has ended.
+/// The privileged runtime must first stop and wait for its active session.
+/// Journals owned by any other live process remain protected.
+pub fn recover_owning_process_after_session_closed() -> OfflineRecoveryReport {
+    recover_with_owner_policy(true)
+}
+
+fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport {
     let store = match JournalStore::program_data() {
         Ok(store) => store,
         Err(error) => {
@@ -802,7 +813,9 @@ pub fn recover_offline() -> OfflineRecoveryReport {
         return report;
     }
 
-    if let Some(owner_process_id) = journal.owner.process_id {
+    if let Some(owner_process_id) = journal.owner.process_id
+        && !(allow_current_owner && owner_process_id == std::process::id())
+    {
         match process_is_running(owner_process_id) {
             Ok(true) => {
                 report.error = Some(format!(

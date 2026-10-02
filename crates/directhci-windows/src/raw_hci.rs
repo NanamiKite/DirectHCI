@@ -357,6 +357,8 @@ mod platform {
     struct DeviceIo {
         interface: WINUSB_INTERFACE_HANDLE,
         file: HANDLE,
+        // Serialize new submissions with shutdown cancellation, not completion.
+        submission: Mutex<()>,
     }
 
     // SAFETY: WinUSB/file handles can service concurrent overlapped operations.
@@ -395,10 +397,20 @@ mod platform {
                     message: error.to_string(),
                 });
             }
-            Ok(Self { interface, file })
+            Ok(Self {
+                interface,
+                file,
+                submission: Mutex::new(()),
+            })
         }
 
         fn abort(&self, pipes: [u8; 3]) -> Vec<String> {
+            // No new I/O can be submitted after cancellation has inspected the
+            // file handle; each operation releases this gate before waiting.
+            let _submission = self
+                .submission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let mut errors = Vec::new();
             for pipe in pipes {
                 // SAFETY: the interface stays alive and each pipe ID came from
@@ -416,6 +428,10 @@ mod platform {
         }
 
         fn cancel_all(&self) {
+            let _submission = self
+                .submission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             // SAFETY: the file handle remains valid through worker join; NULL
             // intentionally selects every pending operation on that handle.
             let _ = unsafe { CancelIoEx(self.file, None) };
@@ -986,14 +1002,23 @@ mod platform {
         let mut transferred = 0u32;
         // SAFETY: buffer, OVERLAPPED, and event stay alive until the completion
         // query below confirms completion or cancellation.
-        let result = unsafe {
-            WinUsb_ReadPipe(
-                io.interface,
-                pipe,
-                Some(&mut buffer),
-                Some(&mut transferred),
-                Some(&mut overlapped),
-            )
+        let result = {
+            let _submission = io
+                .submission
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if state.shutdown.load(Ordering::Acquire) {
+                return Err(RawHciError::Shutdown);
+            }
+            unsafe {
+                WinUsb_ReadPipe(
+                    io.interface,
+                    pipe,
+                    Some(&mut buffer),
+                    Some(&mut transferred),
+                    Some(&mut overlapped),
+                )
+            }
         };
         let accepted = result.is_ok() || result.as_ref().is_err_and(is_io_pending);
         if let Some(started) = started {

@@ -20,6 +20,7 @@ const RX_BATCH: usize = 64;
 const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub type Outbound = mpsc::SyncSender<IpcFrame>;
+pub type DisconnectOwner = Arc<dyn Fn() + Send + Sync>;
 
 enum ControllerRequest {
     Command {
@@ -294,7 +295,10 @@ impl DirectHciRuntime {
                 ));
             }
         }
-        let report = directhci_windows::recover_offline();
+        // The active session has finished above. Offline recovery deliberately
+        // rejects this service's still-live PID, so use the narrowly scoped
+        // same-process retry without changing the offline safety policy.
+        let report = directhci_windows::recover_owning_process_after_session_closed();
         let success = matches!(
             report.status,
             OfflineRecoveryStatus::NoJournal
@@ -360,6 +364,7 @@ impl DirectHciRuntime {
         client_name: String,
         controller_id: &str,
         outbound: Outbound,
+        disconnect_owner: DisconnectOwner,
     ) -> Result<ControlResponse, (IpcErrorCode, String)> {
         if self.shutting_down.load(Ordering::Acquire) {
             return Err((IpcErrorCode::Runtime, "runtime is shutting down".into()));
@@ -446,7 +451,17 @@ impl DirectHciRuntime {
         let runtime = Arc::downgrade(self);
         if let Err(error) = thread::Builder::new()
             .name(format!("directhci-controller-{session_id}"))
-            .spawn(move || controller_worker(runtime, session_id, live, receiver, outbound, cancel))
+            .spawn(move || {
+                controller_worker(
+                    runtime,
+                    session_id,
+                    live,
+                    receiver,
+                    outbound,
+                    cancel,
+                    disconnect_owner,
+                )
+            })
         {
             self.worker_finished(
                 session_id,
@@ -627,6 +642,7 @@ fn controller_worker(
     receiver: mpsc::Receiver<ControllerRequest>,
     outbound: Outbound,
     cancel: Arc<AtomicBool>,
+    disconnect_owner: DisconnectOwner,
 ) {
     let live = live;
     let mut release_request = None;
@@ -790,6 +806,11 @@ fn controller_worker(
     }
     if let Some(runtime) = runtime.upgrade() {
         runtime.worker_finished(session_id, recovery_required, message);
+    }
+    // An unsolicited worker exit has no ReleaseSession response. Wake the
+    // owning pipe so event/ACL receivers observe disconnection, not timeouts.
+    if release_request.is_none() {
+        disconnect_owner();
     }
     eprintln!(
         "directhcid: session {session_id} ended; Windows restore status: {:?}",

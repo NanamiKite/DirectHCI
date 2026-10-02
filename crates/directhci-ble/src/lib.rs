@@ -32,6 +32,8 @@ const VALUE_BUFFER: usize = 4096;
 const REQUEST_DEPTH: usize = 32;
 const NOTIFICATION_DEPTH: usize = 32;
 const DISCONNECT_SETTLE_TIME: Duration = Duration::from_millis(100);
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+const CONNECT_CANCEL_SETTLE_TIME: Duration = Duration::from_secs(6);
 const NOTIFICATION_MTU: usize = trouble_host::config::GATT_CLIENT_NOTIFICATION_MTU;
 
 #[derive(Clone, Debug)]
@@ -806,15 +808,77 @@ async fn control_loop<'stack, 'borrow>(
                         ..Default::default()
                     },
                 };
-                let connection = match central.connect(&config).await {
-                    Ok(connection) => {
+                enum ConnectOutcome<T> {
+                    Completed(T),
+                    Shutdown(Option<oneshot::Sender<Result<(), BleError>>>),
+                    ChannelClosed,
+                    TimedOut,
+                }
+                // Keep the host runner active while connecting. Dropping the
+                // TrouBLE connect future requests LE Create Connection Cancel.
+                let outcome = {
+                    let connecting = central.connect(&config);
+                    tokio::pin!(connecting);
+                    let deadline = tokio::time::sleep(CONNECT_ATTEMPT_TIMEOUT);
+                    tokio::pin!(deadline);
+                    loop {
+                        tokio::select! {
+                            result = &mut connecting => break ConnectOutcome::Completed(result),
+                            _ = &mut deadline => break ConnectOutcome::TimedOut,
+                            request = requests.recv() => match request {
+                                Some(WorkerRequest::Shutdown { reply }) =>
+                                    break ConnectOutcome::Shutdown(reply),
+                                Some(request) => reject_request(
+                                    request,
+                                    BleError::InvalidState("a BLE connection is being established"),
+                                ),
+                                None => break ConnectOutcome::ChannelClosed,
+                            },
+                        }
+                    }
+                };
+                let connection = match outcome {
+                    ConnectOutcome::Completed(Ok(connection)) => {
                         eprintln!("directhci-ble worker: connection established");
                         connection
                     }
-                    Err(error) => {
+                    ConnectOutcome::Completed(Err(error)) => {
                         eprintln!("directhci-ble worker: connection failed: {error:?}");
-                        let _ = reply.send(Err(BleError::Connect(format!("{error:?}"))));
-                        continue;
+                        let error = BleError::Connect(format!("{error:?}"));
+                        let _ = reply.send(Err(error.clone()));
+                        return WorkerExit {
+                            primary: Some(error),
+                            reply: None,
+                        };
+                    }
+                    ConnectOutcome::Shutdown(shutdown_reply) => {
+                        let _ = reply.send(Err(BleError::Connect(
+                            "connection cancelled by shutdown".into(),
+                        )));
+                        tokio::time::sleep(CONNECT_CANCEL_SETTLE_TIME).await;
+                        return WorkerExit {
+                            primary: None,
+                            reply: shutdown_reply,
+                        };
+                    }
+                    ConnectOutcome::ChannelClosed => {
+                        tokio::time::sleep(CONNECT_CANCEL_SETTLE_TIME).await;
+                        return WorkerExit {
+                            primary: None,
+                            reply: None,
+                        };
+                    }
+                    ConnectOutcome::TimedOut => {
+                        let error = BleError::Connect(format!(
+                            "connection attempt timed out after {} seconds",
+                            CONNECT_ATTEMPT_TIMEOUT.as_secs()
+                        ));
+                        let _ = reply.send(Err(error.clone()));
+                        tokio::time::sleep(CONNECT_CANCEL_SETTLE_TIME).await;
+                        return WorkerExit {
+                            primary: Some(error),
+                            reply: None,
+                        };
                     }
                 };
                 eprintln!("directhci-ble worker: initializing GATT client / ATT MTU");

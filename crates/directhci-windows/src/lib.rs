@@ -67,6 +67,7 @@ pub use takeover::{
     OfflineRecoveryStatus, PreflightJournalStatus, RoundTripStatus, RuntimeControllerSession,
     TakeoverPreflightReport, TakeoverRoundTripReport, acquire_runtime_controller_session,
     execute_takeover_hci_info, execute_takeover_roundtrip, plan_takeover, recover_offline,
+    recover_owning_process_after_session_closed,
 };
 pub use usbdk::{
     UsbDkAmbiguityReason, UsbDkApiStatus, UsbDkControllerCorrelation,
