@@ -870,6 +870,38 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
                 return report;
             }
         }
+        // A pending DirectHCI selection may still report the old Windows
+        // driver until a reboot. After a reboot since this journal's acquire,
+        // the original Windows driver and absence of our interface confirm
+        // that a reboot-required restore has converged. Reinstalling that
+        // already-active driver can return NeedReboot again indefinitely.
+        if journal.phase == OwnershipPhase::RecoveryRequired
+            && observation_matches_historical_driver(
+                &observed,
+                &journal.pre_acquire_observation.driver,
+            )
+        {
+            match reboot_completed_after_acquire(&journal) {
+                Ok(true) => {
+                    if let Err(error) = journal_to_windows_owned_and_clear(&store, &mut journal) {
+                        report.status = OfflineRecoveryStatus::RecoveryRequired;
+                        report.error = Some(error);
+                        return report;
+                    }
+                    report.status = OfflineRecoveryStatus::AlreadyWindowsOwned;
+                    report.final_state = Some(observed);
+                    report.journal_cleared = true;
+                    report.journal_retained = false;
+                    return report;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    report.status = OfflineRecoveryStatus::RecoveryRequired;
+                    report.error = Some(format!("cannot verify reboot after takeover: {error}"));
+                    return report;
+                }
+            }
+        }
         // A failed/pending DiInstallDevice can report the old driver until a
         // reboot. Explicitly reinstall the chosen Windows candidate before
         // clearing an uncertain journal so a pending DirectHCI selection is
@@ -931,6 +963,27 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
         }
     }
     report
+}
+
+#[cfg(windows)]
+fn reboot_completed_after_acquire(journal: &OwnershipJournal) -> Result<bool, String> {
+    use windows::Win32::System::SystemInformation::GetTickCount64;
+
+    const BOOT_TIME_MARGIN_MS: u64 = 2_000;
+    let now = unix_time_ms().map_err(|error| error.to_string())?;
+    if journal.created_unix_ms == 0 || journal.created_unix_ms > now {
+        return Ok(false);
+    }
+    // This is an additional guard: current PnP identity, the original
+    // Windows driver and absence of the DirectHCI interface are also
+    // required above. Sleep or hibernation do not count as a new boot.
+    let boot_unix_ms = now.saturating_sub(unsafe { GetTickCount64() });
+    Ok(boot_unix_ms > journal.created_unix_ms.saturating_add(BOOT_TIME_MARGIN_MS))
+}
+
+#[cfg(not(windows))]
+fn reboot_completed_after_acquire(_journal: &OwnershipJournal) -> Result<bool, String> {
+    Ok(false)
 }
 
 fn validate_pre_rebind(

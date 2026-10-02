@@ -243,9 +243,12 @@ the basic round trip succeeds.
 - DirectHCI-side re-enumeration or readiness failure: immediately attempt
   restore.
 - `NeedReboot=TRUE`: never reboot automatically; persist `RecoveryRequired` and
-  retain the journal. If offline recovery still observes BTHUSB, it explicitly
-  reselects a fresh Windows candidate before clearing the record so a pending
-  DirectHCI selection cannot be mistaken for a completed recovery.
+  retain the journal. On the next startup or offline recovery, freshly locate
+  the same physical controller. If a later boot is confirmed, the original
+  Windows driver is active and healthy, and the DirectHCI interface is absent,
+  reconcile to `WindowsOwned` and clear the journal without reinstalling the
+  already-active driver. Before a confirmed later boot, explicitly reselect
+  the Windows candidate; uncertain observations retain the journal.
 - Missing/ambiguous recovery candidate, restore failure, or final verification
   failure: retain the journal and report `directhci recover --offline`.
 - Verified `BTHUSB`, healthy device status, and absent DirectHCI application
