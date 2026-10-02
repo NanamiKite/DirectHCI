@@ -1,31 +1,30 @@
 # Temporary device-specific WinUSB rebind
 
-This document describes the implemented temporary M1 takeover path and its
-safety contract. The Windows host has completed a BTHUSB / `oem69.inf` →
-DirectHCI WinUSB / `oem183.inf` → BTHUSB / `oem69.inf` round trip, including
-WinUSB readiness and verified Windows restore. Those INF names are historical
-observations, not hard-coded recovery targets.
+The temporary takeover backend binds one controller to WinUSB for a session,
+then restores its Windows Bluetooth driver. The service records each
+transition in a durable journal so startup or offline recovery can finish an
+interrupted restore. Recorded hardware results are in
+[compatibility.md](compatibility.md).
 
-Driver package build and certificate trust remain explicit user operations.
-Driver Store staging is optional in Setup; DirectHCI runtime does not stage or
-remove a package, disable the device, or change boot policy. The M1-only diagnostic command is:
+The Control Panel's **Prepare Controller** action generates and stages a
+driver package through the service after certificate trust consent. Setup
+only installs the provisioning component. Preparation and takeover are
+separate operations; this diagnostic tests the driver roundtrip without HCI:
 
 ```text
 directhci takeover roundtrip <controller-id> --execute
 ```
 
-Normal Raw HCI ownership now runs inside `directhcid`; the explicit
+Normal Raw HCI ownership runs inside `directhcid`; the explicit
 `takeover hci-info ... --execute` and `recover --offline` commands remain
 development/recovery entry points. See [architecture.md](architecture.md).
 
 ## Scope and invariant
 
-The validated target was the Intel AX201 Bluetooth USB function
-(`USB\VID_8087&PID_0026`) that Windows normally owns through `BTHUSB`.
-The new development INF instead lists explicit USB PnP Hardware IDs in one
-shared WinUSB package. A listed ID permits a guarded takeover attempt; it does
-not guarantee firmware bring-up, Raw HCI support, or safe restoration on
-untested hardware:
+The tested controller was an Intel AX201 Bluetooth USB function
+(`USB\VID_8087&PID_0026`) normally using `BTHUSB`. Preparation generates an INF
+for one freshly observed Hardware ID. Other controllers still need firmware,
+HCI and restore testing. The ownership sequence is:
 
 ```text
 WindowsOwned
@@ -210,25 +209,21 @@ missing device keeps the journal pending. An ambiguous identity or driver
 choice produces `RecoveryRequired` without modifying any candidate. It also
 refuses to run while the journal's owning process is still active.
 
-## Original destructive acceptance gate
+## Hardware test prerequisites
 
-These were the prerequisites for the first AX201 rebind; that round trip has
-since been completed on the recorded Windows host. Reapply the gate on any
-new host, changed package, or driver/security configuration:
+Before testing on a new host, changed package or driver/security configuration:
 
-No AX201 rebind is permitted until all of these are complete:
-
-1. the development INF/catalog is validated, signed, and staged manually;
-2. the read-only planner finds one DirectHCI candidate and one valid Windows
-   recovery candidate for the exact AX201;
-3. the DirectHCI candidate is lower preference, and staging plus reboot does
-   not auto-bind it;
-4. the durable journal directory is writable and no unresolved journal exists;
-5. the built-in offline recovery command is available;
-6. non-Bluetooth keyboard/mouse, administrator access, recovery media, and a
-   reboot path are available;
-7. current `controllers --json`, `doctor --json`, candidate list, Windows
-   build, and package identities are archived.
+1. prepare and stage the device-specific package;
+2. check that the read-only planner finds one DirectHCI candidate and one valid
+   Windows recovery candidate for the exact controller;
+3. verify the DirectHCI candidate is lower preference, and staging plus reboot
+   does not auto-bind it;
+4. check that the journal directory is writable and no unresolved journal exists;
+5. make the offline recovery command available;
+6. arrange non-Bluetooth input, administrator access, recovery media and a
+   reboot path;
+7. save `controllers --direct --json`, `doctor --json`, the candidate list,
+   Windows build and package identities.
 
 The implemented controlled acceptance sequence is: preflight and journal;
 device-specific bind; wait/re-observe; validate exact identity, WinUSB service,

@@ -1,195 +1,103 @@
-# DirectHCI 中文文档
+# DirectHCI
 
-本文是当前实现的中文总览，面向使用和开发。详细的 M1 驱动选择、
-Journal 格式、WinUSB/UsbDk 调研与 API 来源仍见文末对应的英文专题文档。
-**代码存在、过去在真机成功，以及当前版本已重新验收是三种不同状态。**
+[English](../README.md)
 
-## 项目边界与现状
+DirectHCI 让 Windows 应用直接访问 USB 蓝牙控制器的原始 HCI 接口。
+本地服务会将选中的控制器临时绑定到 WinUSB，收发 HCI 命令、事件和 ACL
+数据，并在客户端释放会话或断开后恢复 Windows 蓝牙驱动。
 
-DirectHCI 是 Windows 蓝牙控制器的用户态所有权与 Raw HCI 基础设施，
-不是某个 BLE 外设的专用协议项目。通用 BLE Central/GATT 能力位于独立
-`directhci-ble` 库，由 TrouBLE 实现 Host Stack；`directhci-core` 和
-`directhcid` 不包含设备专用 UUID、握手或业务状态。
+仓库包含 Windows 服务、控制面板、命令行工具，以及用于原始 HCI 和
+BLE Central/GATT 的 Rust 库。BLE 协议栈使用 TrouBLE。
 
-```text
-CLI / Control Panel / Rust consumer
-            ↓ directhci-client（本地 Named Pipe）
-         directhcid（唯一活动写会话）
-            ↓ M1 临时 WinUSB 接管 + M2 RawHciSession
-      Windows Bluetooth Controller
+**当前版本：`0.1.0-alpha.1`。** 开发测试主要使用 Windows 11 上的
+Intel AX201，已有驱动接管、原始 HCI 通信和 Windows 恢复的实机记录。
+BLE 生命周期回归问题，以及近期安装器和控制面板的改动，仍待实机复测。
+具体结果见[兼容性记录](compatibility.md)。
 
-Rust BLE consumer
-    ↓ directhci-ble → directhci-bt-hci → directhci-client
-```
+DirectHCI 占用控制器期间，连接到这块控制器的 Windows 蓝牙设备会暂时
+不可用。运行时同一时间只允许一个活动 HCI 会话。如果键鼠依赖这块控制器，
+测试前请备好有线输入设备。
 
-当前 AX201 主线是临时接管，不是把系统蓝牙永久绑定到 WinUSB：
+## 开始使用
 
-```text
-BTHUSB / WindowsOwned
-  → 持久化恢复意图
-  → 对准确 devnode 选择 DirectHCI WinUSB
-  → Raw HCI 会话
-  → 关闭 I/O
-  → 重新观察、选择适用的 Windows 蓝牙驱动
-  → BTHUSB / WindowsOwned
-```
+安装器面向 Windows x64。从源码构建安装包需要 Rust、MinGW-w64、EWDK
+和 Inno Setup，步骤见[安装文档](installation.md#build-the-installer)。
 
-Dedicated 模式仅为另一块专用 USB dongle 的辅助路线。UsbDk 只有只读探测
-代码，未在当前 AX201 宿主机安装或执行 redirect。
+1. 运行安装包，从开始菜单打开 **DirectHCI Control Panel**。安装和启动
+   面板都需要管理员权限。
+2. 点击 **Start Service**，选择控制器。
+3. 如果状态为 **Not prepared**，点击 **Prepare Controller**。确认本机
+   证书信任后，服务会生成并暂存 WinUSB 驱动包。Windows 可能因签名策略
+   拒绝该包，详见[控制器准备](installation.md#prepare-a-controller)。
+4. 使用 CLI 或 Rust 客户端打开会话。启动服务和准备驱动包不会接管
+   控制器；客户端申请会话时才会切换驱动。
 
-### 已记录的真机证据
-
-同一台 Windows 11 AX201 宿主机曾完成
-`BTHUSB/oem69.inf → DirectHCI WinUSB/oem183.inf → BTHUSB/oem69.inf`；
-WinUSB readiness 为 `Ready`，接口 E0/01/01，Event IN `0x81`、
-ACL IN `0x82`、ACL OUT `0x02`。这些端点号是实测结果，通用代码按
-descriptor 发现，不应硬编码。HCI Reset 返回 `0x00`；还观察到 LE
-连接、ATT MTU 交换、GATT discovery、被动 notification 与 Windows 恢复。
-`oemNN.inf` 和驱动版本都只是当时的观察，不是永久恢复目标。
-
-**当前版本尚待复测：** BLE CLI 提取为库后，后续真机报告出现过 GATT
-timeout/disconnect 生命周期回归。较早的成功不等于最新 BLE 构建已经通过。
-最近的安装包/面板 UAC 代码也尚无新一轮 Windows 宿主机验收记录。
-请以 [兼容性记录](compatibility.md) 和新的实机结果为准。
-
-## Windows 安装与使用
-
-当前安装器安装 Rust 可执行程序、注册 `DirectHCI` 服务、建立控制面板
-快捷方式，并携带构建机编译的 libwdi 准备组件。安装时不会预先为所有蓝牙
-控制器生成或暂存 WinUSB 包；用户在面板中选择控制器后按需 Prepare，
-准备与实际接管仍然分离。Windows 可以因签名策略拒绝暂存，DirectHCI 不会
-关闭 Secure Boot、启用测试签名或修改 BCD。
-
-Windows 构建机需要挂载 EWDK，并安装 Inno Setup 6.4 或更新版。在
-`cmd.exe` 中运行 EWDK 的 `LaunchBuildEnv.cmd`、`SetupVSEnv`，
-然后从同一窗口进入仓库并执行：
-
-```cmd
-F:\LaunchBuildEnv.cmd
-SetupVSEnv
-cd /d "C:\path\to\DirectHCI"
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-libwdi.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-installer.ps1
-```
-
-将 `F:` 和仓库路径替换为实际位置。普通用户电脑不需要 EWDK 或 MSBuild。
-
-不要在修改源码后使用 `-SkipBuild`：它只检查 exe 是否存在，可能把旧版本
-打进安装包。Cargo 构建目标默认在
-`%LOCALAPPDATA%\DirectHCI\target\x86_64-pc-windows-gnu\release`；
-新安装包在 `%LOCALAPPDATA%\DirectHCI\installer-output`。安装后程序位于
-`C:\Program Files\DirectHCI`。三处不是同一个目录。当前开发版安装包
-文件名固定为 `DirectHCI-Setup-0.1.0-alpha.1.exe`，不要误运行 Downloads
-里的旧副本。
-
-安装器的 `PrivilegesRequired=admin` 要求管理员安装。若安装器本来就是
-通过已提权进程启动，Windows 可能不再显示第二次 UAC。安装程序的提权不会
-传递给后来从开始菜单启动的控制面板；面板源码会检查自身令牌，并在必要时
-请求 UAC，拒绝后不进入界面。**这项新行为须用重新打包、重新安装后的
-Windows 版本确认**；普通 SDK/CLI 客户端不会因此自动提权。
-
-打开 Control Panel 后可查看 SCM 服务状态、控制器列表、首选控制器、
-所有权、活动客户端及恢复状态；可点击 Start/Stop Service、Refresh、
-Restore Windows、Diagnostics。服务未安装或已停止时，面板仍应能打开并
-显示不可用状态。面板不直接操作 SetupAPI/WinUSB，而是调用
-`directhci-client` 和 SCM。
-
-面板打开期间约每两秒自动刷新服务、控制器、活动客户端与恢复状态，
-IPC 查询在后台执行，不阻塞窗口。正常关闭面板时，会先请求停止服务，
-等待 SCM 确认 `Stopped` 后再退出；也可主动点击 **Stop Service**，
-停止服务但保留面板。若有活动会话，停止前须确认，daemon 会关闭 Raw HCI
-并尝试恢复 Windows 蓝牙；停止失败时面板保持打开并显示错误。普通客户端
-断开只释放会话和恢复 Windows 蓝牙，**不会**自动停止服务。前台开发模式
-`directhcid run` 仍由其自身的显式关闭操作结束。
-
-最小化控制面板会将其隐藏到系统托盘，不会停止服务；点击托盘图标可恢复
-窗口。托盘菜单的“Exit Control Panel”与关闭窗口一样，仍需先安全停止
-服务，不能绕过 Windows 蓝牙恢复检查。
-
-### 首选控制器
-
-首选项保存在受保护的 `%ProgramData%\DirectHCI\config.json`，由 daemon
-验证 ControllerId 并原子写入，面板不直接编辑。只有一块控制器且没有已存
-首选项时，daemon 可以自动选择；多块时必须人工选择；已保存的设备消失后
-不会悄悄改选另一块。活动会话期间不能切换首选控制器。
-
-ControllerId 是索引，不是授权凭据。真正 acquire 前必须重新枚举、确认
-同一物理控制器、检查驱动与恢复候选。不要把旧 interface path、显示名称、
-VID/PID 或 `oemNN.inf` 当成可靠的永久身份。
-
-### 卸载与异常恢复
-
-从 Windows“已安装的应用”卸载。卸载前置流程会尝试停止服务并调用现有
-离线恢复；若无法确认 Windows Bluetooth 已恢复，就保留服务、文件及
-Journal，不应手动删除它们。安装器升级也执行相应前置检查。
-
-需要独立恢复时，在管理员终端运行已安装的：
+服务运行后，可在 PowerShell 中查看状态和控制器列表：
 
 ```powershell
-& "$env:ProgramFiles\DirectHCI\directhci.exe" recover --offline
+& "$env:ProgramFiles\DirectHCI\directhci.exe" status
+& "$env:ProgramFiles\DirectHCI\directhci.exe" controllers
 ```
 
-此命令根据持久 Journal **加上新的 Windows 实际观察**进行 reconcile，
-不会仅按历史 `oem69.inf` 名称盲目回放。若报告 identity ambiguous、
-controller missing 或 unsafe journal path，应保留现场并分析，不能清空
-`%ProgramData%\DirectHCI` 来“解除”保护。普通诊断可用
-`directhci status` 和 `directhci controllers`（前提是服务可用）。
+运行 `directhci.exe --help` 查看命令用法。BLE 操作使用
+`directhci-ble.exe` 或 [BLE 库](../crates/directhci-ble/README.md)。
+需要接管控制器的客户端也须以管理员身份运行。
 
-## 开发与真机边界
+关闭控制面板会停止服务；最小化则收起到托盘，服务继续运行。
+如果异常退出后蓝牙未恢复，按[恢复步骤](installation.md#recovery)处理。
 
-Linux VM 可编辑并做 Rust 静态检查；硬件、PnP、驱动与服务验收必须在
-Windows 宿主机。不要把大量 Cargo `target/` 放入 VMware 共享目录：
+## Rust 库
 
-```sh
-export CARGO_TARGET_DIR=/tmp/directhci-target
-cargo check --workspace --target x86_64-pc-windows-gnu
-```
-
-Windows 宿主机构建时让 `CARGO_TARGET_DIR` 指向本地磁盘，例如
-`$env:LOCALAPPDATA\DirectHCI\target`。构建 exe 不等于已经安装服务；
-构建目录 exe 也不等于 `C:\Program Files\DirectHCI` 中的已安装版本。
-当前 WinUSB 准备流程见 [临时重绑定专题](temporary-rebind.md) 和
-[按设备生成的 INF 模板](../driver/winusb-device-specific/README.md)。安装包
-只携带 libwdi 准备组件，不预先生成或暂存任何蓝牙设备驱动包。面板中选择
-控制器并明确同意本机证书信任后，**Prepare Controller** 才根据新鲜枚举的
-精确 PnP Hardware ID 生成单设备 INF/CAT、一次性自签并仅暂存 Driver Store。
-私钥签名后销毁；若 Windows 拒绝本机自签包，则显示真实错误，BTHUSB 不变。
-新控制器不需要更新静态 HWID 清单，也不需要重装 DirectHCI。旧多 HWID
-开发包仅保留迁移兼容；USB class compatible ID INF 因 Inf2Cat B2.6.4.9
-不再使用。准备不会自动接管，后续仍需 planner、journal 和 WinUSB/HCI
-验证；程序不会修改 Secure Boot、TESTSIGNING 或 BCD。
-
-通用 BLE 库可被另一个 Rust consumer 依赖：
-`DirectHciBleCentral → BleConnection` 提供 scan、discover、read/write、
-标准 CCCD subscribe、无 CCCD 被动 listen/listen_all 与显式 disconnect。
-标准订阅和被动监听不会互相自动 fallback。详见
-[BLE 库 README](../crates/directhci-ble/README.md)。在当前 BLE 生命周期
-回归复测通过前，不要把旧的 notification 真机成功表述成最新构建已通过。
-
-## 文档索引
-
-| 主题 | 详细文档 |
+| Crate | 用途 |
 | --- | --- |
-| 架构、运行时与 BLE 边界 | [architecture.md](architecture.md) |
-| 当前硬件证据与待复测项 | [compatibility.md](compatibility.md) |
-| Windows 安装、升级、卸载 | [installation.md](installation.md) |
-| VM / Windows 构建和运行 | [development.md](development.md) |
-| AX201 临时重绑定与恢复 | [temporary-rebind.md](temporary-rebind.md) |
-| Windows 验收阶段和记录 | [windows-test-plan.md](windows-test-plan.md) |
-| Dedicated dongle 辅助流程 | [dedicated-controller.md](dedicated-controller.md) |
-| 方案取舍与 UsbDk 风险 | [ownership-survey.md](ownership-survey.md) |
-| 上游来源与许可证边界 | [references.md](references.md) |
+| [`directhci-client`](../crates/directhci-client) | 连接本地服务，查询控制器、申请和释放原始 HCI 会话 |
+| [`directhci-bt-hci`](../crates/directhci-bt-hci) | 将 DirectHCI 会话适配为 `bt-hci` 控制器 |
+| [`directhci-ble`](../crates/directhci-ble) | 异步 BLE 扫描、连接、GATT 读写和通知 |
 
-本中文页是当前状态与操作的汇总，不复制各专题全部历史调查细节。
-如文档与当前 Windows 真机观察冲突，以保存的实际输出为准，先核对构建
-和安装的 exe 是否为同一版本，再更新相应验收记录。
+这些 crate 尚未发布，使用时通过本地 checkout 的路径依赖引入。
+客户端通过本地命名管道与 `directhcid` 通信，由服务管理 WinUSB 句柄、
+驱动切换和恢复日志。会话与恢复流程见[架构文档](architecture.md)。
+
+## 构建
+
+需要 Rust 1.87 或更新版本。Windows 构建使用 `x86_64-pc-windows-gnu`
+目标，MinGW-w64 工具（包括 `windres.exe`）须在 `PATH` 中。
+在仓库根目录执行：
+
+```powershell
+rustup target add x86_64-pc-windows-gnu
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
+cargo build --locked --release --workspace --target x86_64-pc-windows-gnu
+```
+
+可执行文件输出到
+`%LOCALAPPDATA%\DirectHCI\target\x86_64-pc-windows-gnu\release`。
+构建不会安装服务。前台运行 daemon、Linux 检查和安装包构建说明见
+[开发文档](development.md)。
+
+## 仓库结构
+
+| 路径 | 内容 |
+| --- | --- |
+| `apps/` | Windows 服务、控制面板、诊断 CLI 和 BLE CLI |
+| `crates/` | 客户端库、共享类型和 Windows 后端 |
+| `driver/` | 按设备生成的 WinUSB INF 模板及旧版开发驱动包 |
+| `installer/`、`scripts/windows/` | Windows 打包配置和构建脚本 |
+| `docs/` | 安装、架构、恢复和硬件测试文档 |
+
+## 文档
+
+- [安装、控制器准备与恢复](installation.md)
+- [开发](development.md)
+- [硬件兼容性与已知问题](compatibility.md)
+- [架构](architecture.md)
+- [临时驱动切换与恢复机制](temporary-rebind.md)
+- [Windows 实机测试](windows-test-plan.md)
+- [独立 USB 控制器实验流程](dedicated-controller.md)
+- [早期方案调研](ownership-survey.md)
+- [依赖与参考资料](references.md)
 
 ## 许可证
 
-项目当前暂定采用 GNU GPL 第 3 版，仅此版本（`GPL-3.0-only`）；
-英文许可证全文见仓库根目录的 [LICENSE.txt](../LICENSE.txt)。
-“暂定”表示未来版本仍可重新评估授权方案，并不表示已发布版本的授权可
-追溯撤销。第三方依赖继续适用各自的许可证；来源和使用边界见
-[references.md](references.md)。作为库依赖使用的 `directhci-ble`、
-`directhci-client` 等第一方 crate 也采用此许可证；将其集成进其他项目
-并分发前，应核对 GPL 义务和自身项目的授权兼容性。
+DirectHCI 的第一方 crate 和应用当前采用 [GPL-3.0-only](../LICENSE.txt)。
+第三方依赖的许可证见[参考资料](references.md)。

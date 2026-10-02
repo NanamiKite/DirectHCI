@@ -1,20 +1,15 @@
-# Ownership routes and Dedicated WinUSB implementation survey
+# Ownership backend survey
 
-This survey selects implementation routes; it does not authorize driver
-installation, driver changes, controller capture, or Raw HCI I/O. Statements
-are classified as Microsoft documentation, upstream behavior, current host
-observation, or DirectHCI design decision.
-
-Survey reviewed: 2026-10-01. This is the historical route-selection
-analysis, not the current milestone/status page. The temporary-rebind route
-has since passed an AX201 hardware round trip and powers the Raw HCI runtime.
-See [compatibility.md](compatibility.md) for verified versus pending results.
+Historical design notes, reviewed 2026-10-01. The comparison led to the
+temporary WinUSB rebind backend. Implementation proposals below describe the
+options considered at that stage; current behavior is in
+[architecture.md](architecture.md), and test results are in
+[compatibility.md](compatibility.md).
 
 ## Product modes and non-goals
 
-DirectHCI supports two equally formal modes. They share controller identity,
-diagnostics, the implemented Raw HCI contract, and the single-writer
-invariant, but they have different desired available states.
+The design considered two ownership modes with shared identity, diagnostics
+and a single writer, but different idle states.
 
 Dedicated Controller Mode uses a separate USB controller intentionally
 provisioned for WinUSB:
@@ -47,7 +42,7 @@ The route priority is:
 At the time of the survey Raw HCI and service/IPC were future milestones.
 They are now implemented; Intel vendor initialization and a custom driver
 remain outside the current implementation. Package trust and driver staging
-remain explicit user operations. The AX201 M1 round trip has been observed
+remain explicit user operations. The AX201 driver roundtrip has been observed
 on the Windows host.
 
 Current host observation: the system controller is an Intel AX201 USB
@@ -96,10 +91,10 @@ on hardware/compatible IDs, so identical devices cannot safely be
 distinguished by VID/PID alone. Enrollment must refuse ambiguity and must not
 silently turn a system controller into a dedicated one.
 
-`libwdi` remains a possible provisioning adapter, but is not a core runtime
-dependency. Its C build/packaging and LGPL-3.0-or-later obligations add work
-that is not needed for the first manual developer workflow. Zadig is an
-external GPL-3.0 tool; DirectHCI does not embed or derive from it.
+The initial survey deferred libwdi in favor of manual provisioning. The
+implemented preparation flow now bundles pinned libwdi for package generation
+and signing; see [installation.md](installation.md#prepare-a-controller).
+Zadig remains an external developer tool.
 
 Microsoft OS descriptors are the best experience when the device manufacturer
 already supplies them. They are not a provisioning mechanism DirectHCI can
@@ -190,9 +185,9 @@ service owns the session and workers; CLI, SDK, consumer applications, and
 the Control Panel are clients. The Control Panel does not own the controller
 and currently requires the service to be stopped before its window closes.
 
-## B. Temporary device-specific WinUSB rebind — current Phase 1 mainline
+## B. Temporary device-specific WinUSB rebind — selected backend
 
-This is the implemented Phase 1 takeover path. It selects a staged driver for
+The selected takeover path chooses a staged driver for
 one freshly identified devnode, re-observes after re-enumeration, and reconciles
 back to a freshly applicable Windows driver. It does not use a hardware-ID-wide
 force update or blindly reinstall a cached INF. Durable journal storage and
@@ -256,7 +251,7 @@ requirements. No such evidence currently exists.
 | Runtime driver mutation | None after provisioning | Yes | Redirect through installed filter |
 | Desired available state | `DirectHciReady` | `WindowsOwned` | `WindowsOwned` |
 | Crash recovery | Close/cancel I/O; keep WinUSB binding | Persistent binding requires reconciler | Handle return contract plus lab validation |
-| Role in current roadmap | Future auxiliary | Phase 1 mainline | Not default |
+| Role | Future auxiliary | Implemented backend | Experimental |
 
 ## Route decision and sequencing
 

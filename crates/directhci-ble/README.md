@@ -1,48 +1,96 @@
 # directhci-ble
 
-Generic asynchronous BLE Central and GATT client API backed by the local
-DirectHCI runtime.
+Async BLE Central and GATT client library for the local DirectHCI service.
+It uses `directhci-client` for the HCI session, `directhci-bt-hci` as the
+transport adapter, and TrouBLE for the Bluetooth host stack.
 
-This first-party crate currently uses `GPL-3.0-only`; see
-[LICENSE.txt](../../LICENSE.txt). Its upstream dependencies retain their own
-licenses.
+## Setup
 
-The library acquires Raw HCI through `directhci-client`, adapts it through
-`directhci-bt-hci`, and owns the TrouBLE Host lifecycle. It does not access
-WinUSB or switch Windows drivers itself.
+The crate is unpublished. Add it from a local DirectHCI checkout:
 
-```rust,no_run
-use std::time::Duration;
-use directhci_ble::{
-    BleAddress, BleCentralConfig, DirectHciBleCentral, WriteMode,
-};
-
-# async fn example() -> Result<(), directhci_ble::BleError> {
-let central = DirectHciBleCentral::connect(BleCentralConfig::default()).await?;
-let devices = central.scan(Duration::from_secs(5)).await?;
-let peer: BleAddress = devices[0].address;
-let connection = central.connect_device(peer).await?;
-
-let services = connection.discover().await?;
-let characteristic = services[0].characteristics[0].clone();
-
-// Passive listening does not write a CCCD. The listener is ready when this
-// future returns, so writes performed afterward cannot race listener setup.
-let mut notifications = connection.listen(&characteristic).await?;
-connection
-    .write(&characteristic, vec![0x01, 0x02], WriteMode::WithResponse)
-    .await?;
-if let Some(event) = notifications.recv().await? {
-    println!("handle={:#06x} value={:02x?}", event.handle, event.value);
-}
-
-notifications.close().await?;
-connection.disconnect().await?;
-# Ok(())
-# }
+```toml
+[dependencies]
+directhci-ble = { path = "../DirectHCI/crates/directhci-ble" }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 ```
 
-Use `subscribe` for standard CCCD-based notification/indication enablement,
-`listen` for passive reception from one characteristic, and `listen_all`
-for passive reception from every handle. These operations never fall back to
-one another.
+Adjust the path for your project. On Windows, start the DirectHCI service,
+select and prepare a controller in the Control Panel, then run the consumer
+with administrator rights. A BLE session temporarily takes that controller
+away from Windows Bluetooth. See [installation](../../docs/installation.md).
+
+GATT timeout and disconnect regressions have been reported since the library
+was extracted from the CLI. Hardware retesting is pending; see
+[compatibility](../../docs/compatibility.md).
+
+## Scan
+
+```rust
+use std::time::Duration;
+use directhci_ble::{BleCentralConfig, BleError, DirectHciBleCentral};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), BleError> {
+    let central = DirectHciBleCentral::connect(BleCentralConfig::default()).await?;
+    let scan = central.scan(Duration::from_secs(5)).await;
+    central.shutdown().await?;
+
+    for device in scan? {
+        println!("{} {:?}", device.address, device.local_name);
+    }
+    Ok(())
+}
+```
+
+The default configuration selects a controller only when exactly one is
+present. With multiple controllers, set `BleCentralConfig::controller_id`
+explicitly; this library does not read the panel's saved preference.
+
+## Connections and GATT
+
+`central.connect_device(address).await` consumes the central and returns a
+`BleConnection`. Select a peer from scan results or parse an address such as
+`public:AA:BB:CC:DD:EE:FF` or `random:AA:BB:CC:DD:EE:FF`.
+
+| Method | Operation |
+| --- | --- |
+| `discover` | List services, characteristics and descriptors |
+| `find_characteristic` | Find a characteristic by UUID |
+| `read` / `write` | Exchange raw characteristic values |
+| `subscribe` | Enable notifications or indications by writing the CCCD |
+| `listen` | Receive values from one characteristic without writing its CCCD |
+| `listen_all` | Receive unsolicited values from all handles |
+| `disconnect` | Close the BLE connection and release the HCI session |
+
+Choose UUIDs and write payloads for the target device. Passive listening is
+useful for peripherals that send unsolicited values; it does not enable
+notifications on a device that requires a CCCD write. `subscribe` and `listen`
+return errors from their own operations without falling back to each other.
+
+A listener is ready when `listen(...).await` returns. Keep its stream open
+while writing through the same connection, then receive with `recv().await`.
+Call `stream.close().await` when finished.
+
+Use `connection.disconnect().await` after a connection, or
+`central.shutdown().await` after scanning. Dropping an object requests
+best-effort cleanup but does not wait for it to finish.
+
+## CLI
+
+The `directhci-ble-cli` package builds `directhci-ble.exe`. With the service
+running and exactly one controller present and prepared, scan from an elevated
+PowerShell:
+
+```powershell
+& "$env:ProgramFiles\DirectHCI\directhci-ble.exe" scan --seconds 5
+```
+
+Commands include `connect`, `inspect`, `read`, `write`, `subscribe`, `listen`,
+`listen-all` and `exchange`. Run the executable without arguments to print
+usage. An explicit controller is supplied before the command:
+`directhci-ble --controller <id> scan --seconds 5`.
+
+## License
+
+[GPL-3.0-only](../../LICENSE.txt). Upstream dependencies retain their own
+licenses; see [references](../../docs/references.md).

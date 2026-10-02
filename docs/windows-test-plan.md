@@ -1,209 +1,152 @@
-# Windows host test plan
+# Windows host tests
 
-VM compilation is not hardware validation. Results from this plan must be
-recorded as Windows host observations with Windows build, driver versions,
-backend version, controller identity evidence, and exact result.
+Run hardware tests on a Windows host with administrator access and input
+devices that do not depend on the controller under test. Keep offline recovery
+available before changing a driver. Existing results are in
+[compatibility.md](compatibility.md).
 
-## Stage 1: read-only observation
+For each run, save the source commit, executable paths, Windows build,
+controller identity, driver versions, package identity and complete command
+output. Record failures as well as the final controller state.
 
-1. Run `directhci controllers --json` without elevation.
-2. Confirm the system Bluetooth controller appears exactly once.
-3. Compare VID/PID, instance ID, Container ID, location paths, parent, INF,
-   service, driver provider/version, status, and problem code with Device
-   Manager or `pnputil /enum-devices /connected /deviceids /drivers`.
-4. Run the command repeatedly and after a normal reboot. Record which identity
-   evidence remains stable.
-5. Confirm no device is disabled, restarted, rebound, or removed.
-
-Observed on the current host: the Intel AX201 Bluetooth USB function is
-`8087:0026` and uses `BTHUSB`. The system/sentinel Container ID is normalized
-away; location topology is the current identity basis.
-
-Its instance is `USB\\VID_8087&PID_0026\\5&310905D1&0&14`. This is the system
-controller and is permanently excluded from Dedicated Mode provisioning. It is
-the explicit M1 takeover target. The first temporary-rebind safety gate was
-completed for the recorded host; reapply it before a new destructive run,
-package revision, or different machine.
-
-## Stage 2: read-only UsbDk compatibility gate
-
-Completed host observation:
-
-```text
-UsbDkHelper.dll: missing
-UsbDk service: missing
-enumeration: not attempted
-correlation: not evaluated
-```
-
-This is an environment result, not a DirectHCI probe error. Do not install
-UsbDk merely to change it. The read-only adapter and `doctor` diagnostics remain
-available for machines where the runtime is already present.
-
-UsbDk is now an experimental takeover candidate. Its installer registers a
-system USB filter and triggers machine-wide USB re-enumeration. A public issue
-also reports `WDF_VIOLATION` around `StartRedirect` for a power-managed
-Bluetooth USB device on Windows 11, with related Windows 10 reports. Neither
-safety nor universal incompatibility has been established.
-
-No UsbDk install, uninstall, filter change, `StartRedirect`, or `StopRedirect`
-is authorized on the primary development host by this plan.
-
-## Stage 3: temporary-rebind read-only preflight
-
-Run, without elevation if the host permits read-only driver-list access:
-
-```text
-directhci controllers --json
-directhci doctor --json
-directhci takeover plan <AX201-controller-id> --json
-```
-
-The plan must freshly resolve exactly one AX201 devnode, report `BTHUSB` and
-the current Intel package, enumerate applicable compatible-driver packages and
-ranks, and apply no device changes. Before the development package is staged,
-`directhci_package` should be `missing`; journal writability and the built-in
-offline recovery entry point are checked independently. This stage never
-installs, binds, disables, enables, or restarts a device.
-
-Package creation, staging, transaction ordering, reconciliation, and the first
-destructive test gate are specified in
-[`temporary-rebind.md`](temporary-rebind.md). A staged package is not sufficient
-authorization to bind it.
-
-## Auxiliary: Dedicated WinUSB provisioning
-
-Not yet executed because no separate controller has been supplied. The driver
-change is performed only by the user and applies only to a separate,
-expendable USB Bluetooth controller—not the built-in AX201. Follow
-[`dedicated-controller.md`](dedicated-controller.md).
-
-Preconditions:
-
-1. Keep the system controller Windows-owned and verify local input does not
-   depend on the dedicated dongle.
-2. Record the target controller's identity, location, current driver/INF, and
-   USB class metadata before changing it.
-3. Remove other identical dongles where practical and refuse ambiguous
-   identity.
-4. Use an administrator provisioning step, initially an audited manual Zadig
-   selection of WinUSB. Do not install UsbDk or a filter driver.
-5. Record whether installation requests reboot or unplug/replug.
-6. Re-enumerate and verify the same physical controller now uses WinUSB while
-   the AX201 remains on `BTHUSB`.
-
-A production acceptance path will later replace the developer-only Zadig step
-with a narrowly matched, signed DirectHCI WinUSB INF/catalog and a
-device-specific installer workflow.
-
-## Auxiliary: read-only Dedicated WinUSB readiness
-
-Implemented in the Windows backend; hardware acceptance is pending a separate
-WinUSB-provisioned Bluetooth dongle. Run `directhci doctor` (or
-`directhci doctor --json`) without changing the AX201 binding. With no such
-dongle, the expected result is `Dedicated WinUSB / candidates: 0`.
-
-Completed no-device host baseline:
-
-~~~text
-controllers: 1 (Intel AX201, BTHUSB)
-Dedicated WinUSB discovery: success
-Dedicated WinUSB candidates: 0
-AX201 readiness: not_win_usb_bound
-~~~
-
-After separately authorized provisioning:
-
-1. Freshly enumerate the controller; do not reuse its old interface path.
-2. Confirm controller identity remains correlated across the driver change.
-3. Confirm the current service is `WinUSB`. Read `DeviceInterfaceGUID` or
-   `DeviceInterfaceGUIDs` from that devnode's hardware key, enumerate those
-   interface classes, and require an exact PnP instance-ID match. Do not use
-   `GUID_DEVINTERFACE_USB_DEVICE` as an application interface.
-4. Open its expected device interface with overlapped I/O.
-5. Call `WinUsb_Initialize`, query interface descriptors and pipes, and require
-   exactly one interrupt IN, one bulk IN, and one bulk OUT for the initial HCI
-   transport.
-6. Close all handles without sending a control, bulk, or interrupt transfer.
-7. Verify the AX201 and Windows Bluetooth remain unaffected.
-
-Multiple matching application paths are reported as ambiguous and are not
-opened. A missing or invalid registration is a readiness failure, not a reason
-to guess another interface GUID.
-
-## Future auxiliary: Dedicated Raw HCI acceptance
-
-Dedicated-mode HCI hardware acceptance is still future work because no
-separate WinUSB-bound dongle was tested. M2 command/event/ACL transport has
-instead been exercised through the temporary AX201 takeover. SCO and vendor
-firmware initialization are separate capabilities, not implied by basic
-HCI success.
-
-## Stage 4: first takeover round-trip
-
-The code path includes durable journal persistence, offline recovery,
-device-specific `DiInstallDevice` selection, WinUSB readiness reuse, and
-explicit Windows-driver restore. This gate was completed on the recorded host:
-`BTHUSB/oem69.inf` → `WinUSB/oem183.inf` → readiness `Ready` →
-`BTHUSB/oem69.inf`. Dedicated-controller validation was not required.
-A changed package or different host must pass its own gate again.
-
-The M1-only roundtrip binds only the exact AX201 devnode with
-`DiInstallDevice`, re-observes and runs the existing WinUSB readiness check,
-sends no HCI traffic, then explicitly binds a freshly selected non-DirectHCI
-Windows candidate and verifies Windows Bluetooth. The
-historical `oem69.inf` is evidence, not the desired state or an unconditional
-restore instruction.
-
-Build/stage and execute from an elevated PowerShell only after reviewing the
-package and ensuring non-Bluetooth input and recovery access:
+The PowerShell examples use the installed CLI:
 
 ```powershell
-.\scripts\windows\build-dev-driver.ps1 -CreateCertificate
-# Manually establish the required certificate trust/signing policy, then rerun
-# with -CertificateThumbprint if signature verification initially fails.
-pnputil /add-driver "$env:LOCALAPPDATA\DirectHCI\driver\winusb-supported-devices\directhci-winusb-dev.inf"
-.\directhci.exe controllers --json
-.\directhci.exe takeover plan <AX201-ID> --json
-.\directhci.exe recover --offline --json
-.\directhci.exe takeover roundtrip <AX201-ID> --execute --json
+$cli = "$env:ProgramFiles\DirectHCI\directhci.exe"
 ```
 
-The pre-roundtrip offline recovery command is a harmless no-op when no journal
-exists. Never add `/install` to the staging command.
+For a development build, set `$cli` to that build's executable. Replace quoted
+`<controller-id>` placeholders with an ID from the current controller list.
 
-UsbDk may be reconsidered only in an isolated lab: a sacrificial or readily
-recoverable Windows system, non-Bluetooth input, recovery media, crash
-dumps/kernel debugging, explicitly recorded UsbDk/Windows/HVCI configuration,
-and a noncritical controller. VM results are useful diagnostics but do not
-prove physical USB-stack safety.
+## 1. Observe the controller
 
-## Recorded M2/M3/BLE results and regression gate
+These commands can run without the service and do not change the device:
 
-Earlier AX201 host acceptance observed HCI Reset status `0x00`, Local
-Version `0x0b` / revision `0x375b`, LE connect, ACL TX/RX through ATT MTU
-exchange (MTU 131), GATT discovery, unsolicited notification reception,
-clean disconnect, and `WindowsOwned` restore. These are recorded hardware
-observations, not a guarantee for a later build.
+```powershell
+& $cli controllers --direct --json
+& $cli doctor --json
+& $cli takeover plan '<controller-id>' --json
+```
 
-After the BLE CLI implementation was extracted into `crates/directhci-ble`,
-host reports showed GATT timeout and then disconnect regressions. Before
-claiming the **current** BLE library build accepted, repeat only the
-smallest sequence: connect, inspect, passive listen, then check
-`directhci status` and `directhci controllers` for no active session and
-`WindowsOwned`. Do not infer that Cargo compilation resolves a lifecycle
-regression.
+Confirm that the target appears once. Compare VID/PID, instance ID, Container
+ID, location, parent, service, INF, driver version and problem code with
+Device Manager. Repeat discovery after a normal reboot and record which
+identity evidence remains stable.
 
-## Installer and Control Panel acceptance (pending)
+The takeover plan should identify the exact devnode, current Windows driver,
+compatible driver candidates and their ranks, and any recovery blockers.
+Before preparation, the DirectHCI package may be reported as missing.
 
-Build a fresh installer without `-SkipBuild`; verify the installed binary
-rather than a release-tree or Downloads copy. From a non-elevated Start Menu
-launch, confirm Control Panel UAC approval is requested, SCM status is
-displayed, service Start/Stop works, preferred controller persists, and the
-panel refreshes service/controller/session status without a manual Refresh.
-Confirm a normal client disconnect restores Windows Bluetooth while the
-service stays Running, and a second client connection works without restarting
-it. Confirm explicit Stop Service leaves the panel open; restart the service,
-then close the panel and verify it waits for SCM Stopped before exiting.
-Then separately check upgrade and safe uninstall. These packaging/UAC
-checks have not yet been reported as passing on the Windows host.
+## 2. Prepare the WinUSB package
+
+Use **Prepare Controller** in the installed panel, following
+[installation.md](installation.md#prepare-a-controller). Save the preparation
+result and repeat the read-only plan.
+
+Check that:
+
+- one expected DirectHCI package and a valid Windows restore candidate are
+  available for the target;
+- the DirectHCI candidate has a numerically worse rank than the Windows
+  candidate;
+- the controller remains bound to the Windows Bluetooth driver after staging
+  and after a reboot;
+- the journal directory is usable and no unresolved ownership journal remains;
+- `directhci recover --offline` is available from an elevated terminal.
+
+If Windows rejects staging, save the exact error and verify that the binding
+is unchanged. Leave boot and signing policy unchanged during this test.
+The [legacy development package](../driver/winusb-supported-devices/README.md)
+is a separate diagnostic path; it is not required for normal preparation.
+
+## 3. Test driver takeover and restore
+
+Stop the service before running direct takeover diagnostics. From an elevated
+PowerShell, with non-Bluetooth input and a recovery/reboot path available:
+
+```powershell
+& $cli recover --offline --json
+& $cli takeover plan '<controller-id>' --json
+& $cli takeover roundtrip '<controller-id>' --execute --json
+& $cli controllers --direct --json
+```
+
+The roundtrip should bind the exact device to DirectHCI WinUSB, pass readiness,
+then restore a freshly selected Windows driver. It sends no HCI traffic.
+Verify the target identity, WinUSB application interface, E0/01/01 descriptor,
+event/ACL pipes, and final working Windows Bluetooth state.
+
+A different host, package or driver/security configuration needs its own
+roundtrip. If it fails, preserve the journal and use the
+[recovery procedure](installation.md#recovery) before proceeding. Interruption
+and kill-point tests come after a successful basic roundtrip; the expected
+outcomes are listed in
+[temporary-rebind.md](temporary-rebind.md#implemented-failure-behavior).
+
+## 4. Test HCI and BLE sessions
+
+Start the service, then run from an elevated PowerShell:
+
+```powershell
+& $cli hci-info '<controller-id>' --execute --json
+& $cli status --json
+& $cli controllers --json
+```
+
+Check HCI Reset, Local Version Information, session release and final
+`WindowsOwned` state.
+
+For the BLE regression test, use a known test peripheral and the
+[BLE CLI](../crates/directhci-ble/README.md#cli). Run `connect`, `inspect`, and
+`listen` or `listen-all` as separate sessions, saving their output. Use a
+peripheral known to send unsolicited values for passive listening; use
+`subscribe` if it requires a CCCD write. After each command, check for no
+active HCI session and a restored Windows Bluetooth controller. Repeat after
+Ctrl+C to exercise interrupted cleanup.
+
+GATT timeout and disconnect regressions remain pending acceptance. A successful
+scan alone does not cover these operations.
+
+## 5. Test the installer and Control Panel
+
+Build without `-SkipBuild` and install the resulting package. Test the installed
+executables, recording their paths and hashes.
+
+1. Launch the panel from a non-elevated Start Menu session. Verify the UAC
+   prompt, successful launch on approval and exit on rejection.
+2. Check service Start/Stop, controller selection and preference persistence.
+   Verify status refreshes without clicking Refresh.
+3. Prepare a controller and verify the certificate consent and preparation
+   result. Confirm preparation leaves Windows Bluetooth bound.
+4. Connect and release a client. Verify Bluetooth is restored while the service
+   stays running, then connect a second client without restarting the service.
+5. Stop the service during an active session. Verify confirmation, cleanup and
+   restoration; the panel should remain open.
+6. Restart the service and close the panel. Verify it waits for SCM `Stopped`
+   before exiting. Minimize separately: the tray icon should restore the
+   panel, and minimizing should leave the service running.
+7. Test upgrade and uninstall. An unresolved recovery failure should retain
+   the service, binaries and journal instead of deleting them.
+
+## Optional: a dedicated WinUSB dongle
+
+Use a separate, expendable USB controller and follow
+[dedicated-controller.md](dedicated-controller.md). Keep the system controller
+Windows-owned. After manual provisioning, run `doctor --json` and check fresh
+identity correlation, a unique registered application interface, overlapped
+open, WinUSB initialization, E0/01/01 and exactly one interrupt IN, bulk IN
+and bulk OUT pipe. Close all handles after the probe.
+
+A separate dedicated dongle has not completed hardware acceptance. Its
+readiness and HCI results should be recorded separately from temporary takeover.
+
+## Optional: UsbDk research
+
+The `doctor` UsbDk probe is read-only. A missing helper DLL or service is an
+expected environment result and does not require installing UsbDk.
+
+UsbDk redirect testing is outside this plan. It requires an isolated,
+recoverable Windows machine, non-Bluetooth input, recovery media and crash
+capture. The primary AX201 development host is excluded from UsbDk installation
+and redirect experiments. Background and upstream references are in
+[ownership-survey.md](ownership-survey.md#c-usbdk-runtime-capture--experimental).

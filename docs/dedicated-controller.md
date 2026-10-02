@@ -1,14 +1,15 @@
-# Dedicated Controller onboarding
+# Dedicated USB controller setup
 
-This procedure is a development-only acceptance path for a separate,
-expendable USB Bluetooth controller. It does not provision the controller
-automatically, and it is not the future DirectHCI product installer.
+This experimental procedure uses a spare USB Bluetooth dongle permanently
+bound to WinUSB. It covers manual provisioning and the readiness probe;
+dedicated-mode hardware acceptance is still pending. For normal temporary
+takeover, use [the installation guide](installation.md).
 
 ## Exclusion from Dedicated provisioning: system AX201
 
 Never use this Dedicated/Zadig procedure to provision or permanently rebind
-the current system controller. Its separately documented M1 temporary
-takeover/recovery flow is different:
+the development host's system controller. It uses the
+[temporary takeover and recovery flow](temporary-rebind.md):
 
 ~~~text
 Intel AX201 Bluetooth
@@ -68,9 +69,9 @@ The following driver-changing action is performed by the user, not DirectHCI:
    install/replace action.
 6. Record any reboot or unplug/replug request and the exact Zadig result.
 
-Zadig is an external manual development tool. It is not a DirectHCI runtime
-dependency and this procedure does not authorize automated libwdi, INF,
-SetupAPI, or pnputil driver installation.
+This procedure uses Zadig manually. The DirectHCI panel's libwdi preparation
+flow stages a package for temporary takeover; it does not enroll a dedicated
+controller.
 
 ## After provisioning
 
@@ -100,7 +101,7 @@ provisioning configuration must be investigated.
 
 ## Stop conditions and evidence
 
-Stop without changing DirectHCI code if any of these occurs:
+Stop the hardware test if any of these occurs:
 
 - the physical identity cannot be correlated uniquely;
 - more than one application interface path remains plausible;
@@ -128,8 +129,6 @@ have changed since the snapshot was taken.
 
 ## Dedicated hardware acceptance
 
-Dedicated-mode Raw HCI still requires a real external controller with
-`Ready` descriptor topology. This is **not** a gate on M2 generally:
-Raw HCI and BLE operation have already been exercised through the AX201
-temporary-takeover mode. Dedicated hardware must pass its own identity,
-interface, pipe, and lifecycle acceptance before its results are claimed.
+Dedicated-mode Raw HCI needs a separate controller that passes identity,
+interface, pipe and lifecycle tests. Record those results separately from
+the AX201 temporary-takeover results in [compatibility.md](compatibility.md).

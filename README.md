@@ -1,198 +1,112 @@
 # DirectHCI
 
-DirectHCI is a Windows userspace runtime for taking temporary control of a Bluetooth controller and exposing raw HCI access without permanently replacing the Windows Bluetooth stack.
+[中文](docs/README.zh-CN.md)
 
-The normal Windows Bluetooth driver remains in use when DirectHCI is idle. When a DirectHCI client needs the controller, the runtime can temporarily move the selected device to WinUSB, use it from userspace, and restore the Windows driver when the session ends.
+DirectHCI gives Windows applications raw HCI access to a USB Bluetooth
+controller. A local service temporarily binds the selected controller to
+WinUSB, handles HCI commands, events and ACL data, and restores the Windows
+Bluetooth driver when the client releases the session or disconnects.
 
-The project is intended for applications that need lower-level Bluetooth access than the normal Windows APIs provide. Applications that do not need DirectHCI continue using the Windows Bluetooth stack normally.
+The repository includes a Windows service, a control panel, command-line tools,
+and Rust libraries for raw HCI and BLE Central/GATT through TrouBLE.
 
-## What works
+**Status: `0.1.0-alpha.1`.** Development testing has used an Intel AX201 on
+Windows 11. Driver takeover, raw HCI and Windows restoration have worked on
+that host. BLE lifecycle regressions and recent installer/control-panel
+changes still need hardware retesting. See [compatibility](docs/compatibility.md)
+for the recorded results and open items.
 
-DirectHCI currently provides:
+While a DirectHCI session is active, Windows Bluetooth devices using that
+controller are unavailable. The runtime allows one active HCI session at a
+time. Keep a wired keyboard or mouse available when testing a controller used
+by your input devices.
 
-- Bluetooth controller discovery and stable controller identity
-- temporary Windows Bluetooth → WinUSB takeover
-- automatic restoration of the Windows Bluetooth driver
-- durable recovery state for interrupted sessions
-- raw HCI command, event, and ACL transport
-- a privileged Windows runtime (`directhcid`)
-- local Named Pipe IPC
-- a Rust client SDK
-- a `bt-hci` transport adapter
-- optional BLE/GATT support built on TrouBLE
-- command-line diagnostics and recovery tools
+## Getting started
 
-The main development and hardware validation target is currently an Intel AX201 Bluetooth controller. The runtime itself is not intended to be Intel-specific.
+The installer targets Windows x64. To build it from source, follow
+[the installation guide](docs/installation.md#build-the-installer); the build
+requires Rust, MinGW-w64, EWDK and Inno Setup.
 
-## How it works
+1. Run the installer and open **DirectHCI Control Panel** from the Start Menu.
+   Both require administrator approval.
+2. Click **Start Service** and select a controller.
+3. If it shows **Not prepared**, click **Prepare Controller**. This creates and
+   stages a WinUSB package after asking for local certificate trust. Windows
+   may reject the package under its signing policy; see
+   [controller preparation](docs/installation.md#prepare-a-controller).
+4. Use the CLI or a Rust client to open a session. Starting the service and
+   preparing a controller leave Windows Bluetooth in control; acquisition
+   happens when a client requests a session.
 
-A normal DirectHCI session looks roughly like this:
+With the service running, these PowerShell commands query its status and list
+controllers:
 
-```text
-Application
-    │
-    │ DirectHCI SDK
-    ▼
-directhcid
-    │
-    ├─ temporarily takes ownership of the selected controller
-    ├─ opens the WinUSB interface
-    └─ exposes HCI command/event/ACL transport
-    │
-    ▼
-Bluetooth Controller
+```powershell
+& "$env:ProgramFiles\DirectHCI\directhci.exe" status
+& "$env:ProgramFiles\DirectHCI\directhci.exe" controllers
 ```
 
-When the client releases the session or disconnects:
+For command syntax, run `directhci.exe --help`. BLE operations are available
+through `directhci-ble.exe` and the [BLE library](crates/directhci-ble/README.md).
+Acquiring a controller requires an elevated client.
 
-```text
-DirectHCI
-    ↓
-close HCI session
-    ↓
-restore Windows Bluetooth driver
-    ↓
-Windows owns the controller again
+Closing the Control Panel stops the service; minimizing it keeps the service
+running in the background. If a session ends abnormally and Bluetooth is not
+restored, follow [recovery](docs/installation.md#recovery).
+
+## Rust libraries
+
+| Crate | Purpose |
+| --- | --- |
+| [`directhci-client`](crates/directhci-client) | Local service client: controller queries, acquisition and raw HCI sessions |
+| [`directhci-bt-hci`](crates/directhci-bt-hci) | `bt-hci` controller adapter for a DirectHCI session |
+| [`directhci-ble`](crates/directhci-ble) | Async BLE scanning, connections, GATT read/write and notifications |
+
+The crates are unpublished; use path dependencies from a local checkout.
+The client talks to `directhcid` over a local named pipe. The service owns the
+WinUSB handles and driver changes, and records recovery state before takeover.
+See [architecture](docs/architecture.md) for the session and recovery model.
+
+## Building
+
+Rust 1.87 or later is required. On Windows, install the
+`x86_64-pc-windows-gnu` target and put the MinGW-w64 tools, including
+`windres.exe`, on `PATH`. From the repository root:
+
+```powershell
+rustup target add x86_64-pc-windows-gnu
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
+cargo build --locked --release --workspace --target x86_64-pc-windows-gnu
 ```
 
-Running `directhcid` by itself does not take over a Bluetooth controller. Ownership changes only when a client explicitly requests a DirectHCI session.
+Executables are written to
+`%LOCALAPPDATA%\DirectHCI\target\x86_64-pc-windows-gnu\release`.
+Building them does not install the service. See
+[development](docs/development.md) for running the daemon from a terminal,
+Linux checks and installer prerequisites.
 
-## This is not a replacement Bluetooth stack
+## Repository
 
-DirectHCI is an opt-in compatibility path.
+| Path | Contents |
+| --- | --- |
+| `apps/` | Service, Control Panel, diagnostic CLI and BLE CLI |
+| `crates/` | Client libraries, shared types and Windows backend |
+| `driver/` | Device-specific WinUSB INF template and legacy development package |
+| `installer/`, `scripts/windows/` | Windows packaging and build scripts |
+| `docs/` | Setup, architecture, recovery and hardware test notes |
 
-It does not redirect all Bluetooth traffic on the machine, and ordinary Windows Bluetooth applications do not need to know that DirectHCI exists.
+## Documentation
 
-```text
-Normal application
-    ↓
-Windows Bluetooth stack
-
-Application using DirectHCI
-    ↓
-DirectHCI
-    ↓
-selected controller
-```
-
-The core runtime exposes controller ownership and HCI transport. Higher-level BLE support is provided separately through the DirectHCI BLE library and existing Bluetooth host-stack components rather than reimplementing ATT, GATT, or L2CAP from scratch.
-
-## Repository layout
-
-```text
-apps/
-  directhci/          Command-line tools
-  directhcid/         Privileged Windows runtime
-
-crates/
-  directhci-core/     Shared models and IPC types
-  directhci-windows/  Windows controller, driver and WinUSB support
-  directhci-client/   Client SDK
-  directhci-bt-hci/   bt-hci controller adapter
-  directhci-ble/      Higher-level BLE/GATT API
-
-driver/
-  winusb-device-specific/      Runtime-generated exact-HWID WinUSB template
-  winusb-supported-devices/    Legacy development package (migration only)
-
-docs/
-  ...                 Design, recovery and hardware-testing notes
-```
-
-## CLI
-
-Some useful development and diagnostic commands:
-
-```text
-directhci controllers
-directhci controllers --json
-
-directhci status
-
-directhci controller show <id>
-
-directhci doctor
-directhci doctor --json
-
-directhci recover --offline
-```
-
-Development builds also contain lower-level ownership and HCI commands used for hardware validation.
-
-See the documentation under [`docs/`](docs/) for destructive takeover tests and driver provisioning. Do not run takeover commands on a controller you cannot recover.
-
-## Controller ownership
-
-DirectHCI treats controller ownership as exclusive:
-
-```text
-Windows owned
-    ↕
-DirectHCI owned
-```
-
-A controller is never intentionally shared between the Windows Bluetooth stack and a DirectHCI writer.
-
-The runtime keeps a recovery journal before changing controller ownership. Recovery always checks the current Windows device state rather than blindly replaying old driver information.
-
-Device interface paths, driver names, and current devnodes are treated as observations rather than permanent controller identities.
-
-## Windows and WinUSB
-
-DirectHCI uses Microsoft's in-box `WinUSB.sys`; it ships no custom kernel
-driver. The installer bundles a pinned libwdi-based provisioner, not a static
-Bluetooth driver package. From the Control Panel, **Prepare Controller**
-generates and stages a package for one freshly observed exact USB Bluetooth
-Hardware ID after administrator consent to one-time local certificate trust.
-This does not switch BTHUSB. A newly attached controller can be prepared
-without reinstalling DirectHCI; there is no supported-HWID allowlist. The
-old multi-Hardware-ID development package remains migration-only. Windows
-may reject local self-signed packages under its current policy; DirectHCI
-reports that error and does not change boot policy or controller binding.
-Takeover still requires the existing planner, recovery, and WinUSB capability
-checks.
-
-Driver staging, temporary rebind, restoration and recovery are documented in:
-
-- [`docs/temporary-rebind.md`](docs/temporary-rebind.md)
-- [`docs/windows-test-plan.md`](docs/windows-test-plan.md)
-
-## Development
-
-The main target is Windows.
-
-Most portable Rust code can also be built from Linux.
-
-See [`docs/development.md`](docs/development.md).
-
-## Safety
-
-DirectHCI operates below the normal Windows Bluetooth API and can temporarily remove a Bluetooth controller from the Windows Bluetooth stack.
-
-A few rules are therefore deliberate:
-
-- only one writer owns a controller at a time
-- controller takeover is explicit
-- destructive driver operations are gated
-- interrupted ownership changes leave recovery information behind
-- recovery prefers current Windows state over stale journal data
-- hardware-persistent HCI writes are not part of the normal DirectHCI path
-
-If DirectHCI is experimenting with your only Bluetooth controller, expect Windows Bluetooth devices using that controller to be temporarily unavailable while the session is active.
-
-## Project status
-
-DirectHCI is still under active development.
-
-The controller ownership, Raw HCI runtime, local IPC, Rust client path and BLE integration have been exercised on real Windows hardware. Packaging, installation, controller configuration and hardening of the system-service boundary are still being worked on.
-
-The current focus is turning the validated runtime into a clean Windows system component without changing the already-working HCI path.
+- [Installation, preparation and recovery](docs/installation.md)
+- [Development](docs/development.md)
+- [Hardware compatibility and known issues](docs/compatibility.md)
+- [Architecture](docs/architecture.md)
+- [Temporary driver rebind and recovery](docs/temporary-rebind.md)
+- [Windows hardware test plan](docs/windows-test-plan.md)
+- [Dependencies and references](docs/references.md)
 
 ## License
 
-The current, provisional project license is GNU GPL v3 only
-(`GPL-3.0-only`). See [LICENSE.txt](LICENSE.txt) for the full English text.
-This applies to DirectHCI's first-party crates and applications. Third-party
-dependencies and external tools keep their own licenses; see
-[references.md](docs/references.md). A future release may revisit the license,
-but that does not retroactively revoke rights granted for an earlier release.
+DirectHCI's first-party crates and applications currently use
+[GPL-3.0-only](LICENSE.txt). Third-party licenses are listed in
+[references](docs/references.md).

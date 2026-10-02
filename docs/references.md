@@ -4,12 +4,11 @@ No third-party implementation source has been copied into DirectHCI. Minimal
 public ABI declarations that are required for FFI are recorded explicitly
 below.
 
-DirectHCI's current, provisional first-party license choice is GNU GPL v3 only
-(`GPL-3.0-only`; see [LICENSE.txt](../LICENSE.txt)). This does not relicense
-third-party dependencies or external tools, nor does it change the
-reference-only restrictions recorded below.
+DirectHCI's first-party code currently uses
+[GPL-3.0-only](../LICENSE.txt). Dependencies and external tools retain the
+licenses listed below.
 
-The M1 implementation additionally follows Microsoft's documented
+The temporary-rebind implementation follows Microsoft's documented
 `DiInstallDevice` `NeedReboot` contract, uses
 [`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
 with replace/write-through flags for the Windows journal commit, and uses the
@@ -36,7 +35,7 @@ No Microsoft source code was copied.
 | UsbDk v1.00-22 | [`UsbDkData.h`](https://github.com/daynix/UsbDk/blob/v1.00-22/UsbDk/UsbDkData.h), [`UsbDkHelper.h`](https://github.com/daynix/UsbDk/blob/v1.00-22/UsbDkHelper/UsbDkHelper.h), [identity provenance](https://github.com/daynix/UsbDk/blob/v1.00-22/UsbDk/DeviceAccess.cpp), [installation/re-enumeration notes](https://github.com/daynix/UsbDk/wiki/Troubleshooting-UsbDk-installation), and [Bluetooth power-policy WDF_VIOLATION report #115](https://github.com/daynix/UsbDk/issues/115) | Retained read-only probe and experimental backend research only; current host has neither helper DLL nor service | Apache-2.0; minimal ABI declarations are represented in Rust with attribution. No implementation copied. Public risk evidence prevents treating redirect as the default or production-safe backend; it does not establish universal incompatibility |
 | libusb / rusb | [Windows backend source](https://github.com/libusb/libusb/tree/master/libusb/os), [Windows guidance and restrictions](https://github.com/libusb/libusb/wiki/Windows), [libusb license](https://github.com/libusb/libusb/blob/master/COPYING), and [rusb](https://github.com/a1ien/rusb) | Mature possible optional transport; reference for async transfer/cancellation and documented WinUSB limitations. Direct WinUSB remains the default | libusb LGPL-2.1-or-later; rusb MIT; no code copied; not a current core dependency |
 | nusb | [nusb Windows backend documentation](https://github.com/kevinmehall/nusb/blob/main/src/lib.rs) | Dedicated WinUSB transport candidate | MIT OR Apache-2.0; no code copied; does not provide runtime capture |
-| libwdi / Zadig | [libwdi README](https://github.com/pbatard/libwdi), [API usage](https://github.com/pbatard/libwdi/wiki/Usage), [Zadig guide](https://github.com/pbatard/libwdi/wiki/Zadig), and [library license notice](https://github.com/pbatard/libwdi/blob/master/libwdi/libwdi.c) | Pinned libwdi 1.5.1 is bundled for exact-HWID INF/CAT generation and one-time self-signing; DirectHCI uses SetupAPI only for stage-only installation. Zadig remains external. | libwdi is LGPL-3.0-or-later; installer includes source archive and DirectHCI's build/patch script. End-user machines do not need WDK/SignTool. |
+| libwdi / Zadig | [libwdi README](https://github.com/pbatard/libwdi), [API usage](https://github.com/pbatard/libwdi/wiki/Usage), [Zadig guide](https://github.com/pbatard/libwdi/wiki/Zadig), and [library license notice](https://github.com/pbatard/libwdi/blob/master/libwdi/libwdi.c) | Pinned libwdi 1.5.1 is bundled for exact-HWID INF/CAT generation and one-time self-signing; DirectHCI uses SetupAPI only for stage-only installation. Zadig remains external. | libwdi is LGPL-3.0-or-later. The build produces a source archive; the current installer includes only the DLL. See the distribution note below. |
 | BTstack Windows WinUSB/Intel ports | [`hci_transport_h2_winusb.c`](https://github.com/bluekitchen/btstack/blob/master/platform/windows/hci_transport_h2_winusb.c) and [license](https://github.com/bluekitchen/btstack/blob/master/LICENSE) | Reference direct WinUSB open, descriptor-driven pipe discovery, control/interrupt/bulk mapping, overlapped I/O, abort, and handle teardown | Non-commercial default license with separate commercial licensing; reference only, no code copied or derived |
 | Dolphin Bluetooth passthrough | [`LibUSBBluetoothAdapter.cpp`](https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/Core/IOS/USB/Bluetooth/LibUSBBluetoothAdapter.cpp) and [`BTReal.cpp`](https://github.com/dolphin-emu/dolphin/blob/master/Source/Core/Core/IOS/USB/Bluetooth/BTReal.cpp) | Reference libusb async input resubmission, command-credit flow, cancellation/draining, interface release, and Bluetooth USB mapping | GPL-2.0-or-later; reference only. No code, vendor initialization, or consumer-specific behavior copied |
 | Linux `btusb` / `btintel` | [`btusb.c`](https://github.com/torvalds/linux/blob/master/drivers/bluetooth/btusb.c), [`btintel.c`](https://github.com/torvalds/linux/blob/master/drivers/bluetooth/btintel.c), [`btintel.h`](https://github.com/torvalds/linux/blob/master/drivers/bluetooth/btintel.h) | Reference known Intel state transitions and firmware behavior | GPL-2.0; no code copied or translated |
@@ -61,16 +60,23 @@ No Microsoft source code was copied.
   explains that a later GUI process has its own execution level. The Control
   Panel currently checks the effective token and uses the documented
   [`ShellExecuteW` `runas` verb](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/nf-shellapi-shellexecutew)
-  when elevation is needed. This source-level behavior still needs a fresh
-  host acceptance run after rebuilding the installer.
+  when elevation is needed. Acceptance status is tracked in
+  [compatibility.md](compatibility.md).
 
 - [`bt-hci-usb` 0.2.0](https://github.com/embassy-rs/bt-hci/tree/main/bt-hci-usb)
   is an upstream USB HCI transport in the same ecosystem. Its README requires
-  WinUSB binding on Windows. It is **not** a DirectHCI dependency or a reason
-  to replace the already validated WinUSB implementation in this documentation
-  update. Inference from its documented scope: a raw USB transport alone
-  does not supply DirectHCI's Windows ownership journal, temporary driver
-  rebind, service IPC, or Windows restore contract. No code was copied.
+  WinUSB binding on Windows. DirectHCI does not depend on it; the project
+  implements driver rebind, recovery and service IPC around its own transport.
+
+## Distribution files
+
+`build-libwdi.ps1` produces the DLL and pinned source archive in
+`%LOCALAPPDATA%\DirectHCI\native`. The build script in this repository records
+the patches applied to that source. `build-installer.ps1` requires the archive
+and build manifest, but `installer/directhci.iss` currently installs only the
+DLL. Include the corresponding source, build script and required
+notices when preparing binary distributions; see [LICENSE.txt](../LICENSE.txt)
+and the dependency license links above.
 
 ## Confirmed compatibility notes
 

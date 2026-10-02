@@ -1,123 +1,117 @@
-# Development workflow
+# Development
 
-Source code may live in a VMware shared folder, but build artifacts should be
-placed on the VM or Windows host local disk.
+DirectHCI uses Rust 2024 and requires Rust 1.87 or later. Runtime and hardware
+testing takes place on Windows; Linux can build and test the portable logic.
+Keep Cargo output on a local disk when the source is in a VM shared folder.
 
-## Linux VM
+## Build on Windows
 
-Choose a VM-local directory and export it before running Cargo:
+Install the Windows GNU Rust target and put MinGW-w64 tools on `PATH`.
+The Control Panel build runs `windres.exe` to embed its icon; `WINDRES` can
+specify another resource compiler path.
 
-```sh
-export CARGO_TARGET_DIR=/tmp/directhci-target
-cargo fmt --all --check
-cargo check --workspace
-cargo check --workspace --target x86_64-pc-windows-gnu
-```
-
-The repository does not hard-code a target directory because VM and host paths
-are environment-specific.
-
-Linux checks validate portable logic and Windows GNU compilation. They do not
-validate SetupAPI behavior, driver state, UsbDk, WinUSB, or AX201 ownership.
-
-## Windows host
-
-Copy or build source from the shared folder, but use a host-local target
-directory, for example in PowerShell:
+From PowerShell at the repository root:
 
 ```powershell
+rustup target add x86_64-pc-windows-gnu
 $env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
-cargo build --locked --release --target x86_64-pc-windows-gnu -p directhci -p directhcid -p directhci-control-panel -p directhci-ble-cli
+cargo build --locked --release --workspace --target x86_64-pc-windows-gnu
 $bin = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-gnu\release'
-Get-Item (Join-Path $bin 'directhci.exe'), (Join-Path $bin 'directhcid.exe'), (Join-Path $bin 'directhci-control-panel.exe'), (Join-Path $bin 'directhci-ble.exe')
 ```
 
-These four executables are in `$bin`, not in the source tree and not in
-`C:\Program Files\DirectHCI`. Keep the same `CARGO_TARGET_DIR` for build and
-run. The installer copies them to Program Files only after a separate installer
-build and installation. If the build fails, the executable may not exist.
-Without this environment
-variable, Cargo instead uses the repository's `target` directory.
+The build produces `directhci.exe`, `directhcid.exe`,
+`directhci-control-panel.exe` and `directhci-ble.exe` in `$bin`.
+The BLE executable's Cargo package is named `directhci-ble-cli`.
 
-Controller discovery, `doctor`, and `takeover plan` are non-device-mutating.
-The development command `takeover roundtrip <id> --execute` and
-`recover --offline` use privileged driver-install APIs and must run from an
-elevated terminal. Follow [temporary-rebind.md](temporary-rebind.md) and
-[windows-test-plan.md](windows-test-plan.md); never add `/install` to the
-manual `pnputil /add-driver` staging command.
+## Run the daemon from a terminal
 
-## M3 runtime
-
-Run the development console host from an elevated Windows terminal:
+In an elevated PowerShell, use the `$bin` directory above:
 
 ```powershell
 & (Join-Path $bin 'directhcid.exe') run
 ```
 
-Normal product-path commands connect to `\\.\pipe\DirectHCI\v1`:
+Keep that terminal open. In a second PowerShell, set `$bin` to the same build
+directory and query the daemon:
 
 ```powershell
+$bin = "$env:LOCALAPPDATA\DirectHCI\target\x86_64-pc-windows-gnu\release"
 & (Join-Path $bin 'directhci.exe') status
-& (Join-Path $bin 'directhci.exe') controllers
+& (Join-Path $bin 'directhci.exe') controllers --json
 ```
 
-`directhcid install-service` registers the current executable as the manual
-start `DirectHCI` Windows service. That command does not stage the WinUSB
-package or modify controller drivers; the separate installer offers optional
-Driver Store staging. `controllers --direct`, `takeover ... --execute`,
-and `recover --offline` remain explicit development/disaster-recovery paths.
-Service installation now refuses non-fixed/remote paths, reparse points, or a
-binary/parent with untrusted owner or write access. Console `directhcid run`
-continues to work from development directories.
+Adjust the second path if using a different `CARGO_TARGET_DIR`. The daemon
+uses `\\.\pipe\DirectHCI\v1`; stop an installed DirectHCI service before
+running the foreground daemon. Ctrl+C closes sessions and attempts to
+restore Windows Bluetooth.
 
-The `%ProgramData%\DirectHCI` ownership journal directory is now accepted only
-with a protected SYSTEM/Administrators ACL and trusted owner. Service
-installation/startup safely creates it when missing. A legacy directory with
-an Administrators/SYSTEM owner, no reparse point, and no ownership journal is
-automatically tightened; a formerly user-writable `config.json` is
-quarantined and the daemon recreates preferences. An existing journal,
-untrusted owner, reparse point, or unexpected directory content still blocks
-automatic repair. DirectHCI never adopts an untrusted ownership journal.
-
-## Control Panel
-
-For normal Windows installation and uninstallation, use the installer build
-and safety procedure in [installation.md](installation.md). The commands below
-are for development builds only.
-
-Once the `DirectHCI` service is installed, everyday use is simply opening
-`directhci-control-panel.exe` and, if needed, clicking **Start Service**. No
-terminal is needed for status, controller selection, recovery, or diagnostics.
-The panel checks its effective token on startup and requests UAC elevation
-when necessary. If approval is declined, it does not open. This does not
-elevate the separate CLI, SDK, or BLE consumer. The panel does not install the
-service; that is a one-time development/setup action, not something to repeat
-every launch.
-
-For developers building from source, use the `$bin` path from the Windows host
-build above. If building only the panel:
+Controller discovery and planning commands do not change the device:
 
 ```powershell
-$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
-cargo build --release --target x86_64-pc-windows-gnu -p directhci-control-panel
-$bin = Join-Path $env:CARGO_TARGET_DIR 'x86_64-pc-windows-gnu\release'
-& (Join-Path $bin 'directhci-control-panel.exe')
+& (Join-Path $bin 'directhci.exe') controllers --direct --json
+& (Join-Path $bin 'directhci.exe') doctor --json
+& (Join-Path $bin 'directhci.exe') takeover plan '<controller-id>' --json
 ```
 
-Launch the resulting executable directly; it does not install or start a
-service implicitly. It opens even when the `DirectHCI` service is stopped or
-missing. Start/Stop Service use Windows SCM, while runtime diagnostics, preferred
-controller changes, and Restore Windows use the existing local named pipe.
+Replace `<controller-id>` with an ID from the current controller list.
+`controllers --direct`, `doctor`, `controller show` and `takeover plan`
+can run without the daemon. Normal `controllers` and `status` commands use IPC.
 
-Ordinary local users can query diagnostics through the SDK/CLI while the
-service is available. The Control Panel requests elevation for its SCM and
-preference/recovery operations. Status refreshes automatically about every
-two seconds on a background worker. Closing the panel requests an SCM stop,
-waits for `Stopped`, then exits; the **Stop Service** button does the same
-without closing the panel. Stopping an active session requires confirmation
-and runs the existing Windows Bluetooth restore path. The daemon
-owns `%ProgramData%\DirectHCI\config.json` and writes it atomically; the GUI
-does not edit that file. If exactly one controller exists at daemon startup and
-no preference has been saved, the daemon saves it automatically. With multiple
-controllers, the user must choose one; a missing saved controller is not silently
-replaced.
+Takeover commands with `--execute` and `recover --offline` change driver
+state and require an elevated terminal. Follow the
+[hardware test plan](windows-test-plan.md) before running them.
+
+## Service and Control Panel
+
+Use [the installer](installation.md#build-the-installer) to test service
+installation and the Control Panel. Launch the installed panel from the Start
+Menu; it requests elevation and can start or stop the service. Panel behavior,
+controller preparation and recovery are described in
+[installation.md](installation.md).
+
+For development, `directhcid install-service` registers the executable being
+run as a demand-start service. Its path must be on a fixed local drive, with
+trusted ownership and protected write access. Shared folders, reparse points
+and user-writable service paths are refused. `directhcid uninstall-service`
+stops the service, verifies recovery and removes the registration.
+
+Service registration does not prepare a WinUSB package. That is a separate
+**Prepare Controller** action in the panel. Installed binaries under
+`C:\Program Files\DirectHCI` are updated by installing a new package; a Cargo
+build only updates `$bin`.
+
+## Local checks
+
+On Linux, set a local target directory before checking the workspace:
+
+```sh
+export CARGO_TARGET_DIR=/tmp/directhci-target
+cargo fmt --all --check
+cargo check --locked --workspace
+cargo test --locked --workspace
+```
+
+To check Windows compilation from Linux, install the Windows GNU Rust target
+and MinGW-w64 tools, including `x86_64-w64-mingw32-windres`, then run:
+
+```sh
+rustup target add x86_64-pc-windows-gnu
+cargo check --locked --workspace --target x86_64-pc-windows-gnu
+```
+
+These checks cover Rust compilation and portable tests. SetupAPI, WinUSB,
+driver changes, service behavior and Bluetooth recovery require the
+[Windows host tests](windows-test-plan.md).
+
+## Runtime state
+
+The daemon stores preferences and the ownership journal in
+`%ProgramData%\DirectHCI`. The directory requires a protected
+SYSTEM/Administrators ACL and trusted ownership.
+
+Installation and startup can repair a legacy directory if it has a trusted
+owner, no reparse point, and no contents beyond an optional config file.
+A previously writable `config.json` is quarantined and preferences are
+recreated. An existing journal, unexpected files or an untrusted owner blocks
+automatic repair. Preserve these files when investigating recovery errors;
+see [temporary-rebind.md](temporary-rebind.md#offline-recovery-boundary).

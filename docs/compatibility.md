@@ -1,40 +1,44 @@
-# Compatibility
+# Hardware compatibility
 
-This page separates recorded Windows-host observations from current-build
-acceptance. A successful test on one AX201/Windows installation is not a
-blanket compatibility claim for every firmware, driver, or Windows build.
+Development testing has used one Intel AX201 Bluetooth USB function
+(`8087:0026`) on Windows 11. Other controller, firmware and Windows
+combinations have not been validated.
 
-| Controller | VID/PID | Host | Ownership backend | Recorded evidence |
-| --- | --- | --- | --- | --- |
-| Intel AX201 Bluetooth USB function | 8087:0026 | Windows 11 | Temporary, device-specific WinUSB rebind | Real BTHUSB → DirectHCI WinUSB → BTHUSB round trip; WinUSB readiness; HCI Reset, version query, LE connection, ATT MTU exchange, GATT discovery, passive notification reception, and Windows restore were observed during development. |
+## Recorded AX201 results
 
-The AX201 round trip was observed with Intel `BTHUSB` / `oem69.inf` →
-DirectHCI `WinUSB` / `oem183.inf` → `BTHUSB` / `oem69.inf`.
-The WinUSB interface was E0/01/01 with event interrupt IN `0x81`, ACL
-bulk IN `0x82`, and ACL bulk OUT `0x02`. These endpoint IDs are observed
-values, **not** generic transport constants.
+| Area | Recorded observation |
+| --- | --- |
+| Driver takeover and restore | `BTHUSB/oem69.inf` → `WinUSB/oem183.inf` → `BTHUSB/oem69.inf` |
+| WinUSB readiness | Interface E0/01/01; event interrupt IN `0x81`, ACL bulk IN `0x82`, ACL bulk OUT `0x02` |
+| HCI | Reset status `0x00`; version `0x0b`, revision `0x375b`, manufacturer `0x0002` |
+| BLE | LE connection, ATT MTU exchange (131), GATT discovery and passive notifications |
+| Session teardown | Clean disconnect and final `WindowsOwned` state |
 
-A later host run reported HCI Reset status `0x00`, HCI version `0x0b`,
-revision `0x375b`, manufacturer `0x0002`, and a final
-`WindowsOwned` state. The driver names/versions and instance path are
-historical observations, not stable controller identity or a restore recipe.
+The INF names and endpoint addresses are measurements from that host. The
+runtime selects drivers from fresh observations and discovers endpoints from
+descriptors.
 
-**Current-build caveat:** a subsequent extraction of the BLE CLI logic into
-`crates/directhci-ble` introduced GATT timeout/disconnect regressions in
-reported host runs. Earlier GATT/notification successes establish that the
-underlying path has worked, but do **not** certify that the latest BLE library
-build has passed the same acceptance again. Revalidate connect, inspect,
-listen, and final Windows restore after that lifecycle regression is fixed.
+These records predate later BLE and packaging changes. Exact build revisions
+and complete host logs are not included here; they should accompany future
+test reports using [the test plan](windows-test-plan.md).
 
-No separate Dedicated WinUSB dongle has been provisioned or validated. The
-readiness probe's negative-path result was one AX201 on `BTHUSB`, zero
-Dedicated candidates, and `not_win_usb_bound` for the AX201.
+## Known issues and pending tests
 
-On the recorded host, `UsbDkHelper.dll` and the UsbDk service were missing.
-UsbDk enumeration/correlation and redirect were not attempted. UsbDk is not
-the current AX201 takeover backend.
+- Host reports after the BLE CLI was extracted into `directhci-ble` showed
+  GATT timeouts and disconnect regressions. Connect, inspect, passive listen
+  and final Windows restoration need another acceptance run.
+- Recent installer, service lifecycle, Control Panel and UAC changes have no
+  new Windows host acceptance report.
+- Dynamic WinUSB package preparation needs host verification of local
+  signing acceptance, driver rank, takeover and restore.
+- A separate dedicated WinUSB dongle has not been tested.
 
-The installer, service lifecycle, Control Panel, and GUI self-elevation code
-exist, but the most recent packaging/UAC changes have **not** been confirmed
-by a new Windows-host acceptance report. Do not infer host validation from
-Cargo checks or the presence of source code.
+## Other backend observations
+
+With the AX201 still bound to `BTHUSB`, the dedicated WinUSB probe found zero
+candidates and reported `not_win_usb_bound` for that controller.
+
+The recorded host had neither `UsbDkHelper.dll` nor the UsbDk service, so
+UsbDk enumeration, correlation and redirect were not tested. Temporary WinUSB
+rebind is the implemented takeover backend. The earlier comparison is in
+[ownership-survey.md](ownership-survey.md).
