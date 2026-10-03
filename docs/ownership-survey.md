@@ -1,5 +1,12 @@
 # Ownership backend survey
 
+> **Historical research — not the current installation or controller-preparation guide.**
+> This survey preserves earlier options and proposals. In particular, its
+> “universal INF” proposal below was superseded by dynamic, exact-Hardware-ID
+> device-specific preparation. For current behavior use
+> [installation](installation.md), [compatibility](compatibility.md) and
+> [driver provisioning](internals/driver-provisioning.md).
+
 Historical design notes, reviewed 2026-10-01. The comparison led to the
 temporary WinUSB rebind backend. Implementation proposals below describe the
 options considered at that stage; current behavior is in
@@ -66,8 +73,9 @@ current Windows observation and do not create a product-specific branch.
   and install WinUSB with UAC elevation. This is useful for explicit developer
   provisioning, not proof of an appropriate production installer policy.
 
-### DirectHCI provisioning recommendation
+### Historical provisioning recommendation (superseded)
 
+The following was a design-stage proposal, not a current end-user procedure.
 For developer bring-up, use Zadig manually and only on an explicitly selected,
 separate USB dongle. Record the controller identity and current driver first,
 disconnect other identical dongles where practical, select WinUSB, and
@@ -75,8 +83,8 @@ re-observe the device after installation. This is an administrator operation;
 a reboot or unplug/replug must be treated as possible rather than promised
 away.
 
-For a distributable product, prefer a small DirectHCI-specific universal
-WinUSB INF/catalog package with:
+At the time of this survey, the proposed distributable approach was a small
+DirectHCI-specific multi-Hardware-ID WinUSB INF/catalog package with:
 
 - the narrowest applicable device hardware IDs;
 - a DirectHCI-owned device-interface GUID;
@@ -270,7 +278,7 @@ A separate Dedicated WinUSB dongle still has not been validated.
 The read-only planner, durable intent, offline recovery, and verified
 Windows-driver reconcile path were built before the first AX201 rebind. The
 takeover round trip and Raw HCI are now implemented. See
-[`temporary-rebind.md`](temporary-rebind.md).
+[`ownership-and-recovery.md`](ownership-and-recovery.md).
 
 The existing `directhci doctor` UsbDk gate remains read-only. The current host
 result is helper missing, service missing, enumeration not attempted, and

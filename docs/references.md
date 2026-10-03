@@ -9,20 +9,22 @@ DirectHCI's first-party code currently uses
 licenses listed below.
 
 The temporary-rebind implementation follows Microsoft's documented
-`DiInstallDevice` `NeedReboot` contract, uses
+`DiInstallDevice` `NeedReboot` contract and uses
 [`MoveFileExW`](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw)
-with replace/write-through flags for the Windows journal commit, and uses the
-official [`Inf2Cat`](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/inf2cat)
+with replace/write-through flags for the Windows journal commit. The legacy
+development driver script uses the official
+[`Inf2Cat`](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/inf2cat)
 and [driver test-signing](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/test-signing-driver-packages)
-tool flow. These are API/tool contracts, not copied implementation code.
+tool flow; the current on-demand preparation path uses pinned libwdi instead.
+These are API/tool contracts, not copied implementation code.
 
 The former class-compatible-ID INF (`USB\Class_E0&SubClass_01&Prot_01`)
 failed Inf2Cat B2.6.4.9 on the Windows build host, so DirectHCI no
 longer builds or stages it. Microsoft's
 [standard USB identifier rules](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/standard-usb-identifiers)
 and [INF Models-section rules](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/inf-models-section)
-inform the replacement: one Models entry per explicit USB PnP Hardware ID,
-all referencing the same WinUSB install section. The
+inform the replacement: one exact USB PnP Hardware ID in each dynamically
+generated package, using the WinUSB install section. The
 [WinUSB custom-INF guidance](https://learn.microsoft.com/en-us/windows-hardware/drivers/usbcon/winusb-installation)
 supplies the in-box `WinUSB.sys` Include/Needs structure and `USBDevice`
 setup class. A sourced Hardware ID is not proof of DirectHCI readiness;

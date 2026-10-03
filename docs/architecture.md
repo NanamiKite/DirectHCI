@@ -1,138 +1,81 @@
 # Architecture
 
-DirectHCI has three main layers: Rust consumers, a local Windows service and
-the Windows controller backend.
+DirectHCI separates privileged Windows controller ownership from the Raw HCI
+data path and from any Bluetooth host or device-specific application protocol.
 
 ```text
-CLI / Control Panel / Rust application
-              |
-       directhci-client
-              | local named pipe
-          directhcid
-              |
-      directhci-windows
-              | SetupAPI + WinUSB
-      Bluetooth controller
+Rust consumer / diagnostic CLI / Control Panel
+                    │
+             directhci-client
+                    │ versioned local Named Pipe
+                    ▼
+              directhcid
+                ├─ control plane: discovery, preference, preparation,
+                │                 ownership, recovery, IPC authorization
+                └─ data plane: Raw HCI Command / Event / ACL
+                    │
+             directhci-windows
+                    │ SetupAPI + WinUSB
+                    ▼
+             USB Bluetooth controller
+
+Optional BLE consumer path:
+application → directhci-ble → TrouBLE → directhci-bt-hci
+            → directhci-client → directhcid
 ```
 
-BLE consumers use `directhci-ble` and `directhci-bt-hci` above the client SDK.
-The core service transports HCI commands, events and ACL data; TrouBLE supplies
-the BLE host stack. Hardware results and pending tests are tracked in
-[compatibility.md](compatibility.md).
+## Control plane
 
-## Components
+`directhcid` is the privileged controller owner. It lists freshly observed
+USB Bluetooth candidates, saves the preferred ControllerId, prepares
+device-specific WinUSB packages, and controls temporary acquisition and
+Windows restoration. The Control Panel uses the client SDK for runtime
+operations and Windows SCM for service state; it does not rebind devices
+itself.
 
-| Component | Responsibility |
-| --- | --- |
-| `directhci-core` | Controller models, ownership states, HCI types and IPC messages |
-| `directhci-windows` | PnP enumeration, driver preparation/rebind, journal, recovery and WinUSB I/O |
-| `directhcid` | Privileged session owner, named-pipe server and Windows service |
-| `directhci-client` | Rust SDK for queries, preferences and HCI sessions |
-| `directhci-bt-hci` | `bt-hci` controller adapter |
-| `directhci-ble` | BLE Central/GATT API and TrouBLE task lifecycle |
-| `apps/` clients | Command parsing, diagnostics and Control Panel UI |
+`directhci-windows` handles PnP enumeration, exact-devnode driver selection,
+protected journal storage and recovery. A ControllerId identifies a physical
+controller using multiple topology/identity observations, not just a VID/PID
+or display name. Before a privileged operation, the backend re-enumerates
+and requires a unique current match. The runtime currently permits one
+active Raw HCI writer session globally.
 
-Windows API calls live in `directhci-windows`; shared types in
-`directhci-core` have no Windows API dependency. Peripheral UUIDs and device
-protocols belong in consumer applications.
+Prepare and acquire are different transitions. Preparation stages a driver
+candidate and leaves Windows Bluetooth active. Acquire checks identity,
+candidate/rank, recovery and journal conditions before temporarily binding
+WinUSB. The journal records intent before driver-changing side effects.
+Release, owning-client disconnect and service stop enter the restore path;
+the journal is cleared only after Windows ownership is freshly confirmed.
+See [driver provisioning](internals/driver-provisioning.md),
+[ownership and recovery](ownership-and-recovery.md) and
+[failure model](failure-model.md).
 
-## Controller identity
+## Data plane
 
-`ControllerIdentity` holds physical matching evidence.
-`ControllerObservation` holds the current PnP and driver state. They are
-separate because driver changes can replace interface paths and devnodes.
+The runtime owns `RawHciSession`, its WinUSB handle, receive workers and
+pending commands for the duration of the client session. HCI Command
+responses are correlated server-side; unsolicited Events and ACL packets
+remain available to the owning client. Shutdown stops new I/O, cancels and
+joins workers, closes WinUSB handles, then performs Windows-driver
+reconciliation.
 
-The v0 controller ID uses a genuine USB serial, then USB/PCI location, then
-the current Windows instance ID, in that order, scoped by VID/PID. Driver,
-INF, service and interface path do not participate. Container ID is supporting
-evidence; the Windows system Container ID and zero GUID are discarded.
+The local Named Pipe uses a bounded, versioned protocol. Diagnostic queries
+are available to authenticated local users; acquisition and Raw HCI require
+administrator membership. There is no TCP or HTTP listener. See the
+[SDK guide](sdk.md) for the consumer boundary.
 
-An opaque ControllerId indexes this evidence. Before a privileged operation,
-the backend enumerates again and requires a unique match to the physical
-controller. A cached ID or VID/PID alone is insufficient.
+`directhci-bt-hci` adapts the client SDK to `bt-hci`.
+`directhci-ble` uses TrouBLE for BLE Central, ATT and GATT operations.
+BLE is one optional consumer of Raw HCI, not the reason for or the limit of
+the controller runtime.
 
-## Ownership and sessions
+## Boundaries that must remain intact
 
-The implemented takeover flow is:
-
-```text
-WindowsOwned -> DirectHciOwned(session) -> WindowsOwned
-```
-
-The runtime permits one active writer session globally. Its
-`RuntimeControllerSession` owns the temporary driver binding and
-`RawHciSession`, including WinUSB handles and I/O workers. Clients receive
-session IDs and HCI data over IPC.
-
-Acquire first records recovery intent, selects the WinUSB driver for the
-freshly identified device, and checks the resulting interface and endpoints.
-An unresolved journal or ambiguous device state blocks acquisition.
-
-Release stops new I/O, cancels and joins workers, closes handles, then
-re-observes the controller and restores an applicable Windows driver. The
-journal is completed only after restoration is verified. An owning pipe
-disconnect, explicit release, console shutdown or SCM stop all use this path.
-
-A separate dedicated-controller design leaves a spare dongle bound to WinUSB:
-
-```text
-DirectHciReady -> DirectHciOwned(session) -> DirectHciReady
-```
-
-The dedicated readiness probe exists, but a dedicated runtime acquisition path
-and separate dongle have not been validated. See
-[dedicated-controller.md](dedicated-controller.md) for the experimental setup.
-
-## Recovery
-
-The ownership journal records controller evidence, backend, session, transition
-phase and the original observation. Each driver-changing phase is persisted
-before the operation. After a crash, startup recovery or
-`directhci recover --offline` reads that intent and inspects the current device.
-
-Recovery selects a currently applicable Windows driver. An old INF name in
-the journal is historical evidence, not an unconditional reinstall target.
-A missing controller stays pending; another device with the same VID/PID
-cannot substitute for it. Repeated recovery calls re-observe the state before
-acting.
-
-The journal phases, selection rules and failure handling are documented in
-[temporary-rebind.md](temporary-rebind.md). Offline recovery calls the Windows
-backend directly, so it remains available when the service cannot run.
-
-## IPC and permissions
-
-The service listens on `\\.\pipe\DirectHCI\v1`. Messages are byte-framed and
-bounded; control payloads use JSON, while HCI and ACL payloads stay binary.
-There is no network listener.
-
-Authenticated local users can query diagnostics. Acquisition and raw HCI
-operations require administrator membership. A client connection can own the
-single active session; breaking that connection triggers release.
-
-The Control Panel uses IPC for controller operations and Windows SCM for
-service control. It requests elevation, refreshes state on a background
-worker, and waits for the service to stop before closing. Client disconnect
-restores Bluetooth but leaves the service running.
-
-The daemon validates and atomically stores the preferred ControllerId in
-`%ProgramData%\DirectHCI\config.json`. It refuses preference changes during
-an active session. A preference selects the intended controller; acquisition
-still performs fresh identity checks.
-
-## BLE lifecycle
-
-`directhci-ble` owns the client session, `directhci-bt-hci` adapter, TrouBLE
-runner, GATT task and BLE connection. The CLI in `apps/directhci-ble` calls
-this library and formats the results.
-
-`DirectHciBleCentral::connect_device` consumes the central and returns a
-`BleConnection`. Standard `subscribe` writes the discovered CCCD; passive
-`listen` and `listen_all` receive unsolicited values. Notification streams
-can remain open while the connection performs writes.
-
-`BleConnection::disconnect` and `DirectHciBleCentral::shutdown` wait for
-teardown. The worker stops GATT and the BLE connection before releasing the
-HCI session. `Drop` requests best-effort cleanup; service recovery handles
-interrupted ownership changes. Usage is in the
-[BLE README](../crates/directhci-ble/README.md).
+- Control Panel and CLI do not own WinUSB handles or bypass the service for
+  normal sessions. Offline recovery is an explicitly separate tool.
+- The Raw HCI runtime does not implement vendor-specific GATT commands,
+  peripheral protocols or application state.
+- The BLE library does not own Windows driver installation, journal state
+  or recovery decisions.
+- An exact Hardware ID allows a *preparation attempt*; only the later USB
+  topology, HCI and restore observations establish usable hardware behavior.

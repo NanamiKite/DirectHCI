@@ -81,7 +81,7 @@ roundtrip. If it fails, preserve the journal and use the
 [recovery procedure](installation.md#recovery) before proceeding. Interruption
 and kill-point tests come after a successful basic roundtrip; the expected
 outcomes are listed in
-[temporary-rebind.md](temporary-rebind.md#implemented-failure-behavior).
+[ownership-and-recovery.md](ownership-and-recovery.md#implemented-failure-behavior).
 
 ## 4. Test HCI and BLE sessions
 
@@ -104,8 +104,10 @@ peripheral known to send unsolicited values for passive listening; use
 active HCI session and a restored Windows Bluetooth controller. Repeat after
 Ctrl+C to exercise interrupted cleanup.
 
-GATT timeout and disconnect regressions remain pending acceptance. A successful
-scan alone does not cover these operations.
+Earlier GATT timeout and disconnect regressions need build-specific acceptance
+records. User-reported working runs on three Intel USB IDs are listed in
+[compatibility](compatibility.md), but a successful scan alone does not cover
+connection, GATT, release or restoration.
 
 ## 5. Test the installer and Control Panel
 
