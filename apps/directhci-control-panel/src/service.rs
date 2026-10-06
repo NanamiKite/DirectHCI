@@ -58,16 +58,25 @@ fn open_service(access: u32) -> Result<Option<ScHandle>, String> {
 }
 
 pub fn query() -> Result<ServiceState, String> {
+    query_with_failure().map(|(state, _)| state)
+}
+
+pub fn query_with_failure() -> Result<(ServiceState, Option<String>), String> {
     let Some(status) = query_status()? else {
-        return Ok(ServiceState::NotInstalled);
+        return Ok((ServiceState::NotInstalled, None));
     };
-    Ok(match status.dwCurrentState {
-        SERVICE_STOPPED => ServiceState::Stopped,
-        SERVICE_START_PENDING => ServiceState::StartPending,
-        SERVICE_RUNNING => ServiceState::Running,
-        SERVICE_STOP_PENDING => ServiceState::StopPending,
-        _ => ServiceState::Unknown,
-    })
+    let failure = (status.dwCurrentState == SERVICE_STOPPED && status.dwWin32ExitCode != 0)
+        .then(|| format!("Service stopped with error {} (service-specific {}); Windows Bluetooth recovery was not confirmed. See Windows Event Viewer and recovery diagnostics.", status.dwWin32ExitCode, status.dwServiceSpecificExitCode));
+    Ok((
+        match status.dwCurrentState {
+            SERVICE_STOPPED => ServiceState::Stopped,
+            SERVICE_START_PENDING => ServiceState::StartPending,
+            SERVICE_RUNNING => ServiceState::Running,
+            SERVICE_STOP_PENDING => ServiceState::StopPending,
+            _ => ServiceState::Unknown,
+        },
+        failure,
+    ))
 }
 
 fn query_status() -> Result<Option<SERVICE_STATUS_PROCESS>, String> {

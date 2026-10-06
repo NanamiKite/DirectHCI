@@ -7,7 +7,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use directhci_core::{HciAclPacket, HciCommandPacket, HciCommandResponse, HciEventPacket};
+use directhci_core::{
+    HciAclPacket, HciCommandPacket, HciCommandResponse, HciEventPacket, HciIncomingPacket,
+};
 use serde::Serialize;
 
 use crate::{DedicatedWinUsbControllerReadiness, DedicatedWinUsbReadinessStatus};
@@ -217,6 +219,12 @@ impl RawHciSession {
     pub fn receive_acl(&self, timeout: Duration) -> Result<Option<HciAclPacket>, RawHciError> {
         self.inner.receive_acl(timeout)
     }
+    pub fn receive_packet(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<HciIncomingPacket>, RawHciError> {
+        self.inner.receive_packet(timeout)
+    }
 
     pub fn terminal_error(&self) -> Option<RawHciError> {
         self.inner.terminal_error()
@@ -264,6 +272,12 @@ mod platform {
         pub(super) fn receive_acl(&self, _: Duration) -> Result<Option<HciAclPacket>, RawHciError> {
             Err(RawHciError::UnsupportedPlatform)
         }
+        pub(super) fn receive_packet(
+            &self,
+            _: Duration,
+        ) -> Result<Option<HciIncomingPacket>, RawHciError> {
+            Err(RawHciError::UnsupportedPlatform)
+        }
         pub(super) fn terminal_error(&self) -> Option<RawHciError> {
             Some(RawHciError::UnsupportedPlatform)
         }
@@ -280,8 +294,9 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
+    use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Mutex, mpsc};
+    use std::sync::{Condvar, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -307,6 +322,14 @@ mod platform {
 
     const EVENT_BUFFER_SIZE: usize = 2 + u8::MAX as usize;
     const ACL_BUFFER_SIZE: usize = 4 + u16::MAX as usize;
+    const RX_PACKET_LIMIT: usize = 4096;
+    const RX_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+
+    #[derive(Default)]
+    struct ReceiveState {
+        packets: VecDeque<HciIncomingPacket>,
+        bytes: usize,
+    }
 
     struct PendingCommand {
         opcode: u16,
@@ -318,6 +341,8 @@ mod platform {
         accepting_tx: AtomicBool,
         terminal: Mutex<Option<RawHciError>>,
         pending_command: Mutex<Option<PendingCommand>>,
+        receive: Mutex<ReceiveState>,
+        receive_changed: Condvar,
     }
 
     impl SharedState {
@@ -327,6 +352,8 @@ mod platform {
                 accepting_tx: AtomicBool::new(true),
                 terminal: Mutex::new(None),
                 pending_command: Mutex::new(None),
+                receive: Mutex::new(ReceiveState::default()),
+                receive_changed: Condvar::new(),
             }
         }
 
@@ -343,6 +370,7 @@ mod platform {
             self.accepting_tx.store(false, Ordering::Release);
             self.shutdown.store(true, Ordering::Release);
             self.fail_pending(error);
+            self.wake_receivers();
         }
 
         fn fail_pending(&self, error: RawHciError) {
@@ -350,6 +378,66 @@ mod platform {
                 if let Some(pending) = pending.take() {
                     let _ = pending.sender.send(Err(error));
                 }
+            }
+        }
+
+        fn wake_receivers(&self) {
+            // Synchronize the terminal predicate with wait, avoiding a lost wake.
+            let _guard = self.receive.lock().unwrap_or_else(|e| e.into_inner());
+            self.receive_changed.notify_all();
+        }
+
+        fn enqueue(&self, packet: HciIncomingPacket) -> bool {
+            let error = match self.receive.lock() {
+                Ok(mut rx)
+                    if rx.packets.len() < RX_PACKET_LIMIT
+                        && rx.bytes + packet.encoded_len() <= RX_BYTE_LIMIT =>
+                {
+                    rx.bytes += packet.encoded_len();
+                    rx.packets.push_back(packet);
+                    self.receive_changed.notify_all();
+                    return true;
+                }
+                Ok(_) => internal("Raw HCI receive queue hard limit exceeded"),
+                Err(_) => internal("Raw HCI receive queue poisoned"),
+            };
+            self.fail(error);
+            false
+        }
+
+        fn receive_packet(
+            &self,
+            timeout: Duration,
+            kind: Option<bool>,
+        ) -> Result<Option<HciIncomingPacket>, RawHciError> {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut rx = self
+                .receive
+                .lock()
+                .map_err(|_| internal("Raw HCI receive queue poisoned"))?;
+            loop {
+                if let Some(index) = rx.packets.iter().position(|packet| {
+                    kind.is_none_or(|event| event == matches!(packet, HciIncomingPacket::Event(_)))
+                }) {
+                    let packet = rx.packets.remove(index).expect("position exists");
+                    rx.bytes -= packet.encoded_len();
+                    return Ok(Some(packet));
+                }
+                if let Some(error) = self.terminal_error() {
+                    return Err(error);
+                }
+                if self.shutdown.load(Ordering::Acquire) {
+                    return Err(RawHciError::Shutdown);
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                rx = self
+                    .receive_changed
+                    .wait_timeout(rx, remaining)
+                    .map_err(|_| internal("Raw HCI receive queue poisoned"))?
+                    .0;
             }
         }
     }
@@ -468,8 +556,6 @@ mod platform {
         state: Arc<SharedState>,
         command_lock: Mutex<()>,
         acl_tx_lock: Mutex<()>,
-        event_receiver: Mutex<mpsc::Receiver<Result<HciEventPacket, RawHciError>>>,
-        acl_receiver: Mutex<mpsc::Receiver<Result<HciAclPacket, RawHciError>>>,
         event_worker: Option<JoinHandle<()>>,
         acl_worker: Option<JoinHandle<()>>,
         shutdown_report: Option<RawHciShutdownReport>,
@@ -483,8 +569,6 @@ mod platform {
             let transport = transport_from_readiness(readiness)?;
             let io = Arc::new(DeviceIo::open(&transport.application_interface)?);
             let state = Arc::new(SharedState::new());
-            let (event_sender, event_receiver) = mpsc::channel();
-            let (acl_sender, acl_receiver) = mpsc::channel();
 
             let (event_started_tx, event_started_rx) = mpsc::sync_channel(1);
             let event_io = Arc::clone(&io);
@@ -499,7 +583,6 @@ mod platform {
                         event_io,
                         event_state,
                         event_pipe,
-                        event_sender,
                         event_started_tx,
                         event_trace,
                         trace_raw,
@@ -549,7 +632,6 @@ mod platform {
                         acl_io,
                         acl_state,
                         acl_pipe,
-                        acl_sender,
                         acl_started_tx,
                         acl_trace,
                         trace_raw,
@@ -606,8 +688,6 @@ mod platform {
                 state,
                 command_lock: Mutex::new(()),
                 acl_tx_lock: Mutex::new(()),
-                event_receiver: Mutex::new(event_receiver),
-                acl_receiver: Mutex::new(acl_receiver),
                 event_worker: Some(event_worker),
                 acl_worker: Some(acl_worker),
                 shutdown_report: None,
@@ -719,14 +799,35 @@ mod platform {
             &self,
             timeout: Duration,
         ) -> Result<Option<HciEventPacket>, RawHciError> {
-            receive(&self.event_receiver, timeout, "event", &self.state)
+            self.state
+                .receive_packet(timeout, Some(true))
+                .map(|packet| {
+                    packet.map(|packet| match packet {
+                        HciIncomingPacket::Event(event) => event,
+                        _ => unreachable!("typed event receive"),
+                    })
+                })
         }
 
         pub(super) fn receive_acl(
             &self,
             timeout: Duration,
         ) -> Result<Option<HciAclPacket>, RawHciError> {
-            receive(&self.acl_receiver, timeout, "ACL", &self.state)
+            self.state
+                .receive_packet(timeout, Some(false))
+                .map(|packet| {
+                    packet.map(|packet| match packet {
+                        HciIncomingPacket::Acl(acl) => acl,
+                        _ => unreachable!("typed ACL receive"),
+                    })
+                })
+        }
+
+        pub(super) fn receive_packet(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<HciIncomingPacket>, RawHciError> {
+            self.state.receive_packet(timeout, None)
         }
 
         pub(super) fn terminal_error(&self) -> Option<RawHciError> {
@@ -752,6 +853,7 @@ mod platform {
             self.state.accepting_tx.store(false, Ordering::Release);
             self.state.shutdown.store(true, Ordering::Release);
             self.state.fail_pending(RawHciError::Shutdown);
+            self.state.wake_receivers();
             let mut cancellation_errors = self.io.as_ref().map_or_else(Vec::new, |io| {
                 io.abort([
                     self.transport.event_pipe,
@@ -831,7 +933,6 @@ mod platform {
         io: Arc<DeviceIo>,
         state: Arc<SharedState>,
         pipe: u8,
-        sender: mpsc::Sender<Result<HciEventPacket, RawHciError>>,
         started: mpsc::SyncSender<Result<(), RawHciError>>,
         trace_sink: Option<HciTraceCallback>,
         trace_raw: bool,
@@ -846,7 +947,6 @@ mod platform {
                 Ok(bytes) => bytes,
                 Err(RawHciError::Shutdown) => break,
                 Err(error) => {
-                    let _ = sender.send(Err(error.clone()));
                     state.fail(error);
                     io.cancel_all();
                     break;
@@ -866,7 +966,6 @@ mod platform {
                         packet_type: "event".into(),
                         message: error.to_string(),
                     };
-                    let _ = sender.send(Err(error.clone()));
                     state.fail(error);
                     io.cancel_all();
                     break;
@@ -874,20 +973,22 @@ mod platform {
             };
             match event.command_response() {
                 Ok(Some(response)) => {
-                    if !route_command_response(&state, &sender, event, response) {
+                    if !route_command_response(&state, event, response) {
                         io.cancel_all();
                         break;
                     }
                 }
                 Ok(None) => {
-                    let _ = sender.send(Ok(event));
+                    if !state.enqueue(HciIncomingPacket::Event(event)) {
+                        io.cancel_all();
+                        break;
+                    }
                 }
                 Err(error) => {
                     let error = RawHciError::MalformedHciPacket {
                         packet_type: "command event".into(),
                         message: error.to_string(),
                     };
-                    let _ = sender.send(Err(error.clone()));
                     state.fail(error);
                     io.cancel_all();
                     break;
@@ -898,13 +999,13 @@ mod platform {
 
     fn route_command_response(
         state: &SharedState,
-        event_sender: &mpsc::Sender<Result<HciEventPacket, RawHciError>>,
         event: HciEventPacket,
         response: HciCommandResponse,
     ) -> bool {
         let mut pending = match state.pending_command.lock() {
             Ok(pending) => pending,
-            Err(_) => {
+            Err(poisoned) => {
+                drop(poisoned.into_inner());
                 state.fail(internal("pending command lock poisoned"));
                 return false;
             }
@@ -924,14 +1025,16 @@ mod platform {
                 if let Some(command) = pending.take() {
                     let _ = command.sender.send(Err(error.clone()));
                 }
-                let _ = event_sender.send(Ok(event));
                 drop(pending);
-                state.fail(error);
+                let queued = state.enqueue(HciIncomingPacket::Event(event));
+                if queued {
+                    state.fail(error);
+                }
                 false
             }
             None => {
-                let _ = event_sender.send(Ok(event));
-                true
+                drop(pending);
+                state.enqueue(HciIncomingPacket::Event(event))
             }
         }
     }
@@ -940,7 +1043,6 @@ mod platform {
         io: Arc<DeviceIo>,
         state: Arc<SharedState>,
         pipe: u8,
-        sender: mpsc::Sender<Result<HciAclPacket, RawHciError>>,
         started: mpsc::SyncSender<Result<(), RawHciError>>,
         trace_sink: Option<HciTraceCallback>,
         trace_raw: bool,
@@ -954,7 +1056,6 @@ mod platform {
                 Ok(bytes) => bytes,
                 Err(RawHciError::Shutdown) => break,
                 Err(error) => {
-                    let _ = sender.send(Err(error.clone()));
                     state.fail(error);
                     io.cancel_all();
                     break;
@@ -969,14 +1070,16 @@ mod platform {
             );
             match HciAclPacket::parse(&bytes) {
                 Ok(packet) => {
-                    let _ = sender.send(Ok(packet));
+                    if !state.enqueue(HciIncomingPacket::Acl(packet)) {
+                        io.cancel_all();
+                        break;
+                    }
                 }
                 Err(error) => {
                     let error = RawHciError::MalformedHciPacket {
                         packet_type: "ACL".into(),
                         message: error.to_string(),
                     };
-                    let _ = sender.send(Err(error.clone()));
                     state.fail(error);
                     io.cancel_all();
                     break;
@@ -1205,34 +1308,6 @@ mod platform {
             {
                 pending.take();
             }
-        }
-    }
-
-    fn receive<T>(
-        receiver: &Mutex<mpsc::Receiver<Result<T, RawHciError>>>,
-        timeout: Duration,
-        label: &str,
-        state: &SharedState,
-    ) -> Result<Option<T>, RawHciError> {
-        if let Some(error) = state.terminal_error() {
-            return Err(error);
-        }
-        let receiver = receiver
-            .lock()
-            .map_err(|_| internal(&format!("{label} receiver lock poisoned")))?;
-        match receiver.recv_timeout(timeout) {
-            Ok(Ok(packet)) => Ok(Some(packet)),
-            Ok(Err(error)) => Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => match state.terminal_error() {
-                Some(error) => Err(error),
-                None => Ok(None),
-            },
-            Err(mpsc::RecvTimeoutError::Disconnected) => Err(state
-                .terminal_error()
-                .unwrap_or_else(|| RawHciError::Worker {
-                    worker: format!("{label}_rx"),
-                    message: "channel disconnected".into(),
-                })),
         }
     }
 

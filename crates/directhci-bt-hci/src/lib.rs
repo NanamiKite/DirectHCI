@@ -4,7 +4,7 @@
 //! unsolicited events and ACL data are exposed through `Controller::read`.
 
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -14,7 +14,7 @@ use bt_hci::event::CommandCompleteWithStatus;
 use bt_hci::param::{RemainingBytes, Status};
 use bt_hci::{ControllerToHostPacket, FromHciBytes, PacketKind, WriteHci};
 use directhci_client::{ClientError, RawHciClientSession};
-use directhci_core::{HciAclPacket, HciCommandResponse};
+use directhci_core::{HciAclPacket, HciCommandResponse, HciIncomingPacket};
 use tokio::sync::{Mutex as AsyncMutex, mpsc as async_mpsc, oneshot};
 
 const REQUEST_DEPTH: usize = 32;
@@ -87,7 +87,7 @@ enum Inbound {
     Acl(Vec<u8>),
 }
 struct Shared {
-    requests: mpsc::SyncSender<Request>,
+    requests: async_mpsc::Sender<Request>,
     inbound: AsyncMutex<async_mpsc::Receiver<Result<Inbound, AdapterError>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -98,7 +98,7 @@ pub struct DirectHciController {
 }
 impl DirectHciController {
     pub fn new(session: RawHciClientSession) -> Result<Self, AdapterError> {
-        let (request_tx, request_rx) = mpsc::sync_channel(REQUEST_DEPTH);
+        let (request_tx, request_rx) = async_mpsc::channel(REQUEST_DEPTH);
         let (inbound_tx, inbound_rx) = async_mpsc::channel(INBOUND_DEPTH);
         let worker = thread::Builder::new()
             .name("directhci-bt-hci".into())
@@ -120,12 +120,13 @@ impl DirectHciController {
         let (tx, rx) = oneshot::channel();
         self.shared
             .requests
-            .try_send(Request::Command {
+            .send(Request::Command {
                 opcode,
                 params,
                 reply: tx,
             })
-            .map_err(map_send)?;
+            .await
+            .map_err(|_| AdapterError::Closed)?;
         rx.await.map_err(|_| AdapterError::Closed)?
     }
     pub async fn shutdown(&self) -> Result<(), AdapterError> {
@@ -139,28 +140,26 @@ impl DirectHciController {
             return Ok(());
         };
         let (tx, rx) = oneshot::channel();
-        self.shared
+        let result = match self
+            .shared
             .requests
             .send(Request::Shutdown { reply: tx })
-            .map_err(|_| AdapterError::Closed)?;
-        let result = rx.await.map_err(|_| AdapterError::Closed)?;
+            .await
+        {
+            Ok(()) => rx.await.unwrap_or(Err(AdapterError::Closed)),
+            Err(_) => Err(AdapterError::Closed),
+        };
         worker.join().map_err(|_| AdapterError::WorkerPanicked)?;
         result
     }
 }
-fn map_send<T>(error: mpsc::TrySendError<T>) -> AdapterError {
-    match error {
-        mpsc::TrySendError::Full(_) => AdapterError::Backpressure,
-        mpsc::TrySendError::Disconnected(_) => AdapterError::Closed,
-    }
-}
 fn worker_loop(
     mut session: RawHciClientSession,
-    requests: mpsc::Receiver<Request>,
+    mut requests: async_mpsc::Receiver<Request>,
     inbound: async_mpsc::Sender<Result<Inbound, AdapterError>>,
 ) {
     loop {
-        match requests.recv_timeout(POLL_INTERVAL) {
+        match requests.try_recv() {
             Ok(Request::Command {
                 opcode,
                 params,
@@ -176,11 +175,11 @@ fn worker_loop(
                 let _ = reply.send(result);
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(async_mpsc::error::TryRecvError::Disconnected) => {
                 let _ = session.release();
                 break;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(async_mpsc::error::TryRecvError::Empty) => thread::sleep(POLL_INTERVAL),
         }
         if let Err(error) = pump_inbound(&session, &inbound) {
             let _ = inbound.try_send(Err(error));
@@ -194,32 +193,37 @@ fn pump_inbound(
     tx: &async_mpsc::Sender<Result<Inbound, AdapterError>>,
 ) -> Result<(), AdapterError> {
     for _ in 0..MAX_DRAIN_PER_TICK {
-        let Some(event) = session.receive_event(Duration::ZERO)? else {
+        // Reserve BEFORE consuming the SDK stream. A full queue only pauses
+        // RX pumping; it does not drop packets or prevent shutdown commands.
+        let permit = match tx.try_reserve() {
+            Ok(permit) => permit,
+            Err(async_mpsc::error::TrySendError::Full(_)) => break,
+            Err(async_mpsc::error::TrySendError::Closed(_)) => return Err(AdapterError::Closed),
+        };
+        let Some(packet) = session.receive_packet(Duration::ZERO)? else {
             break;
         };
-        if event
-            .command_response()
-            .map_err(|e| AdapterError::Decode(e.to_string()))?
-            .is_some()
-        {
-            continue;
-        }
-        tx.try_send(Ok(Inbound::Event(
-            event
-                .encode()
-                .map_err(|e| AdapterError::Decode(e.to_string()))?,
-        )))
-        .map_err(|_| AdapterError::Backpressure)?;
-    }
-    for _ in 0..MAX_DRAIN_PER_TICK {
-        let Some(acl) = session.receive_acl(Duration::ZERO)? else {
-            break;
+        let inbound = match packet {
+            HciIncomingPacket::Event(event) => {
+                if event
+                    .command_response()
+                    .map_err(|e| AdapterError::Decode(e.to_string()))?
+                    .is_some()
+                {
+                    continue;
+                }
+                Inbound::Event(
+                    event
+                        .encode()
+                        .map_err(|e| AdapterError::Decode(e.to_string()))?,
+                )
+            }
+            HciIncomingPacket::Acl(acl) => Inbound::Acl(
+                acl.encode()
+                    .map_err(|e| AdapterError::Decode(e.to_string()))?,
+            ),
         };
-        tx.try_send(Ok(Inbound::Acl(
-            acl.encode()
-                .map_err(|e| AdapterError::Decode(e.to_string()))?,
-        )))
-        .map_err(|_| AdapterError::Backpressure)?;
+        permit.send(Ok(inbound));
     }
     Ok(())
 }
@@ -227,9 +231,9 @@ impl embedded_io::ErrorType for DirectHciController {
     type Error = AdapterError;
 }
 impl Controller for DirectHciController {
-    type Buffer<'a> = [u8; 4096];
+    type Buffer<'a> = Vec<u8>;
     fn alloc_buf(&self) -> Result<Self::Buffer<'_>, Self::Error> {
-        Ok([0; 4096])
+        Ok(vec![0; 4 + u16::MAX as usize])
     }
     async fn write_acl_data(
         &self,
@@ -244,11 +248,12 @@ impl Controller for DirectHciController {
         };
         self.shared
             .requests
-            .try_send(Request::Acl {
+            .send(Request::Acl {
                 packet: p,
                 reply: tx,
             })
-            .map_err(map_send)?;
+            .await
+            .map_err(|_| AdapterError::Closed)?;
         rx.await.map_err(|_| AdapterError::Closed)?
     }
     async fn write_sync_data(&self, _: &bt_hci::data::SyncPacket<'_>) -> Result<(), Self::Error> {

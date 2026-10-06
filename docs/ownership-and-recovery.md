@@ -41,8 +41,9 @@ WindowsOwned
 
 The package may be hardware-specific without making `directhci-core` or the
 WinUSB transport AX201-specific. Rebinding/provisioning ends when the same
-physical controller becomes `DirectHciReady`; the existing generic WinUSB
-open/readiness layer begins there.
+physical controller is observed with the DirectHCI binding. `DirectHciReady`
+is persisted at this boundary, before the generic WinUSB readiness/open probe;
+the journal phase alone does not prove that the probe succeeded.
 
 ## Read-only planner
 
@@ -137,7 +138,7 @@ The minimum durable phases are:
 | `WindowsOwned` | No active acquisition | Confirm or diagnose drift |
 | `AcquirePrepared` | Intent persisted; bind may not have started | Observe; clear only if still safely Windows-owned, otherwise reconcile |
 | `RebindingToDirectHci` | Side effect may have happened | Observe exact physical controller; never assume either driver |
-| `DirectHciReady` | DirectHCI package observed and WinUSB readiness passed | With no live service owner, restore Windows |
+| `DirectHciReady` | DirectHCI binding observed; WinUSB readiness/open may still be pending | With no live service owner, restore Windows |
 | `DirectHciOwned` | A runtime session was active | Stop/close any surviving local I/O, then restore Windows |
 | `RestoringWindows` | Restore side effect may have happened | Re-observe and continue convergence |
 | `RecoveryRequired` | Automatic progress was unsafe or failed | Preserve evidence; retry only after a fresh unambiguous observation |
@@ -228,6 +229,31 @@ the basic round trip succeeds.
 
 ## Implemented failure behavior
 
+The main service is demand-start. Its installer registers an independent
+SYSTEM **DirectHCI Boot Recovery** task, so boot recovery does not depend on
+the panel or consumer starting the service. Normal OS shutdown uses SCM
+`PRESHUTDOWN` with a configured 90-second budget; the runtime has a 45-second
+stop deadline. Failed/expired recovery is not reported as a successful stop.
+
+New journal owner metadata includes the kernel boot GUID and process creation
+FILETIME. Boot comparison precedes PID liveness; the same boot requires a
+matching process creation time. The NT boot-GUID query is dynamically resolved
+and fails closed if unavailable. Legacy records remain conservative and do not
+gain invented identity evidence. Fast Startup shutdown is not a full Restart.
+
+Takeover captures the original device `SecuritySDS` override (including explicit
+absence) before persisting intent. Restore reinstates it before selecting the
+Windows driver and verifies it before journal deletion. Legacy unknown baselines
+are never interpreted as “no override”. All controller mutation entry points
+are serialized with a protected share-denied file, held through live leases.
+
+Recovery may observe the journal's exact present devnode with no current driver
+or a problem code. It still requires matching hardware/physical identity and
+one applicable non-DirectHCI restore candidate, rather than acquisition's healthy
+`DirectHciReady` state. A descriptor-failed device without matching identity is
+not guessed from its port. A persisted `WindowsOwned` phase can re-enter
+`RecoveryRequired` and restoration when current observations are unhealthy.
+
 - Before the first journal write: refuse without changing the driver.
 - After `AcquirePrepared` is durable but before rebind: offline recovery uses
   fresh observation and clears or reconciles the record.
@@ -236,7 +262,8 @@ the basic round trip succeeds.
 - DirectHCI-side re-enumeration or readiness failure: immediately attempt
   restore.
 - `NeedReboot=TRUE`: never reboot automatically; persist `RecoveryRequired` and
-  retain the journal. On the next startup or offline recovery, freshly locate
+  retain the journal and request **Restart**, not Fast Startup shutdown/power-on.
+  On the next boot task, service startup or offline recovery, freshly locate
   the same physical controller. If a later boot is confirmed, the original
   Windows driver is active and healthy, and the DirectHCI interface is absent,
   reconcile to `WindowsOwned` and clear the journal without reinstalling the

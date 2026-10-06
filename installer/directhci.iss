@@ -10,7 +10,7 @@
 [Setup]
 AppId={{C6F4C08B-6961-49FE-98AB-6CEA79EC0D6E}
 AppName=DirectHCI
-AppVersion=0.1.0-alpha.1
+AppVersion=0.2.0
 AppPublisher=DirectHCI Project
 DefaultDirName={autopf}\DirectHCI
 DefaultGroupName=DirectHCI
@@ -18,7 +18,7 @@ DisableDirPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
-OutputBaseFilename=DirectHCI-Setup-0.1.0-alpha.1
+OutputBaseFilename=DirectHCI-Setup-0.2.0
 Compression=lzma
 SolidCompression=yes
 CloseApplications=no

@@ -34,6 +34,8 @@ Control Panel 显示服务状态、首选控制器、活动客户端与恢复状
 
 活动会话期间停止服务需要确认；若停止失败，面板会保留并显示错误。点击托盘图标可重新打开窗口。**服务停止本身不能证明蓝牙已经恢复**，应以实际控制器状态为准。
 
+主服务仍为手动启动。安装时会另外注册 **DirectHCI Boot Recovery** SYSTEM 开机任务，执行 `directhcid boot-recovery` 检查遗留 journal，完成后退出；它不会启动交互运行时，也不会接管控制器。恢复失败记录到 Windows“应用程序”事件日志的 `DirectHCI` 来源。必须升级／重新安装服务注册，才会应用该任务和正常关机前恢复的预关机超时；只重新编译 exe 不够。
+
 查询状态可在 PowerShell 中运行：
 
 ```powershell
@@ -54,6 +56,8 @@ $cli = Join-Path $env:ProgramFiles 'DirectHCI\directhci.exe'
 ```
 
 恢复会重新枚举 journal 指向的原物理控制器和当前驱动状态。过期 journal 不等于驱动仍错误；只有新鲜观察确认 Windows 蓝牙已正常接管时才会清理记录。设备缺失、身份不明确、journal 目录不安全或恢复尚未确认时，流程会保留 journal。**不要为了消除错误而手动删除 journal。** 参见[常见问题与安全恢复](troubleshooting.zh-CN.md)。
+
+若提示需要重启，必须选择 Windows 的 **“重新启动”**，不是开启快速启动时的“关机再开机”。新 journal 会保存内核启动标识和进程创建时间，先判断是否已重新启动，再检查原所有者进程，避免 PID 被复用后永久拒绝恢复。接管前也会保存设备原权限，交还前恢复并验证；旧日志缺少原权限时不能猜测或放宽 DACL。驱动／PnP 已健康不代表 Windows 设置中的蓝牙开关一定正常。
 
 ## 升级或卸载
 

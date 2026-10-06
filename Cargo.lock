@@ -62,7 +62,7 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "directhci"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "directhci-client",
  "directhci-core",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-ble"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "bt-hci",
  "critical-section",
@@ -85,7 +85,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-ble-cli"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "directhci-ble",
  "tokio",
@@ -93,7 +93,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-bt-hci"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "bt-hci",
  "directhci-client",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-client"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "directhci-core",
  "windows",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-control-panel"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "directhci-client",
  "directhci-core",
@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-core"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -130,7 +130,7 @@ dependencies = [
 
 [[package]]
 name = "directhci-windows"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "directhci-core",
  "serde",
@@ -140,7 +140,7 @@ dependencies = [
 
 [[package]]
 name = "directhcid"
-version = "0.1.0-alpha.1"
+version = "0.2.0"
 dependencies = [
  "directhci-core",
  "directhci-windows",

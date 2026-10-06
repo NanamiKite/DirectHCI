@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use directhci_core::{
-    ControllerObservation, HciAclPacket, HciCommandResponse, HciEventPacket,
+    ControllerObservation, HciAclPacket, HciCommandResponse, HciEventPacket, HciIncomingPacket,
     RuntimeControllerStatus, RuntimePreferences, RuntimeStatus,
 };
 
@@ -167,6 +167,14 @@ impl RawHciClientSession {
     pub fn receive_acl(&self, timeout: Duration) -> Result<Option<HciAclPacket>, ClientError> {
         self.inner.receive_acl(timeout)
     }
+    /// Receive Event and ACL traffic in IPC arrival order. Do not mix this
+    /// with typed receives when ordering between packet kinds matters.
+    pub fn receive_packet(
+        &self,
+        timeout: Duration,
+    ) -> Result<Option<HciIncomingPacket>, ClientError> {
+        self.inner.receive_packet(timeout)
+    }
     pub fn release(&mut self) -> Result<Option<ControllerObservation>, ClientError> {
         self.inner.release()
     }
@@ -251,6 +259,12 @@ mod platform {
         pub(super) fn receive_acl(&self, _: Duration) -> Result<Option<HciAclPacket>, ClientError> {
             Err(ClientError::UnsupportedPlatform)
         }
+        pub(super) fn receive_packet(
+            &self,
+            _: Duration,
+        ) -> Result<Option<HciIncomingPacket>, ClientError> {
+            Err(ClientError::UnsupportedPlatform)
+        }
         pub(super) fn release(&mut self) -> Result<Option<ControllerObservation>, ClientError> {
             Err(ClientError::UnsupportedPlatform)
         }
@@ -259,7 +273,7 @@ mod platform {
 
 #[cfg(windows)]
 mod platform {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -287,7 +301,10 @@ mod platform {
 
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
     const PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
-    const STREAM_QUEUE_DEPTH: usize = 128;
+    // Keep the reader available for command/release responses during a burst.
+    // Sustained non-consumption still fails explicitly at a bounded hard limit.
+    const STREAM_QUEUE_DEPTH: usize = 4096;
+    const STREAM_QUEUE_BYTES: usize = 16 * 1024 * 1024;
 
     pub(super) fn start_service() -> Result<(), ClientError> {
         let manager = unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
@@ -364,9 +381,76 @@ mod platform {
 
     struct ConnectionState {
         pending: Mutex<HashMap<u32, mpsc::SyncSender<Result<IpcFrame, ClientError>>>>,
-        event_tx: mpsc::SyncSender<Result<(u64, HciEventPacket), ClientError>>,
-        acl_tx: mpsc::SyncSender<Result<(u64, HciAclPacket), ClientError>>,
+        stream: Mutex<StreamState>,
+        stream_changed: Condvar,
         terminal: Mutex<Option<ClientError>>,
+    }
+
+    #[derive(Default)]
+    struct StreamState {
+        packets: VecDeque<(u64, HciIncomingPacket)>,
+        bytes: usize,
+        terminal: Option<ClientError>,
+    }
+
+    impl ConnectionState {
+        fn enqueue(&self, session: u64, packet: HciIncomingPacket) -> Result<(), ClientError> {
+            let mut stream = self
+                .stream
+                .lock()
+                .map_err(|_| protocol("stream lock poisoned"))?;
+            let size = packet.encoded_len();
+            if stream.packets.len() >= STREAM_QUEUE_DEPTH
+                || stream.bytes + size > STREAM_QUEUE_BYTES
+            {
+                return Err(ClientError::Backpressure);
+            }
+            stream.bytes += size;
+            stream.packets.push_back((session, packet));
+            self.stream_changed.notify_all();
+            Ok(())
+        }
+
+        fn receive(
+            &self,
+            session: u64,
+            timeout: Duration,
+            kind: Option<bool>,
+        ) -> Result<Option<HciIncomingPacket>, ClientError> {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut stream = self
+                .stream
+                .lock()
+                .map_err(|_| protocol("stream lock poisoned"))?;
+            loop {
+                let index = stream.packets.iter().position(|(_, packet)| {
+                    kind.is_none_or(|event| event == matches!(packet, HciIncomingPacket::Event(_)))
+                });
+                if let Some(index) = index {
+                    let (actual_session, packet) =
+                        stream.packets.remove(index).expect("position exists");
+                    stream.bytes -= packet.encoded_len();
+                    if actual_session != session {
+                        return Err(ClientError::InvalidSession(format!(
+                            "stream belongs to session {actual_session}"
+                        )));
+                    }
+                    return Ok(Some(packet));
+                }
+                if let Some(error) = &stream.terminal {
+                    return Err(error.clone());
+                }
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    return Ok(None);
+                }
+                stream = self
+                    .stream_changed
+                    .wait_timeout(stream, remaining)
+                    .map_err(|_| protocol("stream lock poisoned"))?
+                    .0;
+            }
+        }
     }
 
     struct Connection {
@@ -374,8 +458,6 @@ mod platform {
         state: Arc<ConnectionState>,
         writer_lock: Mutex<()>,
         next_request: AtomicU32,
-        event_rx: Mutex<mpsc::Receiver<Result<(u64, HciEventPacket), ClientError>>>,
-        acl_rx: Mutex<mpsc::Receiver<Result<(u64, HciAclPacket), ClientError>>>,
         active_session: Mutex<Option<u64>>,
         reader: Mutex<Option<JoinHandle<()>>>,
     }
@@ -552,12 +634,10 @@ mod platform {
                 return Err(protocol("protocol version mismatch"));
             }
 
-            let (event_tx, event_rx) = mpsc::sync_channel(STREAM_QUEUE_DEPTH);
-            let (acl_tx, acl_rx) = mpsc::sync_channel(STREAM_QUEUE_DEPTH);
             let state = Arc::new(ConnectionState {
                 pending: Mutex::new(HashMap::new()),
-                event_tx,
-                acl_tx,
+                stream: Mutex::new(StreamState::default()),
+                stream_changed: Condvar::new(),
                 terminal: Mutex::new(None),
             });
             let connection = Arc::new(Connection {
@@ -565,8 +645,6 @@ mod platform {
                 state: Arc::clone(&state),
                 writer_lock: Mutex::new(()),
                 next_request: AtomicU32::new(2),
-                event_rx: Mutex::new(event_rx),
-                acl_rx: Mutex::new(acl_rx),
                 active_session: Mutex::new(None),
                 reader: Mutex::new(None),
             });
@@ -751,26 +829,39 @@ mod platform {
             timeout: Duration,
         ) -> Result<Option<HciEventPacket>, ClientError> {
             self.ensure_active()?;
-            let receiver = self
-                .connection
-                .event_rx
-                .lock()
-                .map_err(|_| protocol("event receiver poisoned"))?;
-            receive_stream(&receiver, timeout, self.session_id)
-                .map(|value| value.map(|(_, packet)| packet))
+            self.connection
+                .state
+                .receive(self.session_id, timeout, Some(true))
+                .map(|value| {
+                    value.map(|packet| match packet {
+                        HciIncomingPacket::Event(event) => event,
+                        _ => unreachable!("typed event receive"),
+                    })
+                })
         }
         pub(super) fn receive_acl(
             &self,
             timeout: Duration,
         ) -> Result<Option<HciAclPacket>, ClientError> {
             self.ensure_active()?;
-            let receiver = self
-                .connection
-                .acl_rx
-                .lock()
-                .map_err(|_| protocol("ACL receiver poisoned"))?;
-            receive_stream(&receiver, timeout, self.session_id)
-                .map(|value| value.map(|(_, packet)| packet))
+            self.connection
+                .state
+                .receive(self.session_id, timeout, Some(false))
+                .map(|value| {
+                    value.map(|packet| match packet {
+                        HciIncomingPacket::Acl(acl) => acl,
+                        _ => unreachable!("typed ACL receive"),
+                    })
+                })
+        }
+        pub(super) fn receive_packet(
+            &self,
+            timeout: Duration,
+        ) -> Result<Option<HciIncomingPacket>, ClientError> {
+            self.ensure_active()?;
+            self.connection
+                .state
+                .receive(self.session_id, timeout, None)
         }
         pub(super) fn release(&mut self) -> Result<Option<ControllerObservation>, ClientError> {
             if self.released {
@@ -788,20 +879,14 @@ mod platform {
                     // on the same pipe. The reader has already queued any old
                     // stream frames before delivering this response.
                     {
-                        let receiver = self
+                        let mut stream = self
                             .connection
-                            .event_rx
+                            .state
+                            .stream
                             .lock()
-                            .map_err(|_| protocol("event receiver poisoned"))?;
-                        while receiver.try_recv().is_ok() {}
-                    }
-                    {
-                        let receiver = self
-                            .connection
-                            .acl_rx
-                            .lock()
-                            .map_err(|_| protocol("ACL receiver poisoned"))?;
-                        while receiver.try_recv().is_ok() {}
+                            .map_err(|_| protocol("stream lock poisoned"))?;
+                        stream.packets.clear();
+                        stream.bytes = 0;
                     }
                     self.released = true;
                     *self
@@ -843,17 +928,18 @@ mod platform {
             };
             match frame.kind {
                 IpcMessageKind::HciEvent => match decode_hci_event(&frame.payload) {
-                    Ok(value) => {
-                        if state.event_tx.try_send(Ok(value)).is_err() {
-                            break ClientError::Backpressure;
+                    Ok((session, packet)) => {
+                        if let Err(error) = state.enqueue(session, HciIncomingPacket::Event(packet))
+                        {
+                            break error;
                         }
                     }
                     Err(error) => break frame_error(error),
                 },
                 IpcMessageKind::AclRx => match decode_acl_packet(&frame.payload) {
-                    Ok(value) => {
-                        if state.acl_tx.try_send(Ok(value)).is_err() {
-                            break ClientError::Backpressure;
+                    Ok((session, packet)) => {
+                        if let Err(error) = state.enqueue(session, HciIncomingPacket::Acl(packet)) {
+                            break error;
                         }
                     }
                     Err(error) => break frame_error(error),
@@ -876,27 +962,11 @@ mod platform {
                 let _ = sender.send(Err(terminal.clone()));
             }
         }
-        let _ = state.event_tx.try_send(Err(terminal.clone()));
-        let _ = state.acl_tx.try_send(Err(terminal));
-        handle.close_once();
-    }
-
-    fn receive_stream<T>(
-        receiver: &mpsc::Receiver<Result<(u64, T), ClientError>>,
-        timeout: Duration,
-        expected_session: u64,
-    ) -> Result<Option<(u64, T)>, ClientError> {
-        match receiver.recv_timeout(timeout) {
-            Ok(Ok((session, value))) if session == expected_session => Ok(Some((session, value))),
-            Ok(Ok((session, _))) => Err(ClientError::InvalidSession(format!(
-                "stream belongs to session {session}"
-            ))),
-            Ok(Err(error)) => Err(error),
-            Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(ClientError::Disconnected("stream channel closed".into()))
-            }
+        if let Ok(mut stream) = state.stream.lock() {
+            stream.terminal = Some(terminal);
         }
+        state.stream_changed.notify_all();
+        handle.close_once();
     }
 
     struct PipeReader<'a> {

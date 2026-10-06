@@ -33,8 +33,12 @@ restoring `BTHUSB`.
 Takeover Mode operates on a controller that Windows normally owns:
 
 ```text
-WindowsOwned -> DirectHciOwned(lease) -> WindowsOwned
+Windows-owned -> temporary exclusive use -> Windows-owned
 ```
+
+This is a historical conceptual diagram, not a list of legal Rust ownership
+phase transitions. The implemented phases and failure paths are described in
+[ownership and recovery](ownership-and-recovery.md).
 
 It additionally requires driver/PnP transition safety, durable recovery, and
 offline reconciliation. There is no shared-write state in either mode.

@@ -47,8 +47,9 @@ Bluetooth controller.
 3. If it shows **Not prepared**, click **Prepare Controller** and review the
    local certificate-trust prompt. Windows may reject a locally signed package;
    the panel reports that failure without switching the controller.
-4. Start a DirectHCI client. Only client acquisition initiates the temporary
-   takeover. Release, disconnect or service stop triggers restoration.
+4. Start a DirectHCI client. In normal use, client acquisition initiates the
+   temporary takeover; the explicit developer command `takeover ... --execute`
+   can also switch the driver. Release, disconnect or service stop triggers restoration.
 
 The Control Panel shows service state, selected controller, active client and
 recovery state. Closing it stops the service; minimizing it keeps the service
@@ -62,7 +63,7 @@ runtime allows one active Raw HCI session at a time.
 
 ## Current status
 
-Version: `0.1.0-alpha.1`. Real-hardware users report normal DirectHCI
+Version: `0.2.0`. Real-hardware users report normal DirectHCI
 operation with Intel AX201 (`8087:0026`), AX200 (`8087:0029`) and
 BE200/Gale Peak-family Bluetooth (`8087:0036`). These are common family
 labels, not proof of an exact module SKU from the USB ID alone. Detailed
@@ -71,6 +72,10 @@ the other reports still need archived
 build/host and per-stage logs. Windows acceptance of a locally signed package
 remains host-policy-dependent. See the
 [compatibility and validation record](docs/compatibility.md).
+
+Later BLE library changes have had reported GATT timeout/disconnection
+regressions. The current receive-order/lifecycle fixes require Windows-host
+regression acceptance; earlier working runs are not certification of this build.
 
 ## Architecture and development
 

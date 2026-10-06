@@ -24,6 +24,7 @@ use crate::runtime::DirectHciRuntime;
 const SERVICE_NAME: &str = "DirectHCI";
 // Standard DELETE access right required by DeleteService/OpenServiceW.
 const DELETE_ACCESS: u32 = 0x0001_0000;
+const PRESHUTDOWN_TIMEOUT_MS: u32 = 90_000;
 static STOP: OnceLock<Arc<AtomicBool>> = OnceLock::new();
 static STATUS_HANDLE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 
@@ -32,10 +33,11 @@ pub fn dispatch(arguments: Vec<String>) -> Result<(), String> {
         [] => run_console(),
         [command] if command == "run" => run_console(),
         [command] if command == "service" => run_service_dispatcher(),
+        [command] if command == "boot-recovery" => crate::boot_recovery::run(),
         [command] if command == "install-service" => install_service(),
         [command] if command == "uninstall-service" => uninstall_service(),
         [command] if command == "--help" || command == "-h" => {
-            println!("directhcid [run|service|install-service|uninstall-service]");
+            println!("directhcid [run|service|boot-recovery|install-service|uninstall-service]");
             println!("  run              run in the foreground for development");
             println!("  service          enter the Windows SCM dispatcher");
             println!("  install-service  register this executable as DirectHCI (manual start)");
@@ -90,15 +92,21 @@ unsafe extern "system" fn service_main(_: u32, _: *mut PWSTR) {
         }
     };
     STATUS_HANDLE.store(handle.0, Ordering::Release);
-    set_status(SERVICE_START_PENDING, 0, 30_000);
+    set_status(SERVICE_START_PENDING, 0, PRESHUTDOWN_TIMEOUT_MS);
     let stop = Arc::new(AtomicBool::new(false));
     let _ = STOP.set(Arc::clone(&stop));
     let runtime = DirectHciRuntime::start();
-    set_status(SERVICE_RUNNING, SERVICE_ACCEPT_STOP, 0);
-    if let Err(error) = ipc::serve(runtime, stop) {
+    set_status(
+        SERVICE_RUNNING,
+        SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_PRESHUTDOWN,
+        0,
+    );
+    let result = ipc::serve(runtime, stop);
+    if let Err(error) = &result {
         eprintln!("directhcid: service runtime failed: {error}");
+        report_failure(error);
     }
-    set_status(SERVICE_STOPPED, 0, 0);
+    set_status_with_error(SERVICE_STOPPED, 0, 0, result.is_err());
 }
 
 unsafe extern "system" fn service_handler(
@@ -107,8 +115,8 @@ unsafe extern "system" fn service_handler(
     _: *mut c_void,
     _: *mut c_void,
 ) -> u32 {
-    if control == SERVICE_CONTROL_STOP {
-        set_status(SERVICE_STOP_PENDING, 0, 45_000);
+    if matches!(control, SERVICE_CONTROL_STOP | SERVICE_CONTROL_PRESHUTDOWN) {
+        set_status(SERVICE_STOP_PENDING, 0, PRESHUTDOWN_TIMEOUT_MS);
         request_stop();
     }
     NO_ERROR.0
@@ -137,6 +145,15 @@ fn request_stop() {
 }
 
 fn set_status(current: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u32) {
+    set_status_with_error(current, accepted, wait_hint, false);
+}
+
+fn set_status_with_error(
+    current: SERVICE_STATUS_CURRENT_STATE,
+    accepted: u32,
+    wait_hint: u32,
+    failed: bool,
+) {
     let raw = STATUS_HANDLE.load(Ordering::Acquire);
     if raw.is_null() {
         return;
@@ -145,9 +162,16 @@ fn set_status(current: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: current,
         dwControlsAccepted: accepted,
-        dwWin32ExitCode: NO_ERROR.0,
-        dwServiceSpecificExitCode: 0,
-        dwCheckPoint: 0,
+        dwWin32ExitCode: if failed {
+            windows::Win32::Foundation::ERROR_SERVICE_SPECIFIC_ERROR.0
+        } else {
+            NO_ERROR.0
+        },
+        dwServiceSpecificExitCode: u32::from(failed),
+        dwCheckPoint: u32::from(matches!(
+            current,
+            SERVICE_START_PENDING | SERVICE_STOP_PENDING
+        )),
         dwWaitHint: wait_hint,
     };
     // SAFETY: SCM status handle remains valid for the ServiceMain lifetime.
@@ -185,12 +209,40 @@ fn install_service() -> Result<(), String> {
             PCWSTR::null(),
         )
     };
-    let result = service.map_err(|error| format!("CreateServiceW: {error}"));
-    if let Ok(service) = result.as_ref() {
-        let _ = unsafe { CloseServiceHandle(*service) };
-    }
+    let result = service
+        .map_err(|error| format!("CreateServiceW: {error}"))
+        .and_then(|service| {
+            let service = ServiceHandle(service);
+            let configured = (|| {
+                let preshutdown = SERVICE_PRESHUTDOWN_INFO {
+                    dwPreshutdownTimeout: PRESHUTDOWN_TIMEOUT_MS,
+                };
+                unsafe {
+                    ChangeServiceConfig2W(
+                        service.0,
+                        SERVICE_CONFIG_PRESHUTDOWN_INFO,
+                        Some((&preshutdown as *const SERVICE_PRESHUTDOWN_INFO).cast()),
+                    )
+                }
+                .map_err(|e| format!("configure preshutdown recovery: {e}"))?;
+                crate::boot_recovery::register(&executable)
+            })();
+            if let Err(primary) = configured {
+                // This registration is new and was never started. Do not
+                // leave a usable runtime missing its required boot trigger.
+                return match unsafe { DeleteService(service.0) } {
+                    Ok(()) => Err(format!("{primary}; new service registration rolled back")),
+                    Err(cleanup) => Err(format!("{primary}; service rollback failed: {cleanup}")),
+                };
+            }
+            Ok(())
+        });
     let _ = unsafe { CloseServiceHandle(manager) };
-    result.map(|_| println!("DirectHCI service installed (manual start)."))
+    result.map(|_| {
+        println!(
+            "DirectHCI service installed (manual start), with independent SYSTEM boot recovery."
+        )
+    })
 }
 
 // The installer calls this before removing any executable. A failed stop or
@@ -273,7 +325,35 @@ fn uninstall_service() -> Result<(), String> {
             recovery.status
         );
     }
+    // Never remove the boot recovery trigger while restoration or service
+    // deletion is unresolved. A task-removal failure retains binaries too.
+    crate::boot_recovery::remove()?;
     Ok(())
+}
+
+pub(crate) fn report_failure(message: &str) {
+    use windows::Win32::System::EventLog::{
+        DeregisterEventSource, EVENTLOG_ERROR_TYPE, RegisterEventSourceW, ReportEventW,
+    };
+    let source = wide("DirectHCI");
+    let text = wide(message);
+    // Event insertion strings remain readable even without a message DLL.
+    if let Ok(handle) = unsafe { RegisterEventSourceW(PCWSTR::null(), PCWSTR(source.as_ptr())) } {
+        let strings = [PCWSTR(text.as_ptr())];
+        let _ = unsafe {
+            ReportEventW(
+                handle,
+                EVENTLOG_ERROR_TYPE,
+                0,
+                1,
+                None,
+                0,
+                Some(&strings),
+                None,
+            )
+        };
+        let _ = unsafe { DeregisterEventSource(handle) };
+    }
 }
 
 fn wait_service_gone(manager: SC_HANDLE, name: &[u16]) -> Result<(), String> {

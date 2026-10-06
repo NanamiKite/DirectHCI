@@ -264,12 +264,21 @@ pub(crate) fn install_driver_for_controller(
     platform::install_driver_for_controller(identity, selected)
 }
 
-pub(crate) fn process_is_elevated() -> Result<bool, String> {
-    platform::process_is_elevated()
+pub(crate) fn observe_recovery_controller_and_drivers(
+    identity: &directhci_core::ControllerIdentity,
+) -> Result<(ControllerObservation, Vec<CompatibleDriverObservation>), String> {
+    platform::observe_recovery_controller_and_drivers(identity)
 }
 
-pub(crate) fn process_is_running(process_id: u32) -> Result<bool, String> {
-    platform::process_is_running(process_id)
+pub(crate) fn install_recovery_driver(
+    identity: &directhci_core::ControllerIdentity,
+    selected: &CompatibleDriverObservation,
+) -> Result<DriverInstallOutcome, String> {
+    platform::install_recovery_driver(identity, selected)
+}
+
+pub(crate) fn process_is_elevated() -> Result<bool, String> {
+    platform::process_is_elevated()
 }
 
 pub(crate) fn same_physical_controller(
@@ -341,6 +350,11 @@ fn evaluate_observed_controller(
     if let Some(problem_code) = controller.status.problem_code.filter(|code| *code != 0) {
         blockers.push(RebindPlanBlocker::DeviceHasProblem { problem_code });
     }
+    if controller.status.problem_code.is_none() {
+        blockers.push(RebindPlanBlocker::DriverInspectionFailed {
+            message: "device problem code is unavailable; health cannot be established".into(),
+        });
+    }
     if !matches!(current_state, RebindObservedState::WindowsOwned) {
         blockers.push(RebindPlanBlocker::NotWindowsOwned {
             service: controller.service.clone(),
@@ -402,6 +416,15 @@ fn evaluate_observed_controller(
     let windows_driver = match installed.as_slice() {
         [candidate] => Some((*candidate).clone()),
         candidates if candidates.len() > 1 => {
+            blockers.push(RebindPlanBlocker::AmbiguousWindowsRecoveryDriver);
+            None
+        }
+        // Match the restore path: an unranked candidate may outrank every
+        // ranked candidate, so an incomplete list cannot prove a winner.
+        _ if non_directhci
+            .iter()
+            .any(|candidate| candidate.rank.is_none()) =>
+        {
             blockers.push(RebindPlanBlocker::AmbiguousWindowsRecoveryDriver);
             None
         }
@@ -531,11 +554,22 @@ fn driver_matches_package(
             .any(|id| candidate.hardware_id.eq_ignore_ascii_case(id))
 }
 
+#[cfg(windows)]
+pub(crate) fn inspect_unstaged_package(
+    controller: &ControllerObservation,
+    inf: &std::path::Path,
+) -> Result<Vec<CompatibleDriverObservation>, String> {
+    platform::inspect_unstaged_package(controller, inf)
+}
+
 /// Choose the stable device-specific PnP hardware ID from a fresh observation.
 /// This never accepts USB class compatible IDs or revision-only model entries.
 pub fn select_exact_usb_hardware_id(hardware_ids: &[String]) -> Option<String> {
     let mut selected = None;
     for value in hardware_ids {
+        if !value.is_ascii() {
+            continue;
+        }
         let upper = value.to_ascii_uppercase();
         let Some(rest) = upper.strip_prefix("USB\\VID_") else {
             continue;
@@ -621,8 +655,17 @@ mod platform {
         Err("temporary driver rebind is only available on Windows".into())
     }
 
-    pub(super) fn process_is_running(_process_id: u32) -> Result<bool, String> {
-        Err("process inspection is only available on Windows".into())
+    pub(super) fn observe_recovery_controller_and_drivers(
+        _: &directhci_core::ControllerIdentity,
+    ) -> Result<(ControllerObservation, Vec<CompatibleDriverObservation>), String> {
+        Err("recovery driver observation requires Windows".into())
+    }
+
+    pub(super) fn install_recovery_driver(
+        _: &directhci_core::ControllerIdentity,
+        _: &CompatibleDriverObservation,
+    ) -> Result<DriverInstallOutcome, String> {
+        Err("recovery driver installation requires Windows".into())
     }
 }
 
@@ -631,25 +674,21 @@ mod platform {
     use std::mem::{offset_of, size_of};
 
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        DI_FLAGSEX_ALLOWEXCLUDEDDRVS, DIGCF_ALLCLASSES, DIGCF_PRESENT, DIINSTALLDEVICE_FLAGS,
-        DiInstallDevice, HDEVINFO, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W, SP_DRVINFO_DATA_V2_W,
-        SP_DRVINFO_DETAIL_DATA_W, SP_DRVINSTALL_PARAMS, SPDIT_COMPATDRIVER,
+        DI_ENUMSINGLEINF, DI_FLAGSEX_ALLOWEXCLUDEDDRVS, DIGCF_ALLCLASSES, DIGCF_PRESENT,
+        DIINSTALLDEVICE_FLAGS, DiInstallDevice, HDEVINFO, SP_DEVINFO_DATA, SP_DEVINSTALL_PARAMS_W,
+        SP_DRVINFO_DATA_V2_W, SP_DRVINFO_DETAIL_DATA_W, SP_DRVINSTALL_PARAMS, SPDIT_COMPATDRIVER,
         SetupDiBuildDriverInfoList, SetupDiDestroyDeviceInfoList, SetupDiDestroyDriverInfoList,
         SetupDiEnumDriverInfoW, SetupDiGetClassDevsW, SetupDiGetDeviceInstallParamsW,
         SetupDiGetDriverInfoDetailW, SetupDiGetDriverInstallParamsW, SetupDiOpenDeviceInfoW,
         SetupDiSetDeviceInstallParamsW,
     };
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_PARAMETER, ERROR_NO_MORE_ITEMS,
-        GetLastError, HANDLE, STILL_ACTIVE,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, GetLastError, HANDLE,
     };
     use windows::Win32::Security::{
         GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
     };
-    use windows::Win32::System::Threading::{
-        GetCurrentProcess, GetExitCodeProcess, OpenProcess, OpenProcessToken,
-        PROCESS_QUERY_LIMITED_INFORMATION,
-    };
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
     use windows::core::{BOOL, PCWSTR};
 
     use super::*;
@@ -730,13 +769,77 @@ mod platform {
         Ok((controller, drivers))
     }
 
+    pub(crate) fn inspect_unstaged_package(
+        controller: &ControllerObservation,
+        inf: &std::path::Path,
+    ) -> Result<Vec<CompatibleDriverObservation>, String> {
+        with_driver_list(
+            &controller.identity.instance_id,
+            &controller.driver,
+            Some(inf),
+            |_, _, entries| {
+                Ok(entries
+                    .into_iter()
+                    .map(|(_, observation)| observation)
+                    .collect())
+            },
+        )
+    }
+
+    pub(super) fn observe_recovery_controller_and_drivers(
+        identity: &directhci_core::ControllerIdentity,
+    ) -> Result<(ControllerObservation, Vec<CompatibleDriverObservation>), String> {
+        let observations = crate::enumeration::enumerate_recovery_controllers(identity)
+            .map_err(|e| e.to_string())?;
+        let matches: Vec<_> = observations
+            .into_iter()
+            .filter(|c| {
+                same_physical_controller(identity, &c.identity)
+                    && c.identity.hardware_ids.iter().any(|actual| {
+                        identity
+                            .hardware_ids
+                            .iter()
+                            .any(|expected| actual.eq_ignore_ascii_case(expected))
+                    })
+            })
+            .collect();
+        let [controller] = matches.as_slice() else {
+            return Err(format!(
+                "recovery identity does not resolve uniquely ({} matches)",
+                matches.len()
+            ));
+        };
+        let drivers =
+            enumerate_compatible_drivers(&controller.identity.instance_id, &controller.driver)?;
+        Ok((controller.clone(), drivers))
+    }
+
     pub(super) fn install_driver_for_controller(
         identity: &directhci_core::ControllerIdentity,
         selected: &CompatibleDriverObservation,
     ) -> Result<DriverInstallOutcome, String> {
+        install_selected_driver(identity, selected, false)
+    }
+
+    pub(super) fn install_recovery_driver(
+        identity: &directhci_core::ControllerIdentity,
+        selected: &CompatibleDriverObservation,
+    ) -> Result<DriverInstallOutcome, String> {
+        install_selected_driver(identity, selected, true)
+    }
+
+    fn install_selected_driver(
+        identity: &directhci_core::ControllerIdentity,
+        selected: &CompatibleDriverObservation,
+        recovery: bool,
+    ) -> Result<DriverInstallOutcome, String> {
         // Resolve the controller and compatible list again immediately before
         // the destructive call. No cached devnode or SP_DRVINFO_DATA is used.
-        let (controller, fresh_candidates) = observe_controller_and_drivers(identity)?;
+        let (controller, fresh_candidates) = if recovery {
+            observe_recovery_controller_and_drivers(identity)?
+        } else {
+            observe_controller_and_drivers(identity)?
+        };
         let matching: Vec<_> = fresh_candidates
             .iter()
             .filter(|candidate| same_driver_candidate(candidate, selected))
@@ -805,23 +908,6 @@ mod platform {
         Ok(elevation.TokenIsElevated != 0)
     }
 
-    pub(super) fn process_is_running(process_id: u32) -> Result<bool, String> {
-        let process =
-            match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, process_id) } {
-                Ok(process) => OwnedHandle(process),
-                Err(_) if unsafe { GetLastError() } == ERROR_INVALID_PARAMETER => return Ok(false),
-                Err(error) => {
-                    return Err(format!(
-                        "OpenProcess({process_id}) failed while checking journal owner: {error}"
-                    ));
-                }
-            };
-        let mut exit_code = 0u32;
-        unsafe { GetExitCodeProcess(process.0, &mut exit_code) }
-            .map_err(|error| format!("GetExitCodeProcess({process_id}) failed: {error}"))?;
-        Ok(exit_code == STILL_ACTIVE.0 as u32)
-    }
-
     fn enumerate_compatible_drivers(
         instance_id: &str,
         current_driver: &DriverObservation,
@@ -837,6 +923,19 @@ mod platform {
     fn with_compatible_driver_list<T>(
         instance_id: &str,
         current_driver: &DriverObservation,
+        operation: impl FnOnce(
+            HDEVINFO,
+            &SP_DEVINFO_DATA,
+            Vec<(SP_DRVINFO_DATA_V2_W, CompatibleDriverObservation)>,
+        ) -> Result<T, String>,
+    ) -> Result<T, String> {
+        with_driver_list(instance_id, current_driver, None, operation)
+    }
+
+    fn with_driver_list<T>(
+        instance_id: &str,
+        current_driver: &DriverObservation,
+        source_inf: Option<&std::path::Path>,
         operation: impl FnOnce(
             HDEVINFO,
             &SP_DEVINFO_DATA,
@@ -869,6 +968,15 @@ mod platform {
         }
         .map_err(|error| format!("SetupDiGetDeviceInstallParamsW failed: {error}"))?;
         install_params.FlagsEx |= DI_FLAGSEX_ALLOWEXCLUDEDDRVS;
+        if let Some(inf) = source_inf {
+            let path = wide_null(&inf.to_string_lossy());
+            if path.len() > install_params.DriverPath.len() {
+                return Err("source INF path exceeds SetupAPI DriverPath capacity".into());
+            }
+            install_params.Flags |= DI_ENUMSINGLEINF;
+            install_params.DriverPath.fill(0);
+            install_params.DriverPath[..path.len()].copy_from_slice(&path);
+        }
         unsafe {
             SetupDiSetDeviceInstallParamsW(device_set.0, Some(&device_info), &install_params)
         }
@@ -934,13 +1042,13 @@ mod platform {
                 &mut driver_params,
             )
         }
-        .ok()
-        .map(|_| driver_params.Rank);
+        .map_err(|error| format!("SetupDiGetDriverInstallParamsW failed: {error}"))
+        .map(|_| driver_params.Rank)?;
 
         let inf_path = detail.inf_path;
         Ok(CompatibleDriverObservation {
             list_index: index,
-            rank,
+            rank: Some(rank),
             description: decode_utf16_string(&driver.Description),
             manufacturer: decode_utf16_string(&driver.MfgName),
             provider: decode_utf16_string(&driver.ProviderName),

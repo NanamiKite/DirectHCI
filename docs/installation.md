@@ -69,6 +69,15 @@ session should restore Windows Bluetooth while leaving the service running.
 
 Stopping with an active session requires confirmation. If stopping fails,
 the panel stays open and shows the error. Click the tray icon to reopen it.
+**A stopped service does not prove Bluetooth has recovered.** Check the actual
+controller and Windows Bluetooth state.
+
+The main service remains manual-start. Installation also registers
+**DirectHCI Boot Recovery**, a SYSTEM task that runs `directhcid boot-recovery`
+at boot and exits after checking any retained journal. It does not start the
+interactive runtime or take over a controller. Failed recovery is recorded in
+the Windows Application event log under `DirectHCI`. Upgrade/reinstall is
+needed to register this task and the service's preshutdown timeout.
 
 CLI status queries can use a normal PowerShell:
 
@@ -104,6 +113,12 @@ an error disappear**; it contains recovery evidence. Start with
 [troubleshooting and safe recovery](troubleshooting.md); see
 [ownership and recovery](ownership-and-recovery.md) and the
 [failure model](failure-model.md).
+
+If recovery requests a reboot, choose Windows **Restart**, not shutdown and
+power-on with Fast Startup. Recovery compares the kernel boot identifier before
+checking an old owner PID. New journals include the original device security
+baseline; an older journal may require explicit repair if that baseline is
+unknown. Do not widen permissions or delete evidence to force a successful result.
 
 ## Upgrade or uninstall
 

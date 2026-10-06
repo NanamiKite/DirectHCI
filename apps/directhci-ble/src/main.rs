@@ -328,6 +328,7 @@ fn parse_args() -> AppResult<(Option<String>, Command)> {
     } else {
         None
     };
+    validate_options(&args)?;
     let write_mode = |values: &[String]| {
         if values.iter().any(|value| value == "--without-response") {
             WriteMode::WithoutResponse
@@ -406,6 +407,47 @@ fn usage() -> &'static str {
     "usage: directhci-ble [--controller ID] scan [--seconds N]\n       directhci-ble [--controller ID] connect <public|random:AA:BB:CC:DD:EE:FF> [--seconds N]\n       directhci-ble [--controller ID] inspect <address>\n       directhci-ble [--controller ID] read <address> <16-or-128-bit-uuid>\n       directhci-ble [--controller ID] write <address> <uuid> <hex> [--without-response]\n       directhci-ble [--controller ID] subscribe <address> <uuid> [--indications] [--seconds N]\n       directhci-ble [--controller ID] listen <address> <uuid> [--seconds N]\n       directhci-ble [--controller ID] listen-all <address> [--seconds N]\n       directhci-ble [--controller ID] exchange <address> <write-uuid> <hex> [--listen <uuid> | --listen-all] [--without-response] [--seconds N]"
 }
 
+fn validate_options(args: &[String]) -> AppResult<()> {
+    let (positionals, flags): (usize, &[&str]) = match args.first().map(String::as_str) {
+        Some("scan") => (1, &["--seconds"]),
+        Some("connect") | Some("listen-all") => (2, &["--seconds"]),
+        Some("inspect") => (2, &[]),
+        Some("read") => (3, &[]),
+        Some("write") => (4, &["--without-response"]),
+        Some("subscribe") => (3, &["--seconds", "--indications"]),
+        Some("listen") => (3, &["--seconds"]),
+        Some("exchange") => (
+            4,
+            &[
+                "--seconds",
+                "--listen",
+                "--listen-all",
+                "--without-response",
+            ],
+        ),
+        _ => return Err(usage().into()),
+    };
+    if args.len() < positionals {
+        return Err(usage().into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut index = positionals;
+    while index < args.len() {
+        let flag = args[index].as_str();
+        if !flags.contains(&flag) || !seen.insert(flag) {
+            return Err(format!("unknown, unexpected or repeated option: {flag}").into());
+        }
+        if matches!(flag, "--seconds" | "--listen") {
+            index += 1;
+            if args.get(index).is_none_or(|value| value.starts_with("--")) {
+                return Err(format!("{flag} requires a value").into());
+            }
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 fn option_u64(args: &[String], option: &str, default: u64) -> AppResult<u64> {
     match args.iter().position(|value| value == option) {
         Some(index) => args
@@ -434,7 +476,7 @@ fn parse_hex(value: &str) -> AppResult<Vec<u8>> {
             !character.is_ascii_whitespace() && *character != ':' && *character != '-'
         })
         .collect();
-    if compact.len() % 2 != 0 {
+    if compact.len() % 2 != 0 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err("hex data must contain complete bytes".into());
     }
     (0..compact.len())

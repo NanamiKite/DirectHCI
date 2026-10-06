@@ -16,14 +16,14 @@ pub use hci::{
     ControllerBufferSize, HCI_EVENT_COMMAND_COMPLETE, HCI_EVENT_COMMAND_STATUS,
     HCI_READ_BUFFER_SIZE, HCI_READ_LOCAL_SUPPORTED_COMMANDS, HCI_READ_LOCAL_SUPPORTED_FEATURES,
     HCI_READ_LOCAL_VERSION_INFORMATION, HCI_RESET, HciAclPacket, HciCommandPacket,
-    HciCommandResponse, HciEventPacket, HciPacketError, LocalSupportedCommands,
+    HciCommandResponse, HciEventPacket, HciIncomingPacket, HciPacketError, LocalSupportedCommands,
     LocalSupportedFeatures, LocalVersionInformation, opcode, parse_controller_buffer_size,
     parse_local_supported_commands, parse_local_supported_features,
     parse_local_version_information, parse_reset_response,
 };
 pub use ipc::*;
 pub use ownership::{
-    DesiredControllerState, DriverPackageIdentity, InvalidOwnershipTransition, LeaseId,
-    LeaseOwnerMetadata, OWNERSHIP_JOURNAL_SCHEMA_VERSION, OwnershipBackend, OwnershipJournal,
-    OwnershipPhase,
+    DesiredControllerState, DeviceSecurityBaseline, DriverPackageIdentity,
+    InvalidOwnershipTransition, LeaseId, LeaseOwnerMetadata, OWNERSHIP_JOURNAL_SCHEMA_VERSION,
+    OwnershipBackend, OwnershipJournal, OwnershipPhase,
 };

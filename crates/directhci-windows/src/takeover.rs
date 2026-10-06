@@ -23,9 +23,14 @@ use crate::raw_hci::{
 use crate::rebind::{
     CompatibleDriverObservation, DIRECTHCI_WINUSB_INTERFACE_GUID, DirectHciPackageReadiness,
     DriverInstallOutcome, RebindSafetyPrerequisites, TemporaryRebindPlan,
-    install_driver_for_controller, observe_controller_and_drivers,
-    plan_temporary_device_specific_rebind, plan_temporary_winusb_rebind, process_is_elevated,
-    process_is_running, same_driver_candidate, same_inf_name, same_physical_controller,
+    install_driver_for_controller, install_recovery_driver, observe_controller_and_drivers,
+    observe_recovery_controller_and_drivers, plan_temporary_device_specific_rebind,
+    plan_temporary_winusb_rebind, process_is_elevated, same_driver_candidate, same_inf_name,
+    same_physical_controller,
+};
+use crate::recovery_support::{
+    MutationGuard, capture_recovery_baseline, owner_still_running, restore_device_security,
+    verify_device_security,
 };
 use crate::winusb::{
     DedicatedWinUsbControllerReadiness, DedicatedWinUsbReadinessStatus,
@@ -119,6 +124,8 @@ pub struct RuntimeControllerSession {
     store: JournalStore,
     journal: OwnershipJournal,
     raw_hci: Option<RawHciSession>,
+    // Held across takeover, transport shutdown and verified Windows restore.
+    _mutation: MutationGuard,
 }
 
 impl RuntimeControllerSession {
@@ -361,6 +368,13 @@ pub fn acquire_runtime_controller_session(
         report.primary_error = Some("takeover preflight refused execution".into());
         return Err(report);
     }
+    let mutation = match MutationGuard::acquire() {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.primary_error = Some(error);
+            return Err(report);
+        }
+    };
     let Some(pre_state) = report.pre_state.clone() else {
         report.primary_error = Some("preflight did not produce a controller observation".into());
         return Err(report);
@@ -410,8 +424,15 @@ pub fn acquire_runtime_controller_session(
             process_id: Some(std::process::id()),
             session_id: None,
             client_label: Some(client_label.into()),
+            ..Default::default()
         },
     );
+    if let Err(error) = capture_recovery_baseline(&mut journal) {
+        report.primary_error = Some(format!(
+            "capture recovery baseline before takeover: {error}"
+        ));
+        return Err(report);
+    }
     if let Err(error) = store.create(&journal) {
         report.primary_error = Some(format!("persist AcquirePrepared journal: {error}"));
         return Err(report);
@@ -489,6 +510,7 @@ pub fn acquire_runtime_controller_session(
         store,
         journal,
         raw_hci: Some(raw_hci),
+        _mutation: mutation,
     })
 }
 
@@ -520,6 +542,13 @@ where
         report.primary_error = Some("takeover preflight refused execution".into());
         return (report, None);
     }
+    let _mutation = match MutationGuard::acquire() {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.primary_error = Some(error);
+            return (report, None);
+        }
+    };
 
     let Some(pre_state) = report.pre_state.clone() else {
         report.primary_error = Some("preflight did not produce a controller observation".into());
@@ -570,8 +599,15 @@ where
             process_id: Some(std::process::id()),
             session_id: None,
             client_label: Some(client_label.into()),
+            ..Default::default()
         },
     );
+    if let Err(error) = capture_recovery_baseline(&mut journal) {
+        report.primary_error = Some(format!(
+            "capture recovery baseline before takeover: {error}"
+        ));
+        return (report, None);
+    }
     if let Err(error) = store.create(&journal) {
         report.primary_error = Some(format!("persist AcquirePrepared journal: {error}"));
         return (report, None);
@@ -594,7 +630,7 @@ where
             report.rebind = Some(successful_step(&outcome));
             if outcome.need_reboot {
                 report.primary_error = Some(
-                    "DiInstallDevice selected DirectHCI WinUSB but requires a reboot; no reboot was initiated"
+                    "DiInstallDevice selected DirectHCI WinUSB but requires Restart (not shutdown/power on with Fast Startup); no restart was initiated"
                         .into(),
                 );
                 mark_recovery_required(&store, &mut journal, &mut report.recovery_error);
@@ -792,6 +828,15 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
         journal_retained: true,
         error: None,
     };
+    // Excludes live takeover/prepare and serializes boot task, daemon startup
+    // and administrator offline recovery, including the journal load itself.
+    let _mutation = match MutationGuard::acquire() {
+        Ok(guard) => guard,
+        Err(error) => {
+            report.error = Some(error);
+            return report;
+        }
+    };
     let (mut journal, stale) = match store.load() {
         Ok(JournalLoad::Missing) => {
             report.status = OfflineRecoveryStatus::NoJournal;
@@ -816,7 +861,7 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
     if let Some(owner_process_id) = journal.owner.process_id
         && !(allow_current_owner && owner_process_id == std::process::id())
     {
-        match process_is_running(owner_process_id) {
+        match owner_still_running(&journal) {
             Ok(true) => {
                 report.error = Some(format!(
                     "journal owner process {owner_process_id} is still active; offline recovery refused"
@@ -850,7 +895,11 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
     };
     report.observed = Some(observed.clone());
 
-    if is_healthy_windows_owned(&observed) {
+    // A healthy binding is not sufficient if takeover's device-instance ACL
+    // override remains. Restore it through the same guarded restore path.
+    let security_restored =
+        verify_device_security(&journal, &observed.identity.instance_id).is_ok();
+    if is_healthy_windows_owned(&observed) && security_restored {
         match application_interface_is_active(
             &observed.identity.instance_id,
             &journal.directhci_driver_package.device_interface_guid,
@@ -939,14 +988,9 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
         return report;
     }
 
-    if !is_directhci_ready(&observed, &journal.directhci_driver_package) {
-        report.error = Some(format!(
-            "unexpected current driver/service ({:?}); refusing recovery mutation",
-            observed.service
-        ));
-        return report;
-    }
-
+    // Recovery is NOT acquisition: an interrupted PnP transition can leave
+    // no driver or a problem code. Fresh physical identity + a uniquely
+    // applicable non-DirectHCI Windows candidate still permit restoration.
     match restore_windows(&store, &mut journal) {
         Ok(restored) => {
             report.status = OfflineRecoveryStatus::RestoredWindows;
@@ -969,6 +1013,11 @@ fn recover_with_owner_policy(allow_current_owner: bool) -> OfflineRecoveryReport
 fn reboot_completed_after_acquire(journal: &OwnershipJournal) -> Result<bool, String> {
     use windows::Win32::System::SystemInformation::GetTickCount64;
 
+    if journal.owner.boot_identifier.is_some() {
+        return crate::recovery_support::reboot_completed(journal);
+    }
+    // Legacy reconciliation only (never owner authorization). New journals
+    // use the kernel boot GUID; this old heuristic is not used to bypass PID.
     const BOOT_TIME_MARGIN_MS: u64 = 2_000;
     let now = unix_time_ms().map_err(|error| error.to_string())?;
     if journal.created_unix_ms == 0 || journal.created_unix_ms > now {
@@ -1108,6 +1157,18 @@ fn restore_windows(
     store: &JournalStore,
     journal: &mut OwnershipJournal,
 ) -> Result<RestoreSuccess, Box<RestoreFailure>> {
+    // WindowsOwned may be a crash between durable commit and journal removal.
+    // When the actual device is unhealthy, reopen recovery rather than trap
+    // this journal in an illegal WindowsOwned -> RestoringWindows transition.
+    if journal.phase == OwnershipPhase::WindowsOwned {
+        if let Err(message) = persist_phase(store, journal, OwnershipPhase::RecoveryRequired) {
+            return Err(Box::new(RestoreFailure {
+                install: None,
+                final_state: None,
+                message,
+            }));
+        }
+    }
     if let Err(message) = persist_phase(store, journal, OwnershipPhase::RestoringWindows) {
         return Err(Box::new(RestoreFailure {
             install: None,
@@ -1115,21 +1176,22 @@ fn restore_windows(
             message,
         }));
     }
-    let (_, candidates) = match observe_controller_and_drivers(&journal.controller_identity) {
-        Ok(value) => value,
-        Err(message) => {
-            let message = retain_recovery_message(
-                store,
-                journal,
-                &format!("fresh recovery driver enumeration failed: {message}"),
-            );
-            return Err(Box::new(RestoreFailure {
-                install: None,
-                final_state: None,
-                message,
-            }));
-        }
-    };
+    let (observed, candidates) =
+        match observe_recovery_controller_and_drivers(&journal.controller_identity) {
+            Ok(value) => value,
+            Err(message) => {
+                let message = retain_recovery_message(
+                    store,
+                    journal,
+                    &format!("fresh recovery driver enumeration failed: {message}"),
+                );
+                return Err(Box::new(RestoreFailure {
+                    install: None,
+                    final_state: None,
+                    message,
+                }));
+            }
+        };
     let selected = match select_restore_candidate(
         &journal.pre_acquire_observation.driver,
         &journal.directhci_driver_package,
@@ -1162,7 +1224,17 @@ fn restore_windows(
         }
     };
 
-    let outcome = match install_driver_for_controller(&journal.controller_identity, &selected) {
+    // Restore the pre-acquire device property BEFORE Windows restarts its
+    // driver. WinUSB's DDInstall.HW Security value is not auto-rolled back.
+    if let Err(error) = restore_device_security(journal, &observed.identity.instance_id) {
+        let message = retain_recovery_message(store, journal, &error);
+        return Err(Box::new(RestoreFailure {
+            install: None,
+            final_state: Some(observed),
+            message,
+        }));
+    }
+    let outcome = match install_recovery_driver(&journal.controller_identity, &selected) {
         Ok(outcome) => outcome,
         Err(message) => {
             let retained_message = retain_recovery_message(store, journal, &message);
@@ -1178,7 +1250,7 @@ fn restore_windows(
         let message = retain_recovery_message(
             store,
             journal,
-            "Windows driver restore requires a reboot; journal retained",
+            "Windows driver restore requires Restart (not shutdown/power on with Fast Startup); journal retained",
         );
         return Err(Box::new(RestoreFailure {
             install: Some(install),
@@ -1257,6 +1329,11 @@ fn select_restore_candidate(
             .iter()
             .filter(|candidate| same_inf_name(&candidate.inf_path, original_inf))
             .filter(|candidate| {
+                !candidate
+                    .provider
+                    .eq_ignore_ascii_case(&directhci_package.provider)
+            })
+            .filter(|candidate| {
                 pre_driver
                     .provider
                     .as_deref()
@@ -1277,6 +1354,16 @@ fn select_restore_candidate(
         }
     }
 
+    // A missing rank is not evidence that this candidate loses to the ranked
+    // ones. Do not assert a unique fallback winner from an incomplete list.
+    if candidates.iter().any(|candidate| {
+        !candidate
+            .provider
+            .eq_ignore_ascii_case(&directhci_package.provider)
+            && candidate.rank.is_none()
+    }) {
+        return RestoreCandidateDecision::Ambiguous;
+    }
     let non_directhci: Vec<_> = candidates
         .iter()
         // The journal names the active DirectHCI package. A second staged
@@ -1383,6 +1470,16 @@ fn observation_matches_historical_driver(
 fn is_healthy_windows_owned(controller: &ControllerObservation) -> bool {
     controller.status.present
         && controller.status.problem_code == Some(0)
+        && controller
+            .status
+            .status_flags
+            .is_some_and(|flags| flags & 0x8 != 0 && flags & 0x100 != 0x100)
+        && controller.driver.inf_path.is_some()
+        && controller
+            .driver
+            .provider
+            .as_deref()
+            .is_some_and(|provider| !provider.eq_ignore_ascii_case("DirectHCI Project"))
         && controller.service.as_deref().is_some_and(|service| {
             service.eq_ignore_ascii_case("BTHUSB") || service.eq_ignore_ascii_case("IBTUSB")
         })
@@ -1437,11 +1534,20 @@ impl std::fmt::Display for LocateError {
 }
 
 fn fresh_controller(identity: &ControllerIdentity) -> Result<ControllerObservation, LocateError> {
-    let controllers = crate::enumerate_controllers()
-        .map_err(|error| LocateError::Enumeration(error.to_string()))?;
-    let mut matches = controllers
-        .into_iter()
-        .filter(|controller| same_physical_controller(identity, &controller.identity));
+    #[cfg(windows)]
+    let observations = crate::enumeration::enumerate_recovery_controllers(identity);
+    #[cfg(not(windows))]
+    let observations = crate::enumerate_controllers();
+    let controllers = observations.map_err(|error| LocateError::Enumeration(error.to_string()))?;
+    let mut matches = controllers.into_iter().filter(|controller| {
+        same_physical_controller(identity, &controller.identity)
+            && controller.identity.hardware_ids.iter().any(|actual| {
+                identity
+                    .hardware_ids
+                    .iter()
+                    .any(|expected| actual.eq_ignore_ascii_case(expected))
+            })
+    });
     let controller = matches.next().ok_or(LocateError::Missing)?;
     if matches.next().is_some() {
         return Err(LocateError::Ambiguous);
@@ -1471,6 +1577,11 @@ fn journal_to_windows_owned_and_clear(
     store: &JournalStore,
     journal: &mut OwnershipJournal,
 ) -> Result<(), String> {
+    let observed = fresh_controller(&journal.controller_identity).map_err(|e| e.to_string())?;
+    if !is_healthy_windows_owned(&observed) {
+        return Err("cannot clear journal: Windows driver is not healthy and started".into());
+    }
+    verify_device_security(journal, &observed.identity.instance_id)?;
     if journal.phase != OwnershipPhase::WindowsOwned
         && journal.phase != OwnershipPhase::RestoringWindows
     {

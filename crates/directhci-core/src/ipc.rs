@@ -127,12 +127,16 @@ pub fn write_ipc_frame(writer: &mut impl Write, frame: &IpcFrame) -> Result<(), 
 
 pub fn read_ipc_frame(reader: &mut impl Read) -> Result<Option<IpcFrame>, IpcFrameError> {
     let mut header = [0u8; 16];
-    match reader.read(&mut header[..1]) {
-        Ok(0) => return Ok(None),
-        Ok(1) => reader.read_exact(&mut header[1..])?,
-        Ok(_) => unreachable!(),
-        Err(error) => return Err(IpcFrameError::Io(error)),
+    loop {
+        match reader.read(&mut header[..1]) {
+            Ok(0) => return Ok(None),
+            Ok(1) => break,
+            Ok(_) => unreachable!(),
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(IpcFrameError::Io(error)),
+        }
     }
+    reader.read_exact(&mut header[1..])?;
     let magic = [header[0], header[1], header[2], header[3]];
     if magic != IPC_MAGIC {
         return Err(IpcFrameError::InvalidMagic(magic));

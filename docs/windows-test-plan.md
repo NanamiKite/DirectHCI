@@ -130,6 +130,34 @@ executables, recording their paths and hashes.
 7. Test upgrade and uninstall. An unresolved recovery failure should retain
    the service, binaries and journal instead of deleting them.
 
+## 6. Recovery changes requiring Windows acceptance
+
+These checks have **not** been executed in the Linux VM. Do not deliberately
+trigger a blue screen or remove power from the development machine to test them.
+Controlled interruption tests belong on a recoverable test host only.
+
+- After installation, check that the main service is manual-start, the SYSTEM
+  `DirectHCI Boot Recovery` task targets the installed protected executable,
+  and the SCM preshutdown timeout is 90,000 ms. The task should still execute
+  with the panel closed and the main service stopped.
+- Check new journal owner boot GUID/process creation time, and the original
+  device security snapshot, before/after a normal guarded takeover/restore.
+  Confirm the effective Windows Bluetooth radio works, not just `problem_code=0`.
+- Check full **Restart** separately from Fast Startup shutdown/power-on. Verify
+  boot identity comparison and completed-restore reconciliation on the installed
+  Windows version; the boot GUID is queried through an internal NT information
+  class and must fail closed if unavailable.
+- On a controlled recoverable host, verify stale-PID reuse does not block a
+  new-boot journal, and an unrelated same-boot PID with different creation time
+  does not claim the lease. A legacy journal with uncertain evidence stays blocked.
+- Verify interrupted transitions with a uniquely identified problem/no-driver
+  devnode can select the applicable Windows driver; unknown descriptor-failed
+  devices, ambiguous identities and unknown fallback ranks must remain blocked.
+- Confirm a failed/expired service stop reports a nonzero SCM status and a
+  `DirectHCI` Application event while retaining the journal. Verify uninstall
+  keeps the boot task and binaries if recovery fails, and removes the task only
+  after confirmed recovery/service deletion.
+
 ## Optional: a dedicated WinUSB dongle
 
 Use a separate, expendable USB controller and follow

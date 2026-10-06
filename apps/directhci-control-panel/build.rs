@@ -6,11 +6,31 @@ fn main() {
     println!("cargo:rerun-if-changed=directhci.rc");
     println!("cargo:rerun-if-changed=../../assets/directhci.ico");
     println!("cargo:rerun-if-env-changed=WINDRES");
+    println!("cargo:rerun-if-env-changed=RC");
 
-    if !env::var("TARGET")
-        .expect("Cargo provides TARGET")
-        .ends_with("-windows-gnu")
-    {
+    let target = env::var("TARGET").expect("Cargo provides TARGET");
+    if target.ends_with("-windows-msvc") {
+        let rc = env::var_os("RC").unwrap_or_else(|| "rc.exe".into());
+        let output = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo provides OUT_DIR"))
+            .join("directhci-icon.res");
+        let status = Command::new(&rc)
+            .arg("/nologo")
+            .arg("/fo")
+            .arg(&output)
+            .arg("directhci.rc")
+            .status()
+            .unwrap_or_else(|error| {
+                panic!("run {rc:?} from the Windows SDK/EWDK environment: {error}")
+            });
+        assert!(
+            status.success(),
+            "{rc:?} failed to compile DirectHCI resources"
+        );
+        println!("cargo:rustc-link-arg={}", output.display());
+        return;
+    }
+
+    if !target.ends_with("-windows-gnu") {
         return;
     }
 

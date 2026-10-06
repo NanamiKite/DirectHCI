@@ -59,6 +59,7 @@ impl OwnershipPhase {
         matches!(
             (self, next),
             (WindowsOwned, AcquirePrepared)
+                | (WindowsOwned, RecoveryRequired)
                 | (AcquirePrepared, RebindingToDirectHci)
                 | (AcquirePrepared, RestoringWindows)
                 | (AcquirePrepared, RecoveryRequired)
@@ -92,6 +93,19 @@ pub struct LeaseOwnerMetadata {
     pub process_id: Option<u32>,
     pub session_id: Option<String>,
     pub client_label: Option<String>,
+    /// Kernel boot identifier: a resumed Fast Startup session is not a restart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_identifier: Option<String>,
+    /// GetProcessTimes creation FILETIME, not a reusable PID alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_creation_time: Option<u64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct DeviceSecurityBaseline {
+    /// None means the device had no explicit security override. An absent
+    /// baseline in an older journal means unknown, NOT an absent override.
+    pub security_sddl: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -109,6 +123,8 @@ pub struct OwnershipJournal {
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
     pub owner: LeaseOwnerMetadata,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub device_security_baseline: Option<DeviceSecurityBaseline>,
 }
 
 impl OwnershipJournal {
@@ -134,6 +150,7 @@ impl OwnershipJournal {
             created_unix_ms,
             updated_unix_ms,
             owner,
+            device_security_baseline: None,
         }
     }
 

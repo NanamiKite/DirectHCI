@@ -31,6 +31,7 @@ mod provisioning;
 mod provisioning_windows;
 mod raw_hci;
 mod rebind;
+mod recovery_support;
 #[cfg(windows)]
 mod security;
 mod takeover;

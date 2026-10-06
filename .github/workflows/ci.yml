@@ -45,3 +45,29 @@ jobs:
           rustup default stable
       - name: Build workspace
         run: cargo build --locked --workspace --target x86_64-pc-windows-gnu
+
+  windows-native:
+    name: Compile Windows platform code and MSVC resources
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Locate Windows SDK resource compiler
+        shell: pwsh
+        run: |
+          $sdkBin = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
+          $rc = Get-ChildItem -LiteralPath $sdkBin -Filter rc.exe -Recurse |
+            Where-Object { $_.Directory.Name -eq 'x64' } |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $rc) { throw 'Windows SDK rc.exe not found' }
+          "RC=$($rc.FullName)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Install Rust MSVC target
+        run: |
+          rustup toolchain install stable --profile minimal --target x86_64-pc-windows-msvc
+          rustup default stable
+      - name: Compile Windows workspace
+        run: cargo build --locked --workspace --target x86_64-pc-windows-msvc
+      # No service installation, driver staging, takeover, or hardware access
+      # on hosted runners. Hardware recovery acceptance remains a host step.

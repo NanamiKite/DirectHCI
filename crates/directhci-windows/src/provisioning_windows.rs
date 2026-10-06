@@ -9,15 +9,16 @@ use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use windows::Win32::Devices::DeviceAndDriverInstallation::{
-    SP_COPY_STYLE, SPOST_PATH, SetupCopyOEMInfW,
+    SP_COPY_NOOVERWRITE, SPOST_PATH, SetupCopyOEMInfW, SetupUninstallOEMInfW,
 };
-use windows::Win32::Foundation::{FreeLibrary, HMODULE};
+use windows::Win32::Foundation::{ERROR_FILE_EXISTS, FreeLibrary, GetLastError, HMODULE};
+use windows::Win32::Security::Cryptography::*;
 use windows::Win32::System::LibraryLoader::{
     GetProcAddress, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
     LoadLibraryExW,
 };
 use windows::Win32::System::Rpc::UuidCreate;
-use windows::core::{GUID, PCSTR, PCWSTR};
+use windows::core::{GUID, HRESULT, PCSTR, PCWSTR};
 
 use crate::provisioning::{device_specific_package_blueprint, eligible_device_specific_package};
 use crate::rebind::{DirectHciPackageReadiness, same_physical_controller};
@@ -110,6 +111,7 @@ pub fn controller_preparation_status(
 }
 
 pub fn prepare_controller(controller_id: &str) -> Result<PreparedController, String> {
+    let _mutation = crate::recovery_support::MutationGuard::acquire()?;
     let before = unique_controller(controller_id)?;
     let package = eligible_device_specific_package(&before)?;
     let hardware_id = package
@@ -119,6 +121,12 @@ pub fn prepare_controller(controller_id: &str) -> Result<PreparedController, Str
     let blueprint = device_specific_package_blueprint(hardware_id)?;
     let previous = controller_preparation_status(controller_id)?;
     if previous.ready {
+        if !previous.takeover_safe {
+            return Err(format!(
+                "PackageVerificationFailed: existing candidate is not takeover-safe: {:?}",
+                previous.blockers
+            ));
+        }
         return Ok(PreparedController {
             status: previous,
             already_prepared: true,
@@ -231,75 +239,231 @@ pub fn prepare_controller(controller_id: &str) -> Result<PreparedController, Str
     validate_unchanged(&before, controller_id)?;
     // SAFETY: all C strings and both repr(C) structures outlive this synchronous
     // call; the DLL stays loaded until it returns. No wdi_install_driver call.
-    let code = unsafe { prepare(&mut device, path.as_ptr(), input.as_ptr(), &mut options) };
-    if code != 0 {
-        return Err(format!(
-            "PackageSigningFailed: libwdi wdi_prepare_driver returned {code}; inspect directhcid diagnostics"
-        ));
-    }
-    drop(module);
-    let inf = output.join(OUTPUT_INF);
-    let cat = output.join(OUTPUT_CAT);
-    for file in [&inf, &cat] {
-        let metadata = fs::metadata(file)
-            .map_err(|error| format!("PackageVerificationFailed: {}: {error}", file.display()))?;
-        if !metadata.is_file() || metadata.len() == 0 {
+    let mut newly_staged = None;
+    let result = (|| -> Result<PreparedController, String> {
+        let code = unsafe { prepare(&mut device, path.as_ptr(), input.as_ptr(), &mut options) };
+        if code != 0 {
             return Err(format!(
-                "PackageVerificationFailed: missing or empty {}",
-                file.display()
+                "PackageSigningFailed: libwdi wdi_prepare_driver returned {code}; inspect directhcid diagnostics"
             ));
         }
-        crate::security::validate_secure_data_file(file)?;
+        drop(module);
+        let inf = output.join(OUTPUT_INF);
+        let cat = output.join(OUTPUT_CAT);
+        for file in [&inf, &cat] {
+            let metadata = fs::metadata(file).map_err(|error| {
+                format!("PackageVerificationFailed: {}: {error}", file.display())
+            })?;
+            if !metadata.is_file() || metadata.len() == 0 {
+                return Err(format!(
+                    "PackageVerificationFailed: missing or empty {}",
+                    file.display()
+                ));
+            }
+            crate::security::validate_secure_data_file(file)?;
+        }
+        validate_unchanged(&before, controller_id)?;
+        // Inspect the signed source INF against this actual devnode BEFORE making
+        // it a PnP candidate. Stage-only is unsafe if it could win automatic ranking.
+        let preflight = plan_takeover(controller_id);
+        let windows_driver = preflight
+            .rebind
+            .best_windows_recovery_driver
+            .as_ref()
+            .ok_or("PackageVerificationFailed: no unambiguous Windows recovery candidate")?;
+        let source_candidates = crate::rebind::inspect_unstaged_package(&before, &inf)?;
+        let [candidate] = source_candidates.as_slice() else {
+            return Err(
+                "PackageVerificationFailed: source INF has no unique applicable candidate".into(),
+            );
+        };
+        // Trust/catalog registration can improve the source signature score.
+        // Compare the best possible SS=0 score, not an unstaged unsigned score.
+        let best_possible_rank = candidate.rank.map(|rank| rank & 0x00ff_ffff);
+        if !candidate.provider.eq_ignore_ascii_case(&package.provider)
+            || !candidate.hardware_id.eq_ignore_ascii_case(hardware_id)
+            || !matches!((best_possible_rank, windows_driver.rank), (Some(direct), Some(windows)) if direct > windows)
+        {
+            return Err(format!(
+                "PackageVerificationFailed: unsafe source driver rank (DirectHCI={:?}, best possible={:?}, Windows={:?}); not staged",
+                candidate.rank, best_possible_rank, windows_driver.rank
+            ));
+        }
+        validate_unchanged(&before, controller_id)?;
+        let inf_wide = wide(&inf);
+        let mut destination = [0u16; 260];
+        let mut reused = false;
+        // SetupCopyOEMInfW stages this signed package only. It does not bind the
+        // controller; DiInstallDevice remains behind the existing takeover gates.
+        if let Err(error) = unsafe {
+            SetupCopyOEMInfW(
+                PCWSTR(inf_wide.as_ptr()),
+                PCWSTR::null(),
+                SPOST_PATH,
+                SP_COPY_NOOVERWRITE,
+                Some(&mut destination),
+                None,
+                None,
+            )
+        } {
+            if error.code() == HRESULT::from_win32(ERROR_FILE_EXISTS.0) {
+                reused = true;
+            } else {
+                let binding = validate_unchanged(&before, controller_id);
+                return Err(format!(
+                    "PackageStagingRejectedByWindows: {error}; binding: {}",
+                    binding.map_or_else(|error| error, |()| "BTHUSB unchanged".into()),
+                ));
+            }
+        }
+        let published = String::from_utf16_lossy(
+            &destination[..destination
+                .iter()
+                .position(|v| *v == 0)
+                .unwrap_or(destination.len())],
+        );
+        if !reused {
+            newly_staged = Some(published.clone());
+        }
+        validate_unchanged(&before, controller_id)?;
+        let status = controller_preparation_status(controller_id)?;
+        if !status.ready || !status.takeover_safe {
+            return Err(format!(
+                "PackageVerificationFailed: Driver Store accepted the package but fresh compatible-driver enumeration has no unique DirectHCI candidate: {:?}",
+                status.blockers
+            ));
+        }
+        let staged = serde_json::json!({
+            "phase": "staged",
+            "hardware_id": &blueprint.hardware_id,
+            "certificate_subject": &subject_text,
+            "staged_inf": inf.to_string_lossy(),
+            "published_inf": &published,
+            "reused_existing_package": reused,
+        });
+        let mut staged_file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(output.join("staged.json"))
+            .map_err(|error| format!("create staged package record: {error}"))?;
+        staged_file
+            .write_all(&serde_json::to_vec_pretty(&staged).map_err(|error| error.to_string())?)
+            .and_then(|_| staged_file.sync_all())
+            .map_err(|error| format!("persist staged package record: {error}"))?;
+        if reused {
+            // An identical INF already exists; its catalog does not use the new
+            // attempt's unique certificate. Keep that package, remove only new trust.
+            cleanup_attempt_certificate(&subject_text)?;
+        }
+        Ok(PreparedController {
+            status,
+            already_prepared: reused,
+            staged_inf: Some(published),
+        })
+    })();
+    match result {
+        Ok(prepared) => Ok(prepared),
+        Err(primary) => {
+            let cleanup = (|| {
+                if let Some(published) = newly_staged.as_deref() {
+                    let filename = Path::new(published)
+                        .file_name()
+                        .and_then(|v| v.to_str())
+                        .filter(|v| v.starts_with("oem") && v.ends_with(".inf"))
+                        .ok_or("cannot safely resolve newly staged published INF")?;
+                    // No SUOI_FORCEDELETE: Windows must confirm no present OR
+                    // absent device references this newly introduced package.
+                    if !unsafe {
+                        SetupUninstallOEMInfW(PCWSTR(wide(Path::new(filename)).as_ptr()), 0, None)
+                    }
+                    .as_bool()
+                    {
+                        return Err(format!(
+                            "new package retained; SetupUninstallOEMInfW: {}",
+                            unsafe { GetLastError() }.0
+                        ));
+                    }
+                }
+                cleanup_attempt_certificate(&subject_text)
+            })();
+            match cleanup {
+                Ok(()) => Err(primary),
+                Err(error) => Err(format!(
+                    "{primary}; cleanup: {error}; public trust retained if package removal was not confirmed"
+                )),
+            }
+        }
     }
-    validate_unchanged(&before, controller_id)?;
-    let inf_wide = wide(&inf);
-    // SetupCopyOEMInfW stages this signed package only. It does not bind the
-    // controller; DiInstallDevice remains behind the existing takeover gates.
-    if let Err(error) = unsafe {
-        SetupCopyOEMInfW(
-            PCWSTR(inf_wide.as_ptr()),
-            PCWSTR::null(),
-            SPOST_PATH,
-            SP_COPY_STYLE(0),
-            None,
-            None,
-            None,
-        )
-    } {
-        let binding = validate_unchanged(&before, controller_id);
-        return Err(format!(
-            "PackageStagingRejectedByWindows: {error}; binding: {}; one-time public certificate {subject_text} remains trusted because safe reference-aware cleanup is not yet available",
-            binding.map_or_else(|error| error, |()| "BTHUSB unchanged".into()),
-        ));
+}
+
+fn cleanup_attempt_certificate(subject: &str) -> Result<(), String> {
+    // Unique UUID subject, generated in THIS call, signed exactly one catalog;
+    // never remove a reused package's certificate or a pre-existing test root.
+    let name = subject
+        .strip_prefix("CN=DirectHCI-")
+        .ok_or("unexpected attempt certificate identity")?;
+    GUID::try_from(name).map_err(|_| "invalid attempt certificate UUID")?;
+    let common_name = format!("DirectHCI-{name}");
+    let query: Vec<u16> = common_name.encode_utf16().chain(Some(0)).collect();
+    for store_name in ["Root", "TrustedPublisher"] {
+        let store_wide: Vec<u16> = store_name.encode_utf16().chain(Some(0)).collect();
+        let store = unsafe {
+            CertOpenStore(
+                CERT_STORE_PROV_SYSTEM_W,
+                CERT_QUERY_ENCODING_TYPE(0),
+                None,
+                CERT_OPEN_STORE_FLAGS(CERT_SYSTEM_STORE_LOCAL_MACHINE)
+                    | CERT_STORE_OPEN_EXISTING_FLAG,
+                Some(store_wide.as_ptr().cast()),
+            )
+        }
+        .map_err(|e| format!("open certificate store {store_name}: {e}"))?;
+        let result = (|| {
+            loop {
+                let cert = unsafe {
+                    CertFindCertificateInStore(
+                        store,
+                        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                        0,
+                        CERT_FIND_SUBJECT_STR_W,
+                        Some(query.as_ptr().cast()),
+                        None,
+                    )
+                };
+                if cert.is_null() {
+                    let error = unsafe { GetLastError() };
+                    if error.0 == 0x80092004 {
+                        break;
+                    } // CRYPT_E_NOT_FOUND
+                    return Err(format!("enumerate attempt certificate: {}", error.0));
+                }
+                let mut actual = [0u16; 128];
+                unsafe {
+                    CertGetNameStringW(
+                        cert,
+                        CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                        0,
+                        None,
+                        Some(&mut actual),
+                    )
+                };
+                let actual_name = String::from_utf16_lossy(
+                    &actual[..actual.iter().position(|v| *v == 0).unwrap_or(actual.len())],
+                );
+                if actual_name != common_name {
+                    let _ = unsafe { CertFreeCertificateContext(Some(cert)) };
+                    return Err("certificate identity mismatch; trust retained".into());
+                }
+                // CertDeleteCertificateFromStore consumes the context even on failure.
+                unsafe { CertDeleteCertificateFromStore(cert) }
+                    .map_err(|e| format!("remove attempt trust: {e}"))?;
+            }
+            Ok(())
+        })();
+        let _ = unsafe { CertCloseStore(Some(store), 0) };
+        result?;
     }
-    validate_unchanged(&before, controller_id)?;
-    let status = controller_preparation_status(controller_id)?;
-    if !status.ready {
-        return Err(format!(
-            "PackageVerificationFailed: Driver Store accepted the package but fresh compatible-driver enumeration has no unique DirectHCI candidate: {:?}",
-            status.blockers
-        ));
-    }
-    let staged = serde_json::json!({
-        "phase": "staged",
-        "hardware_id": &blueprint.hardware_id,
-        "certificate_subject": &subject_text,
-        "staged_inf": inf.to_string_lossy(),
-    });
-    let mut staged_file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(output.join("staged.json"))
-        .map_err(|error| format!("create staged package record: {error}"))?;
-    staged_file
-        .write_all(&serde_json::to_vec_pretty(&staged).map_err(|error| error.to_string())?)
-        .and_then(|_| staged_file.sync_all())
-        .map_err(|error| format!("persist staged package record: {error}"))?;
-    Ok(PreparedController {
-        status,
-        already_prepared: false,
-        staged_inf: Some(inf.display().to_string()),
-    })
+    Ok(())
 }
 
 fn unique_controller(id: &str) -> Result<ControllerObservation, String> {
@@ -319,7 +483,7 @@ fn validate_unchanged(before: &ControllerObservation, id: &str) -> Result<(), St
     let after = unique_controller(id)?;
     if !same_physical_controller(&before.identity, &after.identity)
         || !after.status.present
-        || after.status.problem_code.is_some_and(|code| code != 0)
+        || after.status.problem_code != Some(0)
         || !after.service.as_deref().is_some_and(|service| {
             service.eq_ignore_ascii_case("BTHUSB") || service.eq_ignore_ascii_case("IBTUSB")
         })

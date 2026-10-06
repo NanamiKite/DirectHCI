@@ -5,3 +5,7 @@
 
 *.orig
 *.rej
+
+# Local incident-repair and legacy-cleanup helpers.
+/scripts/windows/repair-bluetooth-security.ps1
+/scripts/windows/cleanup-directhci.ps1

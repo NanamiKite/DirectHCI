@@ -26,9 +26,13 @@ must come from an explicit user decision about local certificate trust.
 `acquire_raw_hci(id)` returns a `RawHciClientSession` after the runtime has
 finished guarded takeover and opened Raw HCI. The session exposes
 `send_command(opcode, params)`, `send_acl(packet)`,
-`receive_event(timeout)`, `receive_acl(timeout)` and `release()`.
+`receive_packet(timeout)`, typed `receive_event(timeout)` /
+`receive_acl(timeout)` convenience methods and `release()`.
 Command completion/status correlation is performed by the runtime; unsolicited
-events and ACL packets are separate receive streams. Explicitly call
+events and ACL packets share a bounded FIFO. `receive_packet()` returns
+`HciIncomingPacket::Event` or `::Acl` in arrival order; do not mix typed reads
+when ordering across packet kinds matters. The bt-hci adapter uses this unified
+path and pauses before dequeueing when its own queue is full. Explicitly call
 `release()` and handle its restore result. Pipe disconnect is a safety path,
 not a substitute for awaited, confirmed release.
 

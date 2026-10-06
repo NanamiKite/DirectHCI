@@ -42,12 +42,22 @@ sign a new package for each connection.
 
 ## Driver Store staging is not takeover
 
-After confirming nonempty INF and CAT files, the runtime calls
-`SetupCopyOEMInfW` to stage the package. It does **not** call libwdi's driver
+After confirming nonempty INF and CAT files, the runtime inspects the signed
+source INF against the actual controller with `DI_ENUMSINGLEINF`. Its rank
+must be known and, even with the best possible signature score after catalog
+registration, strictly worse than the freshly selected Windows recovery
+candidate, so preparation cannot intentionally introduce a default-winning
+WinUSB candidate. Unknown ranks and ambiguous candidates are refused before
+staging. The signature/feature/identifier fields follow
+[Windows driver ranking](https://learn.microsoft.com/en-us/windows-hardware/drivers/install/how-windows-ranks-driver-packages).
+The runtime then calls `SetupCopyOEMInfW` with
+`SP_COPY_NOOVERWRITE` to stage the package. It does **not** call libwdi's driver
 installation function, use `pnputil /install` or bind WinUSB to the device.
 It then checks that the same physical controller still has its original
 Windows Bluetooth binding and that a fresh planner sees a unique applicable
-DirectHCI candidate. Only a later client acquisition can pass through the
+DirectHCI candidate with `takeover_safe` set. A failure after staging attempts
+to remove only this attempt's newly published INF, without force; an existing
+package is never removed as rollback. Only a later client acquisition can pass through the
 separate journal, driver-rank, recovery-candidate and exact-devnode
 `DiInstallDevice` gates.
 
@@ -68,8 +78,11 @@ Generated INF, CAT and metadata files are kept under the protected
 ProgramData tree. The M1 ownership journal is separate: release restores
 the Windows driver but does not delete the staged package. The current
 uninstaller leaves staged packages, public certificates and ProgramData
-state in place. Reference-aware certificate/package removal is not yet
-implemented, including cleanup after a failed staging attempt. Do not
+state in place. Failed preparation removes only its own UUID-named public
+certificate after confirming that no newly staged package is left. If Windows
+refuses safe package removal, both the package and its public trust are retained
+and the cleanup error is reported separately. Cleanup of arbitrary historical
+or reused package references is not part of this per-attempt rollback. Do not
 describe uninstall as removing these objects or remove a public certificate
 while a staged package may still refer to it.
 

@@ -18,7 +18,8 @@ use windows::Win32::Devices::Properties::{
 };
 use windows::Win32::Devices::Usb::GUID_DEVINTERFACE_USB_DEVICE;
 use windows::Win32::Foundation::{
-    DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_ITEMS, GetLastError,
+    DEVPROPKEY, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS,
+    ERROR_NOT_FOUND, GetLastError,
 };
 use windows::core::{GUID, PCWSTR};
 
@@ -28,6 +29,21 @@ const BLUETOOTH_CLASS_GUID: &str = "{E0CBF06C-CD8B-4647-BB8A-263B43F0F974}";
 const MAX_DEVICE_ID_LEN: usize = 200;
 
 pub(super) fn enumerate_controllers() -> Result<Vec<ControllerObservation>, Error> {
+    enumerate_with_recovery_target(None)
+}
+
+/// Recovery may observe a journal's exact devnode even if an interrupted
+/// driver transition removed its Bluetooth class/service. This is NOT a new
+/// discovery/provisioning eligibility path.
+pub(crate) fn enumerate_recovery_controllers(
+    identity: &ControllerIdentity,
+) -> Result<Vec<ControllerObservation>, Error> {
+    enumerate_with_recovery_target(Some(identity))
+}
+
+fn enumerate_with_recovery_target(
+    target: Option<&ControllerIdentity>,
+) -> Result<Vec<ControllerObservation>, Error> {
     let interface_paths = enumerate_interface_paths(&GUID_DEVINTERFACE_USB_DEVICE)?;
     let device_set = DeviceInfoSet::all_present()?;
     let mut observations = Vec::new();
@@ -50,13 +66,24 @@ pub(super) fn enumerate_controllers() -> Result<Vec<ControllerObservation>, Erro
         let class_guid = get_registry_string(device_set.0, &device_info, SPDRP_CLASSGUID)?;
         let service = get_registry_string(device_set.0, &device_info, SPDRP_SERVICE)?;
 
-        if !is_bluetooth_usb_candidate(
-            &instance_id,
-            &hardware_ids,
-            &compatible_ids,
-            class_guid.as_deref(),
-            service.as_deref(),
-        ) {
+        let recovery_target = target.is_some_and(|target| {
+            target.instance_id.eq_ignore_ascii_case(&instance_id)
+                && hardware_ids.iter().any(|actual| {
+                    target
+                        .hardware_ids
+                        .iter()
+                        .any(|expected| expected.eq_ignore_ascii_case(actual))
+                })
+        });
+        if !recovery_target
+            && !is_bluetooth_usb_candidate(
+                &instance_id,
+                &hardware_ids,
+                &compatible_ids,
+                class_guid.as_deref(),
+                service.as_deref(),
+            )
+        {
             continue;
         }
 
@@ -311,8 +338,19 @@ fn get_registry_property_bytes(
     if first.is_ok() && required_size == 0 {
         return Ok(None);
     }
-    if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || required_size == 0 {
-        return Ok(None);
+    match first {
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(ERROR_INVALID_DATA.0) => {
+            return Ok(None);
+        }
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
+                && required_size != 0 => {}
+        Err(error) => return Err(api_error("SetupDiGetDeviceRegistryPropertyW(size)", error)),
+        Ok(()) => {
+            return Err(Error::WindowsApi(
+                "registry property returned inconsistent size".into(),
+            ));
+        }
     }
 
     let mut buffer = vec![0_u8; required_size as usize];
@@ -360,8 +398,10 @@ fn get_device_guid_property(
     let Some(buffer) = get_device_property_bytes(device_set, device_info, property)? else {
         return Ok(None);
     };
-    if buffer.len() < size_of::<GUID>() {
-        return Ok(None);
+    if buffer.len() != size_of::<GUID>() {
+        return Err(Error::WindowsApi(
+            "GUID device property has invalid size".into(),
+        ));
     }
     let guid = unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<GUID>()) };
     Ok(Some(format!("{{{guid:?}}}")))
@@ -388,8 +428,19 @@ fn get_device_property_bytes(
     if first.is_ok() && required_size == 0 {
         return Ok(None);
     }
-    if unsafe { GetLastError() } != ERROR_INSUFFICIENT_BUFFER || required_size == 0 {
-        return Ok(None);
+    match first {
+        Err(error) if error.code() == windows::core::HRESULT::from_win32(ERROR_NOT_FOUND.0) => {
+            return Ok(None);
+        }
+        Err(error)
+            if error.code() == windows::core::HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0)
+                && required_size != 0 => {}
+        Err(error) => return Err(api_error("SetupDiGetDevicePropertyW(size)", error)),
+        Ok(()) => {
+            return Err(Error::WindowsApi(
+                "device property returned inconsistent size".into(),
+            ));
+        }
     }
 
     let mut buffer = vec![0_u8; required_size as usize];

@@ -90,7 +90,7 @@ impl FromStr for BleAddress {
             BleError::InvalidInput("address must start with public: or random:".into())
         })?;
         let compact = bytes.replace(':', "");
-        if compact.len() != 12 {
+        if compact.len() != 12 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
             return Err(BleError::InvalidInput(
                 "Bluetooth address must contain 6 bytes".into(),
             ));
