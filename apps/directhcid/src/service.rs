@@ -35,7 +35,10 @@ pub fn dispatch(arguments: Vec<String>) -> Result<(), String> {
         [command] if command == "service" => run_service_dispatcher(),
         [command] if command == "boot-recovery" => crate::boot_recovery::run(),
         [command] if command == "install-service" => install_service(),
-        [command] if command == "uninstall-service" => uninstall_service(),
+        [command] if command == "uninstall-service" => uninstall_service(false),
+        [command, option] if command == "uninstall-service" && option == "--require-stopped" => {
+            uninstall_service(true)
+        }
         [command] if command == "--help" || command == "-h" => {
             println!("directhcid [run|service|boot-recovery|install-service|uninstall-service]");
             println!("  run              run in the foreground for development");
@@ -43,6 +46,9 @@ pub fn dispatch(arguments: Vec<String>) -> Result<(), String> {
             println!("  install-service  register this executable as DirectHCI (manual start)");
             println!(
                 "  uninstall-service stop, recover Windows Bluetooth, then remove the service"
+            );
+            println!(
+                "    --require-stopped refuse a running service (installer upgrade preflight)"
             );
             Ok(())
         }
@@ -247,7 +253,7 @@ fn install_service() -> Result<(), String> {
 
 // The installer calls this before removing any executable. A failed stop or
 // recovery deliberately leaves the service and journal in place for diagnosis.
-fn uninstall_service() -> Result<(), String> {
+fn uninstall_service(require_stopped: bool) -> Result<(), String> {
     let manager = ServiceHandle(
         unsafe { OpenSCManagerW(PCWSTR::null(), PCWSTR::null(), SC_MANAGER_CONNECT) }
             .map_err(|error| format!("OpenSCManagerW: {error}"))?,
@@ -276,6 +282,9 @@ fn uninstall_service() -> Result<(), String> {
 
     if let Some(service) = &service {
         if query_service_state(service.0)? != SERVICE_STOPPED {
+            if require_stopped {
+                return Err("DirectHCI service is still running or changing state; stop it and wait for shutdown before installing; service was not stopped by Setup".into());
+            }
             let mut status = SERVICE_STATUS::default();
             match unsafe { ControlService(service.0, SERVICE_CONTROL_STOP, &mut status) } {
                 Ok(()) => {}
@@ -312,6 +321,11 @@ fn uninstall_service() -> Result<(), String> {
         ));
     }
     if let Some(service) = service {
+        // An upgrade must not stop a service that restarted during recovery.
+        // Normal uninstall keeps its existing stop/recover behavior.
+        if require_stopped && query_service_state(service.0)? != SERVICE_STOPPED {
+            return Err("DirectHCI service started during installation preflight; installation is blocked and service registration retained".into());
+        }
         unsafe { DeleteService(service.0) }.map_err(|error| format!("DeleteService: {error}"))?;
         drop(service);
         wait_service_gone(manager.0, &name)?;

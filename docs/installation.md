@@ -93,6 +93,22 @@ Rust consumers see [SDK](sdk.md). `DirectHciClient::connect_or_start(...)` can
 request service startup when the caller has Windows `SERVICE_START` permission;
 `connect(...)` requires an already running service.
 
+## Recovery after abnormal termination
+
+**Known limitation: recovery of system Bluetooth after abnormal termination
+is not yet fixed.** Unexpected power loss, a blue screen, replacement of
+program files while the DirectHCI service is running, or abnormal process
+termination can interrupt orderly restoration. Windows Bluetooth may then
+remain off and refuse to turn on, even when Device Manager shows a healthy
+controller.
+
+Windows **Restart** may be needed to restore Bluetooth; shutdown and power-on
+with Fast Startup are not equivalent. Restart is not a guaranteed fix. A
+stopped service, an active BTHUSB driver or an absent journal alone does not
+prove Bluetooth is usable. Before upgrading, disconnect clients, stop the
+service and exit the applications normally; do not replace running files or
+force-terminate processes. See [safe next steps after abnormal termination](troubleshooting.md#system-bluetooth-is-unusable-after-abnormal-termination).
+
 ## Recovery
 
 If recovery is required while the runtime is available, use **Restore
@@ -123,9 +139,20 @@ unknown. Do not widen permissions or delete evidence to force a successful resul
 ## Upgrade or uninstall
 
 Run a new installer to upgrade, or use **Installed apps → DirectHCI →
-Uninstall**. Both must stop the service and confirm Windows Bluetooth recovery
-before removing the runtime. If recovery cannot be confirmed, the operation
-retains the service, binaries and journal and reports the error.
+Uninstall**. Before upgrading, disconnect active clients, stop the DirectHCI
+service, confirm Windows Bluetooth recovery, and exit the Control Panel
+(including its tray icon) and DirectHCI CLI tools. Setup refuses to open its
+wizard if a DirectHCI process or a non-stopped service is detected, and rechecks
+before recovery preflight and file replacement. A failed status query also
+blocks installation. Setup does not terminate processes or stop a running
+service for an upgrade. Keep DirectHCI closed throughout installation; these
+checks are checkpoints, not a system-wide lock against starting another process.
+
+Upgrade preflight still checks offline recovery before removing the stopped
+service registration; normal uninstall retains its stop/recover path. If
+recovery cannot be confirmed, removal is refused and recovery evidence is
+retained. A stopped service or absent journal alone is not proof that the
+Windows Bluetooth switch works; verify it before upgrading.
 
 The current uninstaller does not remove previously staged WinUSB packages,
 trusted public certificates or `%ProgramData%\DirectHCI` state. Their safe

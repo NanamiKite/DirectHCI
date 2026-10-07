@@ -28,6 +28,14 @@ For normal installation, see [installation](installation.md). The [failure model
 - **Check:** Service stop alone does **not** prove `WindowsOwned`. Inspect Device Manager and the panel/CLI diagnostics. An unknown USB device with “Device Descriptor Request Failed” may not expose the original PnP identity, so recovery can report `device_missing`.
 - **Safe next step:** Do not start another takeover. Run [offline recovery](installation.md#recovery) as administrator while the service is stopped. If it reports `device_missing`, `RecoveryRequired`, or cannot confirm the original controller, keep the journal and collect the exact result and Device Manager problem code. A hardware power cycle or reboot may change what Windows can enumerate, but is not a guaranteed fix; re-check the state afterward. Do not delete the journal or force a driver onto the unknown USB node.
 
+## System Bluetooth is unusable after abnormal termination
+
+**This is a known limitation that is not yet fixed.**
+
+- **Symptom:** Unexpected power loss, a blue screen, replacement of program files while the DirectHCI service is running, or abnormal process termination is followed by Windows Bluetooth staying off and refusing to turn on. Device Manager may still show a healthy controller, and the service may already be stopped.
+- **Check:** Preserve panel **Diagnostics**, the service state, the controller's current driver and Device Manager problem code. BTHUSB with problem code 0, or an absent journal, does not by itself prove that the Windows Bluetooth switch or connections work.
+- **Safe next step:** Do not attempt another takeover. If DirectHCI is still running, disconnect clients and stop the service normally; do not force-terminate processes or keep replacing files. Windows **Restart** may be needed to restore system Bluetooth; shutdown and power-on with Fast Startup are not equivalent. After restarting, check the Bluetooth switch and actual device usability. If the problem remains, preserve diagnostics and follow [the offline recovery guidance](installation.md#recovery). Restart is not a guaranteed fix; do not delete the journal or force a driver to hide the failure.
+
 ## Sharing a diagnostic report
 
 Record the DirectHCI build, Windows build, controller model/USB ID, the action that failed, the exact error, and the final observed driver/ownership state. Use the panel's **Diagnostics → Copy** where possible. Before sharing a CLI/SetupAPI log publicly, review instance IDs, serial numbers, machine/user paths and certificate identifiers. Keep raw logs private when in doubt. The [Windows hardware test plan](windows-test-plan.md) lists useful observations.

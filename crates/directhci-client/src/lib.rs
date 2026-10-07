@@ -276,12 +276,14 @@ mod platform {
     use std::collections::{HashMap, VecDeque};
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::sync::{Arc, Condvar, Mutex, TryLockError, mpsc};
     use std::thread::{self, JoinHandle};
+    use std::time::Instant;
 
     use directhci_core::*;
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_IO_PENDING, ERROR_SERVICE_ALREADY_RUNNING, HANDLE,
+        CloseHandle, ERROR_IO_PENDING, ERROR_SERVICE_ALREADY_RUNNING, HANDLE, WAIT_OBJECT_0,
+        WAIT_TIMEOUT,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_OVERLAPPED, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_READ,
@@ -294,12 +296,19 @@ mod platform {
         CloseServiceHandle, OpenSCManagerW, OpenServiceW, SC_MANAGER_CONNECT, SERVICE_START,
         StartServiceW,
     };
-    use windows::Win32::System::Threading::CreateEventW;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::{HRESULT, PCWSTR};
 
     use super::*;
 
     const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+    const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+    // The runtime's default HCI command budget is 5 seconds. Keep a margin
+    // for IPC delivery without stalling release behind a 60-second command.
+    const HCI_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+    // Separate from ordinary requests; allow the daemon's 45-second stop
+    // budget plus IPC margin. A timeout is NOT confirmed Windows restore.
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(50);
     const PREPARE_TIMEOUT: Duration = Duration::from_secs(180);
     // Keep the reader available for command/release responses during a burst.
     // Sustained non-consumption still fails explicitly at a bounded hard limit.
@@ -463,16 +472,13 @@ mod platform {
     }
 
     impl Connection {
-        fn request(&self, kind: IpcMessageKind, payload: Vec<u8>) -> Result<IpcFrame, ClientError> {
-            self.request_with_timeout(kind, payload, REQUEST_TIMEOUT)
-        }
-
         fn request_with_timeout(
             &self,
             kind: IpcMessageKind,
             payload: Vec<u8>,
             timeout: Duration,
         ) -> Result<IpcFrame, ClientError> {
+            let deadline = Instant::now() + timeout;
             if let Some(error) = self
                 .state
                 .terminal
@@ -493,42 +499,56 @@ mod platform {
                 .map_err(|_| protocol("pending map poisoned"))?
                 .insert(request_id, sender);
             let frame = IpcFrame::v1(kind, request_id, payload).map_err(frame_error)?;
-            let write_result = {
-                let _guard = self
-                    .writer_lock
-                    .lock()
-                    .map_err(|_| protocol("writer lock poisoned"))?;
+            let write_result = (|| {
+                let _guard = loop {
+                    match self.writer_lock.try_lock() {
+                        Ok(guard) => break guard,
+                        Err(TryLockError::Poisoned(_)) => {
+                            return Err(protocol("writer lock poisoned"));
+                        }
+                        Err(TryLockError::WouldBlock) => {
+                            if Instant::now() >= deadline {
+                                return Err(ClientError::Timeout);
+                            }
+                            thread::sleep(Duration::from_millis(1));
+                        }
+                    }
+                };
                 let mut writer = PipeWriter {
                     handle: &self.handle,
+                    deadline: Some(deadline),
                 };
                 write_ipc_frame(&mut writer, &frame).map_err(frame_error)
-            };
+            })();
             if let Err(error) = write_result {
                 self.state
                     .pending
                     .lock()
                     .ok()
                     .and_then(|mut map| map.remove(&request_id));
+                // A timed-out/partial frame cannot be resumed safely.
+                self.abort();
                 return Err(error);
             }
-            let response = match receiver.recv_timeout(timeout) {
-                Ok(response) => response?,
-                Err(error) => {
-                    self.state
-                        .pending
-                        .lock()
-                        .ok()
-                        .and_then(|mut map| map.remove(&request_id));
-                    let error = match error {
-                        mpsc::RecvTimeoutError::Timeout => ClientError::Timeout,
-                        mpsc::RecvTimeoutError::Disconnected => {
-                            ClientError::Disconnected("response channel closed".into())
-                        }
-                    };
-                    self.abort();
-                    return Err(error);
-                }
-            };
+            let response =
+                match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                    Ok(response) => response?,
+                    Err(error) => {
+                        self.state
+                            .pending
+                            .lock()
+                            .ok()
+                            .and_then(|mut map| map.remove(&request_id));
+                        let error = match error {
+                            mpsc::RecvTimeoutError::Timeout => ClientError::Timeout,
+                            mpsc::RecvTimeoutError::Disconnected => {
+                                ClientError::Disconnected("response channel closed".into())
+                            }
+                        };
+                        self.abort();
+                        return Err(error);
+                    }
+                };
             if response.kind == IpcMessageKind::Error {
                 let error: IpcErrorResponse =
                     decode_ipc_json(&response.payload).map_err(frame_error)?;
@@ -542,10 +562,10 @@ mod platform {
 
         fn control(&self, request: &ControlRequest) -> Result<ControlResponse, ClientError> {
             let payload = encode_ipc_json(request).map_err(frame_error)?;
-            let timeout = if matches!(request, ControlRequest::PrepareController { .. }) {
-                PREPARE_TIMEOUT
-            } else {
-                REQUEST_TIMEOUT
+            let timeout = match request {
+                ControlRequest::PrepareController { .. } => PREPARE_TIMEOUT,
+                ControlRequest::ReleaseSession { .. } => RELEASE_TIMEOUT,
+                _ => REQUEST_TIMEOUT,
             };
             let response =
                 self.request_with_timeout(IpcMessageKind::ControlRequest, payload, timeout)?;
@@ -591,6 +611,9 @@ mod platform {
                 }),
                 completed: Condvar::new(),
             });
+            // One budget for the entire ClientHello/ServerHello exchange,
+            // including partial frame reads. A silent server cannot renew it.
+            let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
             let hello = ClientHello {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 client_name,
@@ -603,11 +626,17 @@ mod platform {
             )
             .map_err(frame_error)?;
             {
-                let mut writer = PipeWriter { handle: &handle };
+                let mut writer = PipeWriter {
+                    handle: &handle,
+                    deadline: Some(deadline),
+                };
                 write_ipc_frame(&mut writer, &frame).map_err(frame_error)?;
             }
             let response = {
-                let mut reader = PipeReader { handle: &handle };
+                let mut reader = PipeReader {
+                    handle: &handle,
+                    deadline: Some(deadline),
+                };
                 read_ipc_frame(&mut reader)
                     .map_err(frame_error)?
                     .ok_or_else(|| {
@@ -794,9 +823,10 @@ mod platform {
             parameters: &[u8],
         ) -> Result<HciCommandResponse, ClientError> {
             self.ensure_active()?;
-            let response = self.connection.request(
+            let response = self.connection.request_with_timeout(
                 IpcMessageKind::HciCommand,
                 encode_hci_command(self.session_id, opcode, parameters).map_err(frame_error)?,
+                HCI_REQUEST_TIMEOUT,
             )?;
             if response.kind != IpcMessageKind::HciCommandResponse {
                 return Err(protocol("expected HciCommandResponse"));
@@ -812,9 +842,10 @@ mod platform {
         }
         pub(super) fn send_acl(&self, packet: &HciAclPacket) -> Result<(), ClientError> {
             self.ensure_active()?;
-            let response = self.connection.request(
+            let response = self.connection.request_with_timeout(
                 IpcMessageKind::AclTx,
                 encode_acl_packet(self.session_id, packet).map_err(frame_error)?,
+                HCI_REQUEST_TIMEOUT,
             )?;
             if response.kind != IpcMessageKind::ControlResponse {
                 return Err(protocol("expected ACL acknowledgement"));
@@ -867,6 +898,9 @@ mod platform {
             if self.released {
                 return Ok(None);
             }
+            // Only attempt release once, including on failure. In particular,
+            // Drop must not silently start another full release timeout.
+            self.released = true;
             let result = self.connection.control(&ControlRequest::ReleaseSession {
                 session_id: self.session_id,
             });
@@ -888,7 +922,6 @@ mod platform {
                         stream.packets.clear();
                         stream.bytes = 0;
                     }
-                    self.released = true;
                     *self
                         .connection
                         .active_session
@@ -896,7 +929,10 @@ mod platform {
                         .map_err(|_| protocol("session lock poisoned"))? = None;
                     Ok(controller)
                 }
-                Ok(_) => Err(protocol("unexpected release response")),
+                Ok(_) => {
+                    self.connection.abort();
+                    Err(protocol("unexpected release response"))
+                }
                 Err(error) => {
                     self.connection.abort();
                     Err(error)
@@ -921,7 +957,10 @@ mod platform {
 
     fn reader_loop(handle: Arc<HandleState>, state: Arc<ConnectionState>) {
         let terminal = loop {
-            let frame = match read_ipc_frame(&mut PipeReader { handle: &handle }) {
+            let frame = match read_ipc_frame(&mut PipeReader {
+                handle: &handle,
+                deadline: None,
+            }) {
                 Ok(Some(frame)) => frame,
                 Ok(None) => break ClientError::Disconnected("pipe closed".into()),
                 Err(error) => break frame_error(error),
@@ -971,26 +1010,32 @@ mod platform {
 
     struct PipeReader<'a> {
         handle: &'a HandleState,
+        deadline: Option<Instant>,
     }
     struct PipeWriter<'a> {
         handle: &'a HandleState,
+        deadline: Option<Instant>,
     }
     impl Read for PipeReader<'_> {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            pipe_read(self.handle, buffer)
+            pipe_read(self.handle, buffer, self.deadline)
         }
     }
     impl Write for PipeWriter<'_> {
         fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            pipe_write(self.handle, buffer)
+            pipe_write(self.handle, buffer, self.deadline)
         }
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
     }
 
-    fn pipe_read(handle: &HandleState, buffer: &mut [u8]) -> std::io::Result<usize> {
-        overlapped_io(handle, |overlapped, transferred| unsafe {
+    fn pipe_read(
+        handle: &HandleState,
+        buffer: &mut [u8],
+        deadline: Option<Instant>,
+    ) -> std::io::Result<usize> {
+        overlapped_io(handle, deadline, |overlapped, transferred| unsafe {
             ReadFile(
                 handle.handle,
                 Some(buffer),
@@ -999,8 +1044,12 @@ mod platform {
             )
         })
     }
-    fn pipe_write(handle: &HandleState, buffer: &[u8]) -> std::io::Result<usize> {
-        overlapped_io(handle, |overlapped, transferred| unsafe {
+    fn pipe_write(
+        handle: &HandleState,
+        buffer: &[u8],
+        deadline: Option<Instant>,
+    ) -> std::io::Result<usize> {
+        overlapped_io(handle, deadline, |overlapped, transferred| unsafe {
             WriteFile(
                 handle.handle,
                 Some(buffer),
@@ -1011,6 +1060,7 @@ mod platform {
     }
     fn overlapped_io(
         handle: &HandleState,
+        deadline: Option<Instant>,
         operation: impl FnOnce(*mut OVERLAPPED, *mut u32) -> windows::core::Result<()>,
     ) -> std::io::Result<usize> {
         // Hold the gate through submission only. close_once first blocks new
@@ -1025,8 +1075,11 @@ mod platform {
                 "pipe closed",
             ));
         }
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
         // SAFETY: event, OVERLAPPED and caller buffer live until completion.
-        let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.map_err(win_io)?;
+        let event = unsafe { CreateEventW(None, true, false, PCWSTR::null()) }.map_err(win_io)?;
         let mut overlapped = OVERLAPPED {
             hEvent: event,
             ..Default::default()
@@ -1037,10 +1090,10 @@ mod platform {
         drop(lifecycle);
         let result = match initial {
             Ok(()) => Ok(()),
-            Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => unsafe {
-                GetOverlappedResult(handle.handle, &overlapped, &mut transferred, true)
-            },
-            Err(error) => Err(error),
+            Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_PENDING.0) => {
+                wait_for_io(handle.handle, &overlapped, &mut transferred, deadline)
+            }
+            Err(error) => Err(win_io(error)),
         };
         let _ = unsafe { CloseHandle(event) };
         let mut lifecycle = handle
@@ -1052,8 +1105,34 @@ mod platform {
             handle.completed.notify_all();
         }
         drop(lifecycle);
-        result.map_err(win_io)?;
+        result?;
         Ok(transferred as usize)
+    }
+
+    fn wait_for_io(
+        handle: HANDLE,
+        overlapped: &OVERLAPPED,
+        transferred: &mut u32,
+        deadline: Option<Instant>,
+    ) -> std::io::Result<()> {
+        if let Some(deadline) = deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let wait_ms = remaining.as_millis().min((u32::MAX - 1) as u128) as u32;
+            let waited = unsafe { WaitForSingleObject(overlapped.hEvent, wait_ms) };
+            if waited != WAIT_OBJECT_0 {
+                let error = if waited == WAIT_TIMEOUT {
+                    std::io::ErrorKind::TimedOut.into()
+                } else {
+                    std::io::Error::last_os_error()
+                };
+                // The deadline ends waiting for a server reply, not the
+                // kernel's ownership of OVERLAPPED/event/buffer storage.
+                let _ = unsafe { CancelIoEx(handle, Some(overlapped)) };
+                let _ = unsafe { GetOverlappedResult(handle, overlapped, transferred, true) };
+                return Err(error);
+            }
+        }
+        unsafe { GetOverlappedResult(handle, overlapped, transferred, true) }.map_err(win_io)
     }
 
     fn open_pipe() -> Result<HANDLE, ClientError> {
@@ -1088,7 +1167,12 @@ mod platform {
         std::io::Error::other(error.to_string())
     }
     fn frame_error(error: IpcFrameError) -> ClientError {
-        ClientError::Protocol(error.to_string())
+        match error {
+            IpcFrameError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+                ClientError::Timeout
+            }
+            error => ClientError::Protocol(error.to_string()),
+        }
     }
     fn protocol(message: &str) -> ClientError {
         ClientError::Protocol(message.into())

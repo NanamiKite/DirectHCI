@@ -77,6 +77,12 @@ Later BLE library changes have had reported GATT timeout/disconnection
 regressions. The current receive-order/lifecycle fixes require Windows-host
 regression acceptance; earlier working runs are not certification of this build.
 
+Recovery after abnormal termination remains a known, unresolved limitation.
+Unexpected power loss, a blue screen, replacement of files while the service
+is running, or abnormal process termination may leave system Bluetooth unusable.
+Windows **Restart** may be needed, but is not a guaranteed fix; see
+[safe recovery guidance](docs/troubleshooting.md#system-bluetooth-is-unusable-after-abnormal-termination).
+
 ## Architecture and development
 
 ```text

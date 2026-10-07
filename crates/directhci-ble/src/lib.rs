@@ -19,7 +19,7 @@ use bt_hci::param::{AddrKind, BdAddr, LeAdvEventKind};
 use directhci_bt_hci::DirectHciController;
 use directhci_client::DirectHciClient;
 use embassy_time::Duration as EmbassyDuration;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use trouble_host::advertise::AdStructure;
 use trouble_host::prelude::*;
 
@@ -149,6 +149,11 @@ impl FromStr for BleUuid {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let compact = value.replace('-', "");
+        if !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(BleError::InvalidInput(
+                "UUID must be 4, 8, or 32 hexadecimal digits".into(),
+            ));
+        }
         match compact.len() {
             4 => u16::from_str_radix(&compact, 16)
                 .map(Self::Uuid16)
@@ -332,6 +337,33 @@ struct WorkerHandle {
     terminal: Arc<Mutex<Option<BleError>>>,
     thread: Option<JoinHandle<()>>,
     shutdown_requested: bool,
+    completed: watch::Receiver<Option<Result<(), BleError>>>,
+}
+
+/// Observes the end of BLE/IPC cleanup independently of a shutdown future.
+/// A timeout only stops waiting; retain this handle to await the real result.
+#[derive(Clone)]
+pub struct BleShutdownCompletion {
+    completed: watch::Receiver<Option<Result<(), BleError>>>,
+}
+
+impl BleShutdownCompletion {
+    /// `None` means cleanup is still running, not that restore succeeded.
+    pub fn result(&self) -> Option<Result<(), BleError>> {
+        self.completed.borrow().clone()
+    }
+
+    /// Cancellation-safe: this handle can be waited on again after a timeout.
+    pub async fn wait(&mut self) -> Result<(), BleError> {
+        loop {
+            if let Some(result) = self.result() {
+                return result;
+            }
+            if self.completed.changed().await.is_err() {
+                return self.result().unwrap_or(Err(BleError::WorkerPanicked));
+            }
+        }
+    }
 }
 
 pub struct DirectHciBleCentral {
@@ -342,21 +374,28 @@ impl DirectHciBleCentral {
     pub async fn connect(config: BleCentralConfig) -> Result<Self, BleError> {
         let (request_tx, request_rx) = mpsc::channel(REQUEST_DEPTH);
         let (ready_tx, ready_rx) = oneshot::channel();
+        let (completed_tx, completed_rx) = watch::channel(None);
         let terminal = Arc::new(Mutex::new(None));
         let worker_terminal = Arc::clone(&terminal);
         let thread = thread::Builder::new()
             .name("directhci-ble".into())
-            .spawn(move || worker_thread(config, request_rx, ready_tx, worker_terminal))
+            .spawn(move || {
+                worker_thread(config, request_rx, ready_tx, worker_terminal, completed_tx)
+            })
             .map_err(|error| BleError::Runtime(error.to_string()))?;
-        ready_rx.await.map_err(|_| BleError::WorkerStopped)??;
-        Ok(Self {
+        // Keep ownership before awaiting readiness, so cancelling connect()
+        // also requests shutdown rather than simply detaching its worker.
+        let central = Self {
             worker: WorkerHandle {
                 requests: request_tx,
                 terminal,
                 thread: Some(thread),
                 shutdown_requested: false,
+                completed: completed_rx,
             },
-        })
+        };
+        ready_rx.await.map_err(|_| BleError::WorkerStopped)??;
+        Ok(central)
     }
 
     pub async fn scan(&self, duration: Duration) -> Result<Vec<ScanResult>, BleError> {
@@ -381,6 +420,12 @@ impl DirectHciBleCentral {
 
     pub async fn shutdown(mut self) -> Result<(), BleError> {
         shutdown_worker(&mut self.worker).await
+    }
+
+    pub fn shutdown_completion(&self) -> BleShutdownCompletion {
+        BleShutdownCompletion {
+            completed: self.worker.completed.clone(),
+        }
     }
 }
 
@@ -500,6 +545,13 @@ impl BleConnection {
         central.shutdown().await
     }
 
+    pub fn shutdown_completion(&self) -> BleShutdownCompletion {
+        self.central
+            .as_ref()
+            .expect("live connection")
+            .shutdown_completion()
+    }
+
     fn worker(&self) -> &WorkerHandle {
         &self.central.as_ref().expect("live connection").worker
     }
@@ -566,29 +618,33 @@ async fn request<T>(
 }
 
 async fn shutdown_worker(worker: &mut WorkerHandle) -> Result<(), BleError> {
-    if worker.shutdown_requested {
-        return terminal_error(&worker.terminal).map_or(Ok(()), Err);
+    if !worker.shutdown_requested {
+        // Do not mark it sent before the await: cancellation while enqueuing
+        // must still allow Drop to request best-effort shutdown.
+        let _ = worker
+            .requests
+            .send(WorkerRequest::Shutdown { reply: None })
+            .await;
+        worker.shutdown_requested = true;
     }
-    worker.shutdown_requested = true;
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let sent = worker
-        .requests
-        .send(WorkerRequest::Shutdown {
-            reply: Some(reply_tx),
-        })
-        .await
-        .is_ok();
-    let result = if sent {
-        reply_rx
-            .await
-            .map_err(|_| terminal_error(&worker.terminal).unwrap_or(BleError::WorkerStopped))?
-    } else {
-        terminal_error(&worker.terminal).map_or(Err(BleError::WorkerStopped), Err)
-    };
+    let result = BleShutdownCompletion {
+        completed: worker.completed.clone(),
+    }
+    .wait()
+    .await;
     if let Some(thread) = worker.thread.take() {
-        if thread.join().is_err() {
-            return Err(BleError::WorkerPanicked);
-        }
+        // Completion is sent after owned resources are dropped, but OS/TLS
+        // exit bookkeeping can still remain. Never join on an async thread,
+        // and do not require the caller to own a Tokio runtime.
+        let (joined_tx, joined_rx) = oneshot::channel();
+        thread::Builder::new()
+            .name("directhci-ble-reap".into())
+            .spawn(move || {
+                let result = thread.join().map_err(|_| BleError::WorkerPanicked);
+                let _ = joined_tx.send(result);
+            })
+            .map_err(|error| BleError::Runtime(format!("start shutdown reaper: {error}")))?;
+        joined_rx.await.map_err(|_| BleError::WorkerPanicked)??;
     }
     result
 }
@@ -671,29 +727,44 @@ fn worker_thread(
     requests: mpsc::Receiver<WorkerRequest>,
     ready: oneshot::Sender<Result<(), BleError>>,
     terminal: Arc<Mutex<Option<BleError>>>,
+    completed: watch::Sender<Option<Result<(), BleError>>>,
 ) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .map_err(|error| BleError::Runtime(error.to_string()));
-    let result = match runtime {
-        Ok(runtime) => runtime.block_on(worker_main(config, requests, ready)),
-        Err(error) => {
-            let _ = ready.send(Err(error.clone()));
-            Err(error)
+    let mut shutdown_reply = None;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .map_err(|error| BleError::Runtime(error.to_string()));
+        match runtime {
+            Ok(runtime) => {
+                runtime.block_on(worker_main(config, requests, ready, &mut shutdown_reply))
+            }
+            Err(error) => {
+                let _ = ready.send(Err(error.clone()));
+                Err(error)
+            }
         }
-    };
-    if let Err(error) = result {
+        // worker_main's stack, client/IPC, and this runtime are dropped here,
+        // before any completion notification. This includes failed startup.
+    }))
+    .unwrap_or(Err(BleError::WorkerPanicked));
+    if let Err(error) = &result {
         if let Ok(mut value) = terminal.lock() {
-            *value = Some(error);
+            *value = Some(error.clone());
         }
     }
+    drop(terminal);
+    if let Some(reply) = shutdown_reply {
+        let _ = reply.send(result.clone());
+    }
+    completed.send_replace(Some(result));
 }
 
 async fn worker_main(
     config: BleCentralConfig,
     requests: mpsc::Receiver<WorkerRequest>,
     ready: oneshot::Sender<Result<(), BleError>>,
+    shutdown_reply: &mut Option<oneshot::Sender<Result<(), BleError>>>,
 ) -> Result<(), BleError> {
     let runtime_client = match DirectHciClient::connect(config.client_name, config.client_version) {
         Ok(client) => client,
@@ -769,9 +840,7 @@ async fn worker_main(
         .await
         .map_err(|error| BleError::Runtime(format!("DirectHCI release failed: {error}")));
     let result = combine_result(exit.primary, cleanup.err());
-    if let Some(reply) = exit.reply {
-        let _ = reply.send(result.clone());
-    }
+    *shutdown_reply = exit.reply;
     result
 }
 
