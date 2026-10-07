@@ -32,7 +32,7 @@ use windows::Win32::System::Threading::{
 };
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
-use crate::runtime::{DirectHciRuntime, Outbound};
+use crate::runtime::{DirectHciRuntime, Outbound, SESSION_STOP_TIMEOUT};
 
 const OUTBOUND_DEPTH: usize = 128;
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
@@ -128,7 +128,20 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
         Ok(())
     })();
     // Never let an accept/lock/spawn failure bypass controller restoration.
-    let shutdown_result = runtime.shutdown();
+    let deadline = Instant::now() + SESSION_STOP_TIMEOUT;
+    let mut shutdown_result = runtime.shutdown(deadline);
+    let mut timeout_reported = false;
+    if Instant::now() >= deadline {
+        let message = shutdown_result
+            .as_ref()
+            .err()
+            .cloned()
+            .unwrap_or_else(|| "service shutdown exceeded 45 seconds".into());
+        eprintln!("directhcid: {message}");
+        crate::service::report_failure(&message);
+        timeout_reported = true;
+        shutdown_result = Err(message);
+    }
     {
         // Poison is an accept-loop error, not permission to strand live pipe
         // operations. Recover the registry only to cancel/join, never admit.
@@ -139,8 +152,26 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
             handle.request_cancel();
         }
     }
-    for worker in workers {
-        let _ = worker.join();
+    // Never enter an unbounded join before checking the whole-stop deadline.
+    // CancelIoEx cannot interrupt synchronous PnP/libwdi work. At the deadline
+    // report failure NOW, but keep its owners alive until the work returns:
+    // detaching/terminating them and reporting Stopped could strand a device.
+    while !workers.is_empty() || runtime.shutdown_pending() {
+        reap_finished(&mut workers);
+        if workers.is_empty() && !runtime.shutdown_pending() {
+            break;
+        }
+        if !timeout_reported && Instant::now() >= deadline {
+            let message = format!(
+                "service shutdown exceeded 45 seconds with {} IPC workers still running; safe I/O/PnP cleanup is pending; Windows restore is not certified",
+                workers.len()
+            );
+            eprintln!("directhcid: {message}");
+            crate::service::report_failure(&message);
+            shutdown_result = Err(message);
+            timeout_reported = true;
+        }
+        thread::sleep(Duration::from_millis(10));
     }
     match (accept_result, shutdown_result) {
         (Err(primary), Err(cleanup)) => Err(format!("{primary}; shutdown: {cleanup}")),

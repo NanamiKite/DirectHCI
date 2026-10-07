@@ -90,7 +90,7 @@ impl JournalStore {
             });
         }
         if self.secure_program_data {
-            platform::reject_reparse(&path).map_err(|message| JournalError::UnsafePath {
+            platform::validate_secure_file(&path).map_err(|message| JournalError::UnsafePath {
                 path: path.clone(),
                 message,
             })?;
@@ -130,18 +130,18 @@ impl JournalStore {
             });
         }
         if journal.created_unix_ms > journal.updated_unix_ms {
-            return Err(JournalError::Corrupt {
-                path,
-                message: "created timestamp is newer than updated timestamp".into(),
-            });
+            eprintln!(
+                "directhci: journal clock anomaly at {}: updated timestamp precedes creation; recovery still requires identity and device validation",
+                path.display()
+            );
         }
         if journal.updated_unix_ms
             > now.saturating_add(Duration::from_secs(5 * 60).as_millis() as u64)
         {
-            return Err(JournalError::Corrupt {
-                path,
-                message: "updated timestamp is unreasonably far in the future".into(),
-            });
+            eprintln!(
+                "directhci: journal clock anomaly at {}: updated timestamp is ahead of the wall clock; recovery still requires identity and device validation",
+                path.display()
+            );
         }
         let age_ms = now.saturating_sub(journal.updated_unix_ms);
         Ok(JournalLoad::Present {
@@ -212,12 +212,12 @@ impl JournalStore {
         let path = self.path();
         if self.secure_program_data {
             match fs::symlink_metadata(&path) {
-                Ok(_) => {
-                    platform::reject_reparse(&path).map_err(|message| JournalError::UnsafePath {
+                Ok(_) => platform::validate_secure_file(&path).map_err(|message| {
+                    JournalError::UnsafePath {
                         path: path.clone(),
                         message,
-                    })?
-                }
+                    }
+                })?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => {
                     return Err(JournalError::io("inspect journal metadata", &path, error));
@@ -419,8 +419,8 @@ mod platform {
         crate::security::validate_secure_journal_directory(path)
     }
 
-    pub(super) fn reject_reparse(path: &Path) -> Result<(), String> {
-        crate::security::reject_reparse(path)
+    pub(super) fn validate_secure_file(path: &Path) -> Result<(), String> {
+        crate::security::validate_secure_data_file(path)
     }
 
     pub(super) fn program_data_directory() -> Result<PathBuf, JournalError> {
@@ -504,7 +504,7 @@ mod platform {
     pub(super) fn validate_secure_directory(_path: &Path) -> Result<(), String> {
         Ok(())
     }
-    pub(super) fn reject_reparse(_path: &Path) -> Result<(), String> {
+    pub(super) fn validate_secure_file(_path: &Path) -> Result<(), String> {
         Ok(())
     }
 

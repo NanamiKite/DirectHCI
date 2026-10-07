@@ -17,7 +17,7 @@ use directhci_windows::{
 const CONTROLLER_REQUEST_DEPTH: usize = 32;
 const RX_POLL: Duration = Duration::from_millis(10);
 const RX_BATCH: usize = 64;
-const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(45);
+pub(crate) const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub type Outbound = mpsc::SyncSender<IpcFrame>;
 pub type DisconnectOwner = Arc<dyn Fn() + Send + Sync>;
@@ -459,15 +459,33 @@ impl DirectHciRuntime {
         let live = match acquire_runtime_controller_session(controller_id, &client_name) {
             Ok(live) => live,
             Err(report) => {
-                self.finish_failed_acquire(
-                    connection_id,
-                    report.status,
-                    report.recovery_error.or(report.primary_error),
-                );
-                return Err((
-                    IpcErrorCode::Ownership,
-                    "temporary takeover failed; inspect runtime status and M1 journal".into(),
-                ));
+                let stage = if !report.preflight.safe_to_execute {
+                    "preflight"
+                } else if report.rebind.is_none() {
+                    "lease/journal preparation"
+                } else if report
+                    .rebind
+                    .as_ref()
+                    .is_some_and(|step| !step.api_succeeded)
+                {
+                    "driver rebind"
+                } else if report.directhci_state.is_none() {
+                    "post-rebind observation"
+                } else if report.winusb_readiness.as_ref().is_none_or(|readiness| {
+                    readiness.status != directhci_windows::DedicatedWinUsbReadinessStatus::Ready
+                }) {
+                    "WinUSB validation/journal"
+                } else {
+                    "Raw HCI initialization/journal"
+                };
+                // Preserve both errors, blockers and restore outcome even when
+                // no journal was created or Windows was successfully restored.
+                let details = serde_json::to_string(&report)
+                    .unwrap_or_else(|error| format!("encode takeover report: {error}; {report:?}"));
+                let message = format!("temporary takeover failed at {stage}: {details}");
+                eprintln!("directhcid: {message}");
+                self.finish_failed_acquire(connection_id, report.status, Some(message.clone()));
+                return Err((IpcErrorCode::Ownership, message));
             }
         };
         let controller = live.controller().clone();
@@ -578,7 +596,7 @@ impl DirectHciRuntime {
         }
     }
 
-    pub fn shutdown(&self) -> Result<(), String> {
+    pub fn shutdown(&self, deadline: Instant) -> Result<(), String> {
         let sender = {
             // Admission and shutdown use the SAME lock: after this point no
             // acquire or prepare may become active, even after an earlier
@@ -596,7 +614,6 @@ impl DirectHciRuntime {
         if let Some(sender) = sender {
             let _ = sender.try_send(ControllerRequest::Stop);
         }
-        let deadline = std::time::Instant::now() + SESSION_STOP_TIMEOUT;
         while std::time::Instant::now() < deadline {
             {
                 let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -615,6 +632,11 @@ impl DirectHciRuntime {
             thread::sleep(Duration::from_millis(50));
         }
         Err("shutdown recovery exceeded 45 seconds; durable M1 journal is retained; Windows restore was not confirmed".into())
+    }
+
+    pub(crate) fn shutdown_pending(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.active.is_some() || state.maintenance
     }
 
     fn session_sender(
@@ -707,7 +729,10 @@ fn controller_worker(
                 request_id,
                 opcode,
                 parameters,
-            }) => match live.raw_hci().send_command(opcode, &parameters) {
+            }) => match live
+                .raw_hci()
+                .send_command_with_cancel(opcode, &parameters, &cancel)
+            {
                 Ok(response) => {
                     let frame = IpcFrame::v1(
                         IpcMessageKind::HciCommandResponse,
@@ -734,7 +759,7 @@ fn controller_worker(
                 Err(_) => {}
             },
             Ok(ControllerRequest::Acl { request_id, packet }) => {
-                match live.raw_hci().send_acl(&packet) {
+                match live.raw_hci().send_acl_with_cancel(&packet, &cancel) {
                     Ok(()) => {
                         if send_json(
                             &outbound,
@@ -816,6 +841,11 @@ fn controller_worker(
         .clone()
         .or(fatal)
         .or(report.primary_error.clone());
+    // Commit the lease's final state before the independent pipe writer can
+    // deliver Released and allow the client to immediately acquire again.
+    if let Some(runtime) = runtime.upgrade() {
+        runtime.worker_finished(session_id, recovery_required, message.clone());
+    }
     if let Some(request_id) = release_request {
         if recovery_required {
             let _ = send_error(
@@ -837,9 +867,6 @@ fn controller_worker(
                 },
             );
         }
-    }
-    if let Some(runtime) = runtime.upgrade() {
-        runtime.worker_finished(session_id, recovery_required, message);
     }
     // An unsolicited worker exit has no ReleaseSession response. Wake the
     // owning pipe so event/ACL receivers observe disconnection, not timeouts.

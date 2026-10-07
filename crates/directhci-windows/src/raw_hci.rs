@@ -5,6 +5,7 @@
 //! workers before releasing the WinUSB/file handles.
 
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use directhci_core::{
@@ -205,11 +206,30 @@ impl RawHciSession {
         opcode: u16,
         parameters: &[u8],
     ) -> Result<HciCommandResponse, RawHciError> {
-        self.inner.send_command(opcode, parameters)
+        self.inner.send_command(opcode, parameters, None)
     }
 
     pub fn send_acl(&self, packet: &HciAclPacket) -> Result<(), RawHciError> {
-        self.inner.send_acl(packet)
+        self.inner.send_acl(packet, None)
+    }
+
+    /// Allows the runtime lease owner to interrupt pending USB transmission and
+    /// response waiting. Cancellation still drains kernel I/O before returning.
+    pub fn send_command_with_cancel(
+        &self,
+        opcode: u16,
+        parameters: &[u8],
+        cancel: &AtomicBool,
+    ) -> Result<HciCommandResponse, RawHciError> {
+        self.inner.send_command(opcode, parameters, Some(cancel))
+    }
+
+    pub fn send_acl_with_cancel(
+        &self,
+        packet: &HciAclPacket,
+        cancel: &AtomicBool,
+    ) -> Result<(), RawHciError> {
+        self.inner.send_acl(packet, Some(cancel))
     }
 
     pub fn receive_event(&self, timeout: Duration) -> Result<Option<HciEventPacket>, RawHciError> {
@@ -257,10 +277,15 @@ mod platform {
             &self,
             _: u16,
             _: &[u8],
+            _: Option<&AtomicBool>,
         ) -> Result<HciCommandResponse, RawHciError> {
             Err(RawHciError::UnsupportedPlatform)
         }
-        pub(super) fn send_acl(&self, _: &HciAclPacket) -> Result<(), RawHciError> {
+        pub(super) fn send_acl(
+            &self,
+            _: &HciAclPacket,
+            _: Option<&AtomicBool>,
+        ) -> Result<(), RawHciError> {
             Err(RawHciError::UnsupportedPlatform)
         }
         pub(super) fn receive_event(
@@ -298,7 +323,7 @@ mod platform {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Condvar, Mutex, mpsc};
     use std::thread::{self, JoinHandle};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     use directhci_core::HciPacketError;
     use windows::Win32::Devices::Usb::{
@@ -307,15 +332,16 @@ mod platform {
         WinUsb_WritePipe,
     };
     use windows::Win32::Foundation::{
-        CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_IO_PENDING, ERROR_NO_SUCH_DEVICE,
-        ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, GENERIC_READ, GENERIC_WRITE, HANDLE,
+        CloseHandle, ERROR_DEVICE_NOT_CONNECTED, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
+        ERROR_NO_SUCH_DEVICE, ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ,
         FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::IO::{CancelIoEx, OVERLAPPED};
-    use windows::Win32::System::Threading::CreateEventW;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
     use windows::core::{HRESULT, PCWSTR};
 
     use super::*;
@@ -324,6 +350,13 @@ mod platform {
     const ACL_BUFFER_SIZE: usize = 4 + u16::MAX as usize;
     const RX_PACKET_LIMIT: usize = 4096;
     const RX_BYTE_LIMIT: usize = 16 * 1024 * 1024;
+    const CANCEL_POLL: Duration = Duration::from_millis(10);
+
+    struct TransmitWait<'a> {
+        deadline: Instant,
+        cancel: Option<&'a AtomicBool>,
+        timeout: RawHciError,
+    }
 
     #[derive(Default)]
     struct ReceiveState {
@@ -702,13 +735,20 @@ mod platform {
             &self,
             opcode: u16,
             parameters: &[u8],
+            cancel: Option<&AtomicBool>,
         ) -> Result<HciCommandResponse, RawHciError> {
-            self.ensure_operational()?;
+            self.ensure_operational(cancel)?;
             let _guard = self
                 .command_lock
                 .lock()
                 .map_err(|_| internal("command lock poisoned"))?;
-            self.ensure_operational()?;
+            self.ensure_operational(cancel)?;
+            let timeout = self.options.effective_command_timeout();
+            let deadline = Instant::now() + timeout;
+            let timeout_error = RawHciError::CommandTimeout {
+                opcode,
+                timeout_ms: timeout.as_millis().min(u64::MAX as u128) as u64,
+            };
             let mut bytes = HciCommandPacket::new(opcode, parameters)
                 .encode()
                 .map_err(packet_error)?;
@@ -726,7 +766,16 @@ mod platform {
             }
 
             let io = self.io.as_ref().ok_or(RawHciError::Shutdown)?;
-            if let Err(error) = control_transfer(io, &mut bytes, &self.state) {
+            if let Err(error) = control_transfer(
+                io,
+                &mut bytes,
+                &self.state,
+                TransmitWait {
+                    deadline,
+                    cancel,
+                    timeout: timeout_error.clone(),
+                },
+            ) {
                 clear_pending(&self.state, opcode);
                 self.state.fail(error.clone());
                 io.cancel_all();
@@ -739,49 +788,69 @@ mod platform {
                 &bytes,
             );
 
-            match receiver.recv_timeout(self.options.effective_command_timeout()) {
-                Ok(Ok(HciCommandResponse::Status {
-                    status,
-                    command_opcode,
-                    ..
-                })) if status != 0 => Err(RawHciError::CommandRejected {
-                    opcode: command_opcode,
-                    status,
-                }),
-                Ok(result) => result,
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    clear_pending(&self.state, opcode);
-                    let error = RawHciError::CommandTimeout {
-                        opcode,
-                        timeout_ms: self
-                            .options
-                            .effective_command_timeout()
-                            .as_millis()
-                            .min(u64::MAX as u128) as u64,
-                    };
+            loop {
+                if let Err(error) = self.ensure_operational(cancel) {
                     self.state.fail(error.clone());
                     io.cancel_all();
-                    Err(error)
+                    return Err(error);
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => Err(self
-                    .state
-                    .terminal_error()
-                    .unwrap_or_else(|| RawHciError::EventRead {
-                        message: "event worker stopped before command response".into(),
-                    })),
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match receiver.recv_timeout(remaining.min(CANCEL_POLL)) {
+                    Ok(Ok(HciCommandResponse::Status {
+                        status,
+                        command_opcode,
+                        ..
+                    })) if status != 0 => {
+                        return Err(RawHciError::CommandRejected {
+                            opcode: command_opcode,
+                            status,
+                        });
+                    }
+                    Ok(result) => return result,
+                    Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        clear_pending(&self.state, opcode);
+                        self.state.fail(timeout_error.clone());
+                        io.cancel_all();
+                        return Err(timeout_error);
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        return Err(self.state.terminal_error().unwrap_or_else(|| {
+                            RawHciError::EventRead {
+                                message: "event worker stopped before command response".into(),
+                            }
+                        }));
+                    }
+                }
             }
         }
 
-        pub(super) fn send_acl(&self, packet: &HciAclPacket) -> Result<(), RawHciError> {
-            self.ensure_operational()?;
+        pub(super) fn send_acl(
+            &self,
+            packet: &HciAclPacket,
+            cancel: Option<&AtomicBool>,
+        ) -> Result<(), RawHciError> {
+            self.ensure_operational(cancel)?;
             let _guard = self
                 .acl_tx_lock
                 .lock()
                 .map_err(|_| internal("ACL TX lock poisoned"))?;
-            self.ensure_operational()?;
+            self.ensure_operational(cancel)?;
             let bytes = packet.encode().map_err(packet_error)?;
             let io = self.io.as_ref().ok_or(RawHciError::Shutdown)?;
-            if let Err(error) = pipe_write(io, self.transport.acl_out_pipe, &bytes, &self.state) {
+            if let Err(error) = pipe_write(
+                io,
+                self.transport.acl_out_pipe,
+                &bytes,
+                &self.state,
+                TransmitWait {
+                    deadline: Instant::now() + self.options.effective_command_timeout(),
+                    cancel,
+                    timeout: RawHciError::AclWrite {
+                        message: "USB transmission deadline exceeded".into(),
+                    },
+                },
+            ) {
                 self.state.fail(error.clone());
                 io.cancel_all();
                 return Err(error);
@@ -834,12 +903,13 @@ mod platform {
             self.state.terminal_error()
         }
 
-        fn ensure_operational(&self) -> Result<(), RawHciError> {
+        fn ensure_operational(&self, cancel: Option<&AtomicBool>) -> Result<(), RawHciError> {
             if let Some(error) = self.state.terminal_error() {
                 return Err(error);
             }
             if !self.state.accepting_tx.load(Ordering::Acquire)
                 || self.state.shutdown.load(Ordering::Acquire)
+                || cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
             {
                 return Err(RawHciError::Shutdown);
             }
@@ -1143,6 +1213,7 @@ mod platform {
         pipe: u8,
         bytes: &[u8],
         state: &SharedState,
+        wait: TransmitWait<'_>,
     ) -> Result<(), RawHciError> {
         let event = EventHandle::new().map_err(|error| RawHciError::AclWrite {
             message: error.to_string(),
@@ -1154,22 +1225,27 @@ mod platform {
         let mut transferred = 0u32;
         // SAFETY: bytes, OVERLAPPED, and event stay alive until completion is
         // confirmed below.
-        let result = unsafe {
-            WinUsb_WritePipe(
-                io.interface,
-                pipe,
-                bytes,
-                Some(&mut transferred),
-                Some(&overlapped),
-            )
+        let result = {
+            let _submission = io.submission.lock().unwrap_or_else(|e| e.into_inner());
+            check_transmit(state, &wait)?;
+            unsafe {
+                WinUsb_WritePipe(
+                    io.interface,
+                    pipe,
+                    bytes,
+                    Some(&mut transferred),
+                    Some(&overlapped),
+                )
+            }
         };
-        complete_overlapped(
+        complete_transmit(
             io,
             &overlapped,
             &mut transferred,
             result,
             "ACL write",
             state,
+            wait,
         )
         .map_err(|error| match error {
             RawHciError::DeviceRemoved { .. } | RawHciError::Shutdown => error,
@@ -1189,6 +1265,7 @@ mod platform {
         io: &DeviceIo,
         bytes: &mut [u8],
         state: &SharedState,
+        wait: TransmitWait<'_>,
     ) -> Result<(), RawHciError> {
         let length = u16::try_from(bytes.len()).map_err(|_| RawHciError::UsbControlTransfer {
             message: "HCI command exceeds USB control transfer length".into(),
@@ -1210,25 +1287,32 @@ mod platform {
         let mut transferred = 0u32;
         // SAFETY: the complete command buffer, OVERLAPPED, and event stay alive
         // through completion; setup.Length exactly matches the slice.
-        let result = unsafe {
-            WinUsb_ControlTransfer(
-                io.interface,
-                setup,
-                Some(bytes),
-                Some(&mut transferred),
-                Some(&overlapped),
-            )
+        let result = {
+            let _submission = io.submission.lock().unwrap_or_else(|e| e.into_inner());
+            check_transmit(state, &wait)?;
+            unsafe {
+                WinUsb_ControlTransfer(
+                    io.interface,
+                    setup,
+                    Some(bytes),
+                    Some(&mut transferred),
+                    Some(&overlapped),
+                )
+            }
         };
-        complete_overlapped(
+        complete_transmit(
             io,
             &overlapped,
             &mut transferred,
             result,
             "control transfer",
             state,
+            wait,
         )
         .map_err(|error| match error {
-            RawHciError::DeviceRemoved { .. } | RawHciError::Shutdown => error,
+            RawHciError::DeviceRemoved { .. }
+            | RawHciError::Shutdown
+            | RawHciError::CommandTimeout { .. } => error,
             other => RawHciError::UsbControlTransfer {
                 message: other.to_string(),
             },
@@ -1239,6 +1323,78 @@ mod platform {
             });
         }
         Ok(())
+    }
+
+    fn check_transmit(state: &SharedState, wait: &TransmitWait<'_>) -> Result<(), RawHciError> {
+        if let Some(error) = state.terminal_error() {
+            return Err(error);
+        }
+        if state.shutdown.load(Ordering::Acquire)
+            || !state.accepting_tx.load(Ordering::Acquire)
+            || wait.cancel.is_some_and(|flag| flag.load(Ordering::Acquire))
+        {
+            return Err(RawHciError::Shutdown);
+        }
+        if Instant::now() >= wait.deadline {
+            return Err(wait.timeout.clone());
+        }
+        Ok(())
+    }
+
+    fn complete_transmit(
+        io: &DeviceIo,
+        overlapped: &OVERLAPPED,
+        transferred: &mut u32,
+        initial: windows::core::Result<()>,
+        operation: &str,
+        state: &SharedState,
+        wait: TransmitWait<'_>,
+    ) -> Result<(), RawHciError> {
+        match initial {
+            Ok(()) => return Ok(()),
+            Err(error) if is_io_pending(&error) => {}
+            Err(error) => return Err(windows_io_error(operation, error, state)),
+        }
+        loop {
+            // Non-blocking completion queries also work after an auto-reset
+            // event has been consumed by WaitForSingleObject.
+            match unsafe {
+                WinUsb_GetOverlappedResult(io.interface, overlapped, transferred, false)
+            } {
+                Ok(()) => return Ok(()),
+                Err(error) if error.code() == HRESULT::from_win32(ERROR_IO_INCOMPLETE.0) => {}
+                Err(error) => return Err(windows_io_error(operation, error, state)),
+            }
+            let reason = match check_transmit(state, &wait) {
+                Err(error) => error,
+                Ok(()) => {
+                    let remaining = wait.deadline.saturating_duration_since(Instant::now());
+                    let millis = remaining.min(CANCEL_POLL).as_millis().max(1) as u32;
+                    match unsafe { WaitForSingleObject(overlapped.hEvent, millis) } {
+                        WAIT_OBJECT_0 | WAIT_TIMEOUT => continue,
+                        _ => {
+                            windows_io_error(operation, windows::core::Error::from_thread(), state)
+                        }
+                    }
+                }
+            };
+            {
+                // Close admission under the SAME gate as every submission.
+                let _submission = io.submission.lock().unwrap_or_else(|e| e.into_inner());
+                state.fail(reason.clone());
+                if let Err(error) = unsafe { CancelIoEx(io.file, Some(overlapped)) }
+                    && error.code() != HRESULT::from_win32(ERROR_NOT_FOUND.0)
+                {
+                    eprintln!("directhci: cancel pending {operation}: {error}");
+                }
+            }
+            // CancelIoEx is only a request. Even on timeout, keep buffer,
+            // OVERLAPPED, event and handles alive until terminal completion.
+            // A broken kernel driver may still delay this safety drain.
+            let _ =
+                unsafe { WinUsb_GetOverlappedResult(io.interface, overlapped, transferred, true) };
+            return Err(reason);
+        }
     }
 
     fn complete_overlapped(

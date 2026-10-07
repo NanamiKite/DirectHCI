@@ -232,8 +232,13 @@ the basic round trip succeeds.
 The main service is demand-start. Its installer registers an independent
 SYSTEM **DirectHCI Boot Recovery** task, so boot recovery does not depend on
 the panel or consumer starting the service. Normal OS shutdown uses SCM
-`PRESHUTDOWN` with a configured 90-second budget; the runtime has a 45-second
-stop deadline. Failed/expired recovery is not reported as a successful stop.
+`PRESHUTDOWN` with a configured 90-second budget. Runtime shutdown and IPC worker
+draining share a 45-second graceful-stop deadline. Exceeding it is reported to
+the Application event log immediately and remains a failed stop outcome even
+if cleanup subsequently completes. It is not a hard limit on synchronous PnP
+work or kernel I/O cancellation: their owners remain alive while safe cleanup
+is pending, and the service must not report `Stopped` as if recovery succeeded.
+Windows can still terminate the service at its own shutdown deadline.
 
 New journal owner metadata includes the kernel boot GUID and process creation
 FILETIME. Boot comparison precedes PID liveness; the same boot requires a

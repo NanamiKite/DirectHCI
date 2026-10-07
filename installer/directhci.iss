@@ -43,6 +43,8 @@ Name: "{group}\DirectHCI Control Panel"; Filename: "{app}\directhci-control-pane
 Name: "{group}\Uninstall DirectHCI"; Filename: "{uninstallexe}"
 
 [Code]
+{ Keep #nn character literals off the start of a line: ISPP treats a leading
+  hash sign as a preprocessor directive, even inside Pascal Script. }
 function DirectHciRunningError: String;
 var
   Locator, Services, Objects, Item: Variant;
@@ -80,16 +82,16 @@ begin
         Details := Details + #13#10 + '  DirectHCI service: ' + ServiceState;
     end;
     if Details <> '' then
-      Result := 'DirectHCI is still running. Setup cannot continue.' +
-        #13#10#13#10 + 'Disconnect active clients, stop the DirectHCI service, ' +
+      Result := 'DirectHCI is still running. Setup cannot continue.' + #13#10#13#10 +
+        'Disconnect active clients, stop the DirectHCI service, ' +
         'and exit the Control Panel (including the system tray) and CLI tools. ' +
-        'Wait for shutdown to finish, then run Setup again.' +
-        #13#10#13#10 + 'Detected:' + Details;
+        'Wait for shutdown to finish, then run Setup again.' + #13#10#13#10 +
+        'Detected:' + Details;
   except
     { An unavailable/failed query is not evidence that installation is safe. }
     Result := 'Setup could not verify that DirectHCI is stopped. ' +
-      'Installation is blocked; no process or service was stopped.' +
-      #13#10#13#10 + GetExceptionMessage;
+      'Installation is blocked; no process or service was stopped.' + #13#10#13#10 +
+      GetExceptionMessage;
   end;
 end;
 

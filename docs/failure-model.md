@@ -17,11 +17,23 @@ will recover without host intervention.
 | Short RX queue burst | Pause adapter pumping without consuming/dropping the next packet; daemon retries outbound writes within a bounded deadline | Event/ACL enqueue order is preserved; command and shutdown handling continue |
 | Sustained RX non-consumption | SDK and Raw HCI each enforce 4096 packets / 16 MiB; daemon outbound retry expires after two seconds | Explicit session failure and restoration rather than unlimited memory growth; no guarantee against all overload |
 | Service stop or Control Panel exit | Stop accepting new sessions, request owner-session shutdown and wait up to the runtime deadline | A failed or timed-out restore can retain the journal; SCM stop alone is not proof of `WindowsOwned` |
-| Normal OS shutdown/restart | SCM sends `PRESHUTDOWN`; configured 90-second SCM budget covers the runtime's 45-second stop deadline | Failure/timeout is reported to SCM and Application event log; journal retained |
+| Normal OS shutdown/restart | SCM sends `PRESHUTDOWN` with a configured 90-second budget; runtime and IPC draining share a 45-second graceful-stop deadline | Timeout is immediately reported to the Application event log; safe kernel/PnP cleanup may exceed the deadline; no successful stop is certified |
 | Daemon crash, blue screen or machine power loss | Durable journal survives; installer-registered SYSTEM boot task runs recovery-only even though the main service is manual-start; daemon startup and offline recovery also reconcile | Missing, ambiguous or firmware-unresponsive controller keeps the journal; recovery is not guaranteed |
 | PnP reports reboot required | Do not reboot automatically; retain journal and re-check real PnP state on later startup/recovery | Clear only when a later boot and healthy Windows-owned state are confirmed; otherwise `RecoveryRequired` |
 | Controller missing or changed identity | Do not substitute another device with the same VID/PID | Journal retained for diagnosis |
 | Untrusted ProgramData path | Refuse operations that rely on the journal | No new takeover; fix storage trust before retrying |
+
+Journal reads validate both the directory and the file's owner/write ACL.
+An independently writable legacy journal is not trusted merely because its
+parent directory is now secure. Wall-clock rollback or future timestamps are
+diagnostic anomalies, not sufficient grounds to reject an otherwise valid
+journal; recovery still verifies owner identity and fresh physical-device state.
+
+Raw HCI command budgets cover USB transmission and the response wait together.
+Runtime stop/disconnect cancellation is checked during pending USB transmission
+and response waiting. A cancelled transfer must reach terminal completion
+before its buffer, OVERLAPPED, event or device handle is released; a driver that
+does not complete cancellation can still delay safe recovery.
 | Upgrade or uninstall with unconfirmed recovery | Abort removal of service/binaries and retain journal | Installation retained so recovery remains possible |
 
 A journal is an intent and evidence record, not proof that WinUSB is still

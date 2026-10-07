@@ -46,6 +46,12 @@ The default configuration selects a controller only when exactly one is
 present. With multiple controllers, set `BleCentralConfig::controller_id`
 explicitly; this library does not read the panel's saved preference.
 
+Each scan retains at most 512 addresses, 64 service UUIDs per address and 16
+distinct payloads each for advertising and scan responses. Old payload variants
+are evicted as new ones arrive. Once the address limit is reached, known
+addresses continue updating and new addresses are ignored until the next scan.
+These bounds prevent long scans from accumulating unlimited broadcast history.
+
 ## Connections and GATT
 
 `central.connect_device(address).await` consumes the central and returns a

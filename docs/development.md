@@ -1,6 +1,6 @@
 # Development
 
-DirectHCI uses Rust 2024 and requires Rust 1.87 or later. Runtime and hardware
+DirectHCI uses Rust 2024 and requires Rust 1.88 or later. Runtime and hardware
 testing takes place on Windows; Linux can build and test the portable logic.
 Keep Cargo output on a local disk when the source is in a VM shared folder.
 
