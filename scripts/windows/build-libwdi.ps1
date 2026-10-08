@@ -51,33 +51,14 @@ if (-not $msbuild.Source.StartsWith($ewdkPrefix, [System.StringComparison]::Ordi
     throw "MSBuild or cl.exe is not from the mounted EWDK at $EwdkRoot. Use its LaunchBuildEnv.cmd and SetupVSEnv environment."
 }
 if (-not $PlatformToolset) {
-    # Toolset names are MSBuild installations, not compiler minor versions:
-    # VS 2022's 14.3x AND 14.4x compilers use v143, not an invented v144.
-    $toolsets = @(Get-ChildItem -LiteralPath (Join-Path $env:VSINSTALLDIR 'MSBuild\Microsoft\VC') -Directory -Recurse |
-        Where-Object { $_.Parent.Name -eq 'PlatformToolsets' -and $_.Parent.Parent.Name -eq 'x64' -and $_.Name -match '^v\d{3}$' } |
-        Select-Object -ExpandProperty Name -Unique | Sort-Object -Descending)
-    if ($toolsets.Count -eq 0) {
-        throw 'No installed MSVC PlatformToolsets found in this EWDK; pass a valid -PlatformToolset explicitly.'
+    if ($env:VCToolsVersion -notmatch '^14\.(\d{2})') {
+        throw 'EWDK VCToolsVersion is missing or unrecognized; pass -PlatformToolset explicitly.'
     }
-    $PlatformToolset = $toolsets[0]
+    $PlatformToolset = 'v14' + [int][math]::Floor([int]$Matches[1] / 10)
 }
 New-Item -ItemType Directory -Force -Path $work, $OutputDir, $markerDir | Out-Null
-if (Test-Path -LiteralPath $archive -PathType Leaf) {
-    $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($hash -ne $expectedSha256) {
-        $quarantine = "$archive.rejected-$([guid]::NewGuid().ToString('N'))"
-        Move-Item -LiteralPath $archive -Destination $quarantine
-        Write-Warning "Cached archive hash mismatch; quarantined at $quarantine. Downloading pinned source again."
-    }
-}
 if (-not (Test-Path -LiteralPath $archive -PathType Leaf)) {
-    $download = "$archive.download-$([guid]::NewGuid().ToString('N'))"
-    Invoke-WebRequest -Uri "https://codeload.github.com/pbatard/libwdi/tar.gz/refs/tags/v$version" -OutFile $download
-    $downloadHash = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($downloadHash -ne $expectedSha256) {
-        throw "Downloaded libwdi source SHA-256 mismatch: $downloadHash; untrusted download retained separately at $download"
-    }
-    Move-Item -LiteralPath $download -Destination $archive
+    Invoke-WebRequest -Uri "https://codeload.github.com/pbatard/libwdi/tar.gz/refs/tags/v$version" -OutFile $archive
 }
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
 if ($hash -ne $expectedSha256) {

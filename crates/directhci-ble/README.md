@@ -46,12 +46,6 @@ The default configuration selects a controller only when exactly one is
 present. With multiple controllers, set `BleCentralConfig::controller_id`
 explicitly; this library does not read the panel's saved preference.
 
-Each scan retains at most 512 addresses, 64 service UUIDs per address and 16
-distinct payloads each for advertising and scan responses. Old payload variants
-are evicted as new ones arrive. Once the address limit is reached, known
-addresses continue updating and new addresses are ignored until the next scan.
-These bounds prevent long scans from accumulating unlimited broadcast history.
-
 ## Connections and GATT
 
 `central.connect_device(address).await` consumes the central and returns a
@@ -80,30 +74,6 @@ Call `stream.close().await` when finished.
 Use `connection.disconnect().await` after a connection, or
 `central.shutdown().await` after scanning. Dropping an object requests
 best-effort cleanup but does not wait for it to finish.
-
-Shutdown completion is sent after the worker's owned GATT/host, IPC client and
-runtime resources are dropped. Native thread joining happens off the caller's
-async thread. If a UI needs a shorter wait, retain a completion handle before
-consuming the connection:
-
-```rust
-let mut completion = connection.shutdown_completion();
-match tokio::time::timeout(Duration::from_secs(2), connection.disconnect()).await {
-    Ok(result) => result?,
-    Err(_) => {
-        // Show "Disconnecting", not "Disconnected". The UI can keep this
-        // handle in its background task and observe the eventual result.
-        completion.wait().await?;
-    }
-}
-```
-
-The central has the same `shutdown_completion()` method. `completion.result()`
-returns `None` until local cleanup is done, or the final `Ok`/`Err` afterwards;
-waiting again after a timeout is safe. A failed release leaves Windows restore
-unconfirmed: the daemon may still be recovering. Check runtime/Control Panel
-status rather than treating an SDK wait timeout as successful disconnection.
-See [SDK request budgets](../../docs/sdk.md#raw-hci).
 
 ## CLI
 

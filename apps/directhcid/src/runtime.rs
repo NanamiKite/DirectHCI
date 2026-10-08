@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak, mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use directhci_core::{
     ActiveSessionInfo, ControlResponse, ControllerObservation, IpcErrorCode, IpcFrame,
@@ -17,7 +17,7 @@ use directhci_windows::{
 const CONTROLLER_REQUEST_DEPTH: usize = 32;
 const RX_POLL: Duration = Duration::from_millis(10);
 const RX_BATCH: usize = 64;
-pub(crate) const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(45);
+const SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(45);
 
 pub type Outbound = mpsc::SyncSender<IpcFrame>;
 pub type DisconnectOwner = Arc<dyn Fn() + Send + Sync>;
@@ -74,22 +74,7 @@ impl DirectHciRuntime {
                 .map_err(Clone::clone)
                 .and_then(PreferencesStore::load)
         });
-        // A SYSTEM boot recovery may already be restoring. Do not turn that
-        // brief, legitimate collision into a permanently blocked runtime.
-        let recovery_deadline = std::time::Instant::now() + SESSION_STOP_TIMEOUT;
-        let recovery = loop {
-            let report = directhci_windows::recover_offline();
-            if report
-                .error
-                .as_deref()
-                .is_some_and(|message| message.starts_with("controller mutation is busy:"))
-                && std::time::Instant::now() < recovery_deadline
-            {
-                thread::sleep(Duration::from_millis(100));
-                continue;
-            }
-            break report;
-        };
+        let recovery = directhci_windows::recover_offline();
         // An empty preference may be initialized once during privileged daemon
         // startup. A read-only IPC request must never persist configuration.
         if matches!(&preferences, Ok(value) if value.preferred_controller_id.is_none()) {
@@ -224,9 +209,6 @@ impl DirectHciRuntime {
         }
         {
             let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return Err((IpcErrorCode::Runtime, "runtime is shutting down".into()));
-            }
             if state.recovery_required {
                 return Err((
                     IpcErrorCode::RecoveryRequired,
@@ -245,13 +227,10 @@ impl DirectHciRuntime {
             state.maintenance = true;
         }
         let result = directhci_windows::prepare_controller(controller_id);
-        {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            state.maintenance = false;
-        }
-        if self.state.is_poisoned() {
-            return Err(runtime_lock_error());
-        }
+        self.state
+            .lock()
+            .map_err(|_| runtime_lock_error())?
+            .maintenance = false;
         result
             .map(|result| directhci_core::PreparedController {
                 status: directhci_core::ControllerPreparationStatus {
@@ -269,9 +248,6 @@ impl DirectHciRuntime {
     pub fn restore_windows(&self) -> Result<(), (IpcErrorCode, String)> {
         let active = {
             let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return Err((IpcErrorCode::Runtime, "runtime is shutting down".into()));
-            }
             if state.maintenance {
                 return Err((
                     IpcErrorCode::ControllerBusy,
@@ -292,7 +268,7 @@ impl DirectHciRuntime {
                 if self
                     .state
                     .lock()
-                    .unwrap_or_else(|error| error.into_inner())
+                    .map_err(|_| runtime_lock_error())?
                     .active
                     .as_ref()
                     .is_none_or(|active| active.info.session_id != session_id)
@@ -304,11 +280,11 @@ impl DirectHciRuntime {
             if self
                 .state
                 .lock()
-                .unwrap_or_else(|error| error.into_inner())
+                .map_err(|_| runtime_lock_error())?
                 .active
                 .is_some()
             {
-                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
                 state.recovery_required = true;
                 state.recovery_message =
                     Some("active session did not stop within the recovery deadline".into());
@@ -318,13 +294,6 @@ impl DirectHciRuntime {
                     state.recovery_message.clone().unwrap(),
                 ));
             }
-        }
-        if self.state.is_poisoned() {
-            self.state
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .maintenance = false;
-            return Err(runtime_lock_error());
         }
         // The active session has finished above. Offline recovery deliberately
         // rejects this service's still-live PID, so use the narrowly scoped
@@ -336,7 +305,7 @@ impl DirectHciRuntime {
                 | OfflineRecoveryStatus::AlreadyWindowsOwned
                 | OfflineRecoveryStatus::RestoredWindows
         );
-        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
         state.maintenance = false;
         state.recovery_required = !success;
         state.recovery_message = (!success).then(|| {
@@ -344,9 +313,7 @@ impl DirectHciRuntime {
                 .error
                 .unwrap_or_else(|| format!("Windows recovery ended in {:?}", report.status))
         });
-        if self.state.is_poisoned() {
-            Err(runtime_lock_error())
-        } else if success {
+        if success {
             Ok(())
         } else {
             Err((
@@ -407,9 +374,6 @@ impl DirectHciRuntime {
         let session_id = self.next_session.fetch_add(1, Ordering::Relaxed);
         {
             let mut state = self.state.lock().map_err(|_| runtime_lock_error())?;
-            if self.shutting_down.load(Ordering::Acquire) {
-                return Err((IpcErrorCode::Runtime, "runtime is shutting down".into()));
-            }
             if state.recovery_required {
                 return Err((
                     IpcErrorCode::RecoveryRequired,
@@ -459,33 +423,26 @@ impl DirectHciRuntime {
         let live = match acquire_runtime_controller_session(controller_id, &client_name) {
             Ok(live) => live,
             Err(report) => {
-                let stage = if !report.preflight.safe_to_execute {
-                    "preflight"
-                } else if report.rebind.is_none() {
-                    "lease/journal preparation"
-                } else if report
-                    .rebind
-                    .as_ref()
-                    .is_some_and(|step| !step.api_succeeded)
-                {
-                    "driver rebind"
-                } else if report.directhci_state.is_none() {
-                    "post-rebind observation"
-                } else if report.winusb_readiness.as_ref().is_none_or(|readiness| {
-                    readiness.status != directhci_windows::DedicatedWinUsbReadinessStatus::Ready
-                }) {
-                    "WinUSB validation/journal"
+                let mut details = report
+                    .primary_error
+                    .clone()
+                    .unwrap_or_else(|| "temporary takeover failed".into());
+                if !report.preflight.blockers.is_empty() {
+                    details.push_str(&format!(
+                        "; blockers: {}",
+                        report.preflight.blockers.join("; ")
+                    ));
+                }
+                if let Some(error) = &report.recovery_error {
+                    details.push_str(&format!("; recovery: {error}"));
+                }
+                let code = if matches!(report.status, RoundTripStatus::RecoveryRequired) {
+                    IpcErrorCode::RecoveryRequired
                 } else {
-                    "Raw HCI initialization/journal"
+                    IpcErrorCode::Ownership
                 };
-                // Preserve both errors, blockers and restore outcome even when
-                // no journal was created or Windows was successfully restored.
-                let details = serde_json::to_string(&report)
-                    .unwrap_or_else(|error| format!("encode takeover report: {error}; {report:?}"));
-                let message = format!("temporary takeover failed at {stage}: {details}");
-                eprintln!("directhcid: {message}");
-                self.finish_failed_acquire(connection_id, report.status, Some(message.clone()));
-                return Err((IpcErrorCode::Ownership, message));
+                self.finish_failed_acquire(connection_id, report.status, Some(details.clone()));
+                return Err((code, details));
             }
         };
         let controller = live.controller().clone();
@@ -578,65 +535,48 @@ impl DirectHciRuntime {
     }
 
     pub fn disconnect(&self, connection_id: u64) {
-        let sender = {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            (|| {
-                let active = state.active.as_mut()?;
-                if active.owner_connection != connection_id {
-                    return None;
-                }
-                active.phase = RuntimeControllerState::Restoring;
-                active.cancel.store(true, Ordering::Release);
-                Some(active.requests.clone())
-            })()
-        };
+        let sender = self.state.lock().ok().and_then(|mut state| {
+            let active = state.active.as_mut()?;
+            if active.owner_connection != connection_id {
+                return None;
+            }
+            active.phase = RuntimeControllerState::Restoring;
+            active.cancel.store(true, Ordering::Release);
+            Some(active.requests.clone())
+        });
         if let Some(sender) = sender {
             eprintln!("directhcid: owning client disconnected; restoring controller");
             let _ = sender.try_send(ControllerRequest::Stop);
         }
     }
 
-    pub fn shutdown(&self, deadline: Instant) -> Result<(), String> {
-        let sender = {
-            // Admission and shutdown use the SAME lock: after this point no
-            // acquire or prepare may become active, even after an earlier
-            // optimistic check of the atomic flag.
-            // A poisoned state still contains the lease cancellation handle.
-            // Recover it only to stop work; normal admission remains fail-closed.
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-            self.shutting_down.store(true, Ordering::Release);
-            state.active.as_mut().map(|active| {
-                active.phase = RuntimeControllerState::Restoring;
-                active.cancel.store(true, Ordering::Release);
-                active.requests.clone()
-            })
+    pub fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        let active = self.state.lock().ok().and_then(|mut state| {
+            let active = state.active.as_mut()?;
+            active.phase = RuntimeControllerState::Restoring;
+            active.cancel.store(true, Ordering::Release);
+            Some((active.requests.clone(), active.info.session_id))
+        });
+        let Some((sender, session_id)) = active else {
+            return;
         };
-        if let Some(sender) = sender {
-            let _ = sender.try_send(ControllerRequest::Stop);
-        }
+        let _ = sender.try_send(ControllerRequest::Stop);
+        let deadline = std::time::Instant::now() + SESSION_STOP_TIMEOUT;
         while std::time::Instant::now() < deadline {
-            {
-                let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-                if state.active.is_none() && !state.maintenance {
-                    return if self.state.is_poisoned() {
-                        Err("runtime lock poisoned; shutdown attempted but success is not certified; inspect recovery diagnostics".into())
-                    } else if state.recovery_required {
-                        Err(state.recovery_message.clone().unwrap_or_else(|| {
-                            "Windows recovery required; journal retained".into()
-                        }))
-                    } else {
-                        Ok(())
-                    };
-                }
+            let active = self
+                .state
+                .lock()
+                .ok()
+                .and_then(|state| state.active.as_ref().map(|value| value.info.session_id));
+            if active != Some(session_id) {
+                return;
             }
             thread::sleep(Duration::from_millis(50));
         }
-        Err("shutdown recovery exceeded 45 seconds; durable M1 journal is retained; Windows restore was not confirmed".into())
-    }
-
-    pub(crate) fn shutdown_pending(&self) -> bool {
-        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
-        state.active.is_some() || state.maintenance
+        eprintln!(
+            "directhcid: shutdown recovery exceeded 45 seconds; durable M1 journal is retained"
+        );
     }
 
     fn session_sender(
@@ -674,8 +614,7 @@ impl DirectHciRuntime {
         status: RoundTripStatus,
         message: Option<String>,
     ) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Ok(mut state) = self.state.lock() {
             if state
                 .active
                 .as_ref()
@@ -691,8 +630,7 @@ impl DirectHciRuntime {
     }
 
     fn worker_finished(&self, session_id: u64, recovery_required: bool, message: Option<String>) {
-        {
-            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if let Ok(mut state) = self.state.lock() {
             if state
                 .active
                 .as_ref()
@@ -729,10 +667,7 @@ fn controller_worker(
                 request_id,
                 opcode,
                 parameters,
-            }) => match live
-                .raw_hci()
-                .send_command_with_cancel(opcode, &parameters, &cancel)
-            {
+            }) => match live.raw_hci().send_command(opcode, &parameters) {
                 Ok(response) => {
                     let frame = IpcFrame::v1(
                         IpcMessageKind::HciCommandResponse,
@@ -759,7 +694,7 @@ fn controller_worker(
                 Err(_) => {}
             },
             Ok(ControllerRequest::Acl { request_id, packet }) => {
-                match live.raw_hci().send_acl_with_cancel(&packet, &cancel) {
+                match live.raw_hci().send_acl(&packet) {
                     Ok(()) => {
                         if send_json(
                             &outbound,
@@ -797,37 +732,54 @@ fn controller_worker(
         }
 
         for _ in 0..RX_BATCH {
-            let packet = match live.raw_hci().receive_packet(Duration::ZERO) {
+            let event = match live.raw_hci().receive_event(Duration::ZERO) {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    fatal = Some(format!("event RX failed: {error}"));
+                    break 'session;
+                }
+            };
+            let payload = match encode_hci_event(session_id, &event) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    fatal = Some(format!("encode HCI event: {error}"));
+                    break 'session;
+                }
+            };
+            let frame =
+                IpcFrame::v1(IpcMessageKind::HciEvent, 0, payload).expect("bounded HCI event");
+            if outbound.try_send(frame).is_err() {
+                fatal = Some("client event queue overflow".into());
+                break 'session;
+            }
+        }
+        for _ in 0..RX_BATCH {
+            let packet = match live.raw_hci().receive_acl(Duration::ZERO) {
                 Ok(Some(packet)) => packet,
                 Ok(None) => break,
                 Err(error) => {
-                    fatal = Some(format!("HCI RX failed: {error}"));
+                    fatal = Some(format!("ACL RX failed: {error}"));
                     break 'session;
                 }
             };
-            let (kind, payload) = match packet {
-                directhci_core::HciIncomingPacket::Event(event) => (
-                    IpcMessageKind::HciEvent,
-                    encode_hci_event(session_id, &event),
-                ),
-                directhci_core::HciIncomingPacket::Acl(acl) => {
-                    (IpcMessageKind::AclRx, encode_acl_packet(session_id, &acl))
-                }
-            };
-            let payload = match payload {
+            let payload = match encode_acl_packet(session_id, &packet) {
                 Ok(payload) => payload,
                 Err(error) => {
-                    fatal = Some(format!("encode HCI packet: {error}"));
+                    fatal = Some(format!("encode ACL packet: {error}"));
                     break 'session;
                 }
             };
-            let frame = IpcFrame::v1(kind, 0, payload).expect("bounded HCI packet");
-            if send_outbound(&outbound, frame, Some(&cancel)).is_err() {
-                if !cancel.load(Ordering::Acquire) {
-                    fatal = Some("client RX queue remained blocked or disconnected".into());
-                }
+            let frame =
+                IpcFrame::v1(IpcMessageKind::AclRx, 0, payload).expect("bounded ACL packet");
+            if outbound.try_send(frame).is_err() {
+                fatal = Some("client ACL queue overflow".into());
                 break 'session;
             }
+        }
+        if let Some(error) = live.raw_hci().terminal_error() {
+            fatal = Some(error.to_string());
+            break;
         }
     }
 
@@ -841,11 +793,6 @@ fn controller_worker(
         .clone()
         .or(fatal)
         .or(report.primary_error.clone());
-    // Commit the lease's final state before the independent pipe writer can
-    // deliver Released and allow the client to immediately acquire again.
-    if let Some(runtime) = runtime.upgrade() {
-        runtime.worker_finished(session_id, recovery_required, message.clone());
-    }
     if let Some(request_id) = release_request {
         if recovery_required {
             let _ = send_error(
@@ -868,6 +815,9 @@ fn controller_worker(
             );
         }
     }
+    if let Some(runtime) = runtime.upgrade() {
+        runtime.worker_finished(session_id, recovery_required, message);
+    }
     // An unsolicited worker exit has no ReleaseSession response. Wake the
     // owning pipe so event/ACL receivers observe disconnection, not timeouts.
     if release_request.is_none() {
@@ -883,31 +833,7 @@ fn send_frame(
     outbound: &Outbound,
     frame: Result<IpcFrame, directhci_core::IpcFrameError>,
 ) -> Result<(), ()> {
-    send_outbound(outbound, frame.map_err(|_| ())?, None)
-}
-
-// A brief scheduling stall is not a dead client. Bound the retry and preserve
-// the exact frame; shutdown can interrupt RX backpressure immediately.
-pub(crate) fn send_outbound(
-    outbound: &Outbound,
-    mut frame: IpcFrame,
-    cancel: Option<&AtomicBool>,
-) -> Result<(), ()> {
-    let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        if cancel.is_some_and(|cancel| cancel.load(Ordering::Acquire)) {
-            return Err(());
-        }
-        match outbound.try_send(frame) {
-            Ok(()) => return Ok(()),
-            Err(mpsc::TrySendError::Disconnected(_)) => return Err(()),
-            Err(mpsc::TrySendError::Full(value)) => frame = value,
-        }
-        if Instant::now() >= deadline {
-            return Err(());
-        }
-        thread::sleep(Duration::from_millis(5));
-    }
+    outbound.try_send(frame.map_err(|_| ())?).map_err(|_| ())
 }
 fn send_json<T: serde::Serialize>(
     outbound: &Outbound,

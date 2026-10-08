@@ -90,6 +90,12 @@ impl JournalStore {
             });
         }
         if self.secure_program_data {
+            platform::reject_reparse(&path).map_err(|message| JournalError::UnsafePath {
+                path: path.clone(),
+                message,
+            })?;
+            // Recovery now replays a saved device DACL. A secure parent does
+            // not make a journal with an independent user-writable ACL safe.
             platform::validate_secure_file(&path).map_err(|message| JournalError::UnsafePath {
                 path: path.clone(),
                 message,
@@ -114,7 +120,9 @@ impl JournalStore {
                 path: path.clone(),
                 message: error.to_string(),
             })?;
-        if journal.schema_version != OWNERSHIP_JOURNAL_SCHEMA_VERSION {
+        if !matches!(journal.schema_version, 1 | 2)
+            && journal.schema_version != OWNERSHIP_JOURNAL_SCHEMA_VERSION
+        {
             return Err(JournalError::UnsupportedSchema {
                 path,
                 found: journal.schema_version,
@@ -130,18 +138,18 @@ impl JournalStore {
             });
         }
         if journal.created_unix_ms > journal.updated_unix_ms {
-            eprintln!(
-                "directhci: journal clock anomaly at {}: updated timestamp precedes creation; recovery still requires identity and device validation",
-                path.display()
-            );
+            return Err(JournalError::Corrupt {
+                path,
+                message: "created timestamp is newer than updated timestamp".into(),
+            });
         }
         if journal.updated_unix_ms
             > now.saturating_add(Duration::from_secs(5 * 60).as_millis() as u64)
         {
-            eprintln!(
-                "directhci: journal clock anomaly at {}: updated timestamp is ahead of the wall clock; recovery still requires identity and device validation",
-                path.display()
-            );
+            return Err(JournalError::Corrupt {
+                path,
+                message: "updated timestamp is unreasonably far in the future".into(),
+            });
         }
         let age_ms = now.saturating_sub(journal.updated_unix_ms);
         Ok(JournalLoad::Present {
@@ -212,12 +220,12 @@ impl JournalStore {
         let path = self.path();
         if self.secure_program_data {
             match fs::symlink_metadata(&path) {
-                Ok(_) => platform::validate_secure_file(&path).map_err(|message| {
-                    JournalError::UnsafePath {
+                Ok(_) => {
+                    platform::reject_reparse(&path).map_err(|message| JournalError::UnsafePath {
                         path: path.clone(),
                         message,
-                    }
-                })?,
+                    })?
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => {
                     return Err(JournalError::io("inspect journal metadata", &path, error));
@@ -419,6 +427,10 @@ mod platform {
         crate::security::validate_secure_journal_directory(path)
     }
 
+    pub(super) fn reject_reparse(path: &Path) -> Result<(), String> {
+        crate::security::reject_reparse(path)
+    }
+
     pub(super) fn validate_secure_file(path: &Path) -> Result<(), String> {
         crate::security::validate_secure_data_file(path)
     }
@@ -501,10 +513,13 @@ mod platform {
     pub(super) fn ensure_secure_directory(_path: &Path) -> Result<(), String> {
         Ok(())
     }
+    pub(super) fn validate_secure_file(_path: &Path) -> Result<(), String> {
+        Ok(())
+    }
     pub(super) fn validate_secure_directory(_path: &Path) -> Result<(), String> {
         Ok(())
     }
-    pub(super) fn validate_secure_file(_path: &Path) -> Result<(), String> {
+    pub(super) fn reject_reparse(_path: &Path) -> Result<(), String> {
         Ok(())
     }
 

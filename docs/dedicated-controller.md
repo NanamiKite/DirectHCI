@@ -9,7 +9,7 @@ takeover, use [the installation guide](installation.md).
 
 Never use this Dedicated/Zadig procedure to provision or permanently rebind
 the development host's system controller. It uses the
-[temporary takeover and recovery flow](ownership-and-recovery.md):
+[temporary takeover and recovery flow](temporary-rebind.md):
 
 ~~~text
 Intel AX201 Bluetooth

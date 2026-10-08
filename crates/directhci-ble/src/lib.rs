@@ -19,7 +19,7 @@ use bt_hci::param::{AddrKind, BdAddr, LeAdvEventKind};
 use directhci_bt_hci::DirectHciController;
 use directhci_client::DirectHciClient;
 use embassy_time::Duration as EmbassyDuration;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 use trouble_host::advertise::AdStructure;
 use trouble_host::prelude::*;
 
@@ -35,9 +35,6 @@ const DISCONNECT_SETTLE_TIME: Duration = Duration::from_millis(100);
 const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
 const CONNECT_CANCEL_SETTLE_TIME: Duration = Duration::from_secs(6);
 const NOTIFICATION_MTU: usize = trouble_host::config::GATT_CLIENT_NOTIFICATION_MTU;
-const SCAN_DEVICE_LIMIT: usize = 512;
-const SCAN_PAYLOAD_HISTORY: usize = 16;
-const SCAN_UUID_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct BleCentralConfig {
@@ -93,7 +90,7 @@ impl FromStr for BleAddress {
             BleError::InvalidInput("address must start with public: or random:".into())
         })?;
         let compact = bytes.replace(':', "");
-        if compact.len() != 12 || !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if compact.len() != 12 {
             return Err(BleError::InvalidInput(
                 "Bluetooth address must contain 6 bytes".into(),
             ));
@@ -152,11 +149,6 @@ impl FromStr for BleUuid {
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let compact = value.replace('-', "");
-        if !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(BleError::InvalidInput(
-                "UUID must be 4, 8, or 32 hexadecimal digits".into(),
-            ));
-        }
         match compact.len() {
             4 => u16::from_str_radix(&compact, 16)
                 .map(Self::Uuid16)
@@ -179,11 +171,8 @@ pub struct ScanResult {
     pub address: BleAddress,
     pub rssi: i8,
     pub local_name: Option<String>,
-    /// Up to 64 distinct service UUIDs observed during this scan.
     pub service_uuids: Vec<BleUuid>,
-    /// Up to 16 distinct advertising payloads; oldest stored variants are evicted.
     pub advertisement_data: Vec<Vec<u8>>,
-    /// Up to 16 distinct scan-response payloads; oldest stored variants are evicted.
     pub scan_response_data: Vec<Vec<u8>>,
 }
 
@@ -343,33 +332,6 @@ struct WorkerHandle {
     terminal: Arc<Mutex<Option<BleError>>>,
     thread: Option<JoinHandle<()>>,
     shutdown_requested: bool,
-    completed: watch::Receiver<Option<Result<(), BleError>>>,
-}
-
-/// Observes the end of BLE/IPC cleanup independently of a shutdown future.
-/// A timeout only stops waiting; retain this handle to await the real result.
-#[derive(Clone)]
-pub struct BleShutdownCompletion {
-    completed: watch::Receiver<Option<Result<(), BleError>>>,
-}
-
-impl BleShutdownCompletion {
-    /// `None` means cleanup is still running, not that restore succeeded.
-    pub fn result(&self) -> Option<Result<(), BleError>> {
-        self.completed.borrow().clone()
-    }
-
-    /// Cancellation-safe: this handle can be waited on again after a timeout.
-    pub async fn wait(&mut self) -> Result<(), BleError> {
-        loop {
-            if let Some(result) = self.result() {
-                return result;
-            }
-            if self.completed.changed().await.is_err() {
-                return self.result().unwrap_or(Err(BleError::WorkerPanicked));
-            }
-        }
-    }
 }
 
 pub struct DirectHciBleCentral {
@@ -380,32 +342,23 @@ impl DirectHciBleCentral {
     pub async fn connect(config: BleCentralConfig) -> Result<Self, BleError> {
         let (request_tx, request_rx) = mpsc::channel(REQUEST_DEPTH);
         let (ready_tx, ready_rx) = oneshot::channel();
-        let (completed_tx, completed_rx) = watch::channel(None);
         let terminal = Arc::new(Mutex::new(None));
         let worker_terminal = Arc::clone(&terminal);
         let thread = thread::Builder::new()
             .name("directhci-ble".into())
-            .spawn(move || {
-                worker_thread(config, request_rx, ready_tx, worker_terminal, completed_tx)
-            })
+            .spawn(move || worker_thread(config, request_rx, ready_tx, worker_terminal))
             .map_err(|error| BleError::Runtime(error.to_string()))?;
-        // Keep ownership before awaiting readiness, so cancelling connect()
-        // also requests shutdown rather than simply detaching its worker.
-        let central = Self {
+        ready_rx.await.map_err(|_| BleError::WorkerStopped)??;
+        Ok(Self {
             worker: WorkerHandle {
                 requests: request_tx,
                 terminal,
                 thread: Some(thread),
                 shutdown_requested: false,
-                completed: completed_rx,
             },
-        };
-        ready_rx.await.map_err(|_| BleError::WorkerStopped)??;
-        Ok(central)
+        })
     }
 
-    /// Collects up to 512 addresses. Known addresses continue to update after
-    /// this limit; additional addresses are ignored until the next scan.
     pub async fn scan(&self, duration: Duration) -> Result<Vec<ScanResult>, BleError> {
         request(&self.worker, |reply| WorkerRequest::Scan {
             duration,
@@ -428,12 +381,6 @@ impl DirectHciBleCentral {
 
     pub async fn shutdown(mut self) -> Result<(), BleError> {
         shutdown_worker(&mut self.worker).await
-    }
-
-    pub fn shutdown_completion(&self) -> BleShutdownCompletion {
-        BleShutdownCompletion {
-            completed: self.worker.completed.clone(),
-        }
     }
 }
 
@@ -553,13 +500,6 @@ impl BleConnection {
         central.shutdown().await
     }
 
-    pub fn shutdown_completion(&self) -> BleShutdownCompletion {
-        self.central
-            .as_ref()
-            .expect("live connection")
-            .shutdown_completion()
-    }
-
     fn worker(&self) -> &WorkerHandle {
         &self.central.as_ref().expect("live connection").worker
     }
@@ -626,33 +566,29 @@ async fn request<T>(
 }
 
 async fn shutdown_worker(worker: &mut WorkerHandle) -> Result<(), BleError> {
-    if !worker.shutdown_requested {
-        // Do not mark it sent before the await: cancellation while enqueuing
-        // must still allow Drop to request best-effort shutdown.
-        let _ = worker
-            .requests
-            .send(WorkerRequest::Shutdown { reply: None })
-            .await;
-        worker.shutdown_requested = true;
+    if worker.shutdown_requested {
+        return terminal_error(&worker.terminal).map_or(Ok(()), Err);
     }
-    let result = BleShutdownCompletion {
-        completed: worker.completed.clone(),
-    }
-    .wait()
-    .await;
+    worker.shutdown_requested = true;
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let sent = worker
+        .requests
+        .send(WorkerRequest::Shutdown {
+            reply: Some(reply_tx),
+        })
+        .await
+        .is_ok();
+    let result = if sent {
+        reply_rx
+            .await
+            .map_err(|_| terminal_error(&worker.terminal).unwrap_or(BleError::WorkerStopped))?
+    } else {
+        terminal_error(&worker.terminal).map_or(Err(BleError::WorkerStopped), Err)
+    };
     if let Some(thread) = worker.thread.take() {
-        // Completion is sent after owned resources are dropped, but OS/TLS
-        // exit bookkeeping can still remain. Never join on an async thread,
-        // and do not require the caller to own a Tokio runtime.
-        let (joined_tx, joined_rx) = oneshot::channel();
-        thread::Builder::new()
-            .name("directhci-ble-reap".into())
-            .spawn(move || {
-                let result = thread.join().map_err(|_| BleError::WorkerPanicked);
-                let _ = joined_tx.send(result);
-            })
-            .map_err(|error| BleError::Runtime(format!("start shutdown reaper: {error}")))?;
-        joined_rx.await.map_err(|_| BleError::WorkerPanicked)??;
+        if thread.join().is_err() {
+            return Err(BleError::WorkerPanicked);
+        }
     }
     result
 }
@@ -735,44 +671,29 @@ fn worker_thread(
     requests: mpsc::Receiver<WorkerRequest>,
     ready: oneshot::Sender<Result<(), BleError>>,
     terminal: Arc<Mutex<Option<BleError>>>,
-    completed: watch::Sender<Option<Result<(), BleError>>>,
 ) {
-    let mut shutdown_reply = None;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .map_err(|error| BleError::Runtime(error.to_string()));
-        match runtime {
-            Ok(runtime) => {
-                runtime.block_on(worker_main(config, requests, ready, &mut shutdown_reply))
-            }
-            Err(error) => {
-                let _ = ready.send(Err(error.clone()));
-                Err(error)
-            }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .map_err(|error| BleError::Runtime(error.to_string()));
+    let result = match runtime {
+        Ok(runtime) => runtime.block_on(worker_main(config, requests, ready)),
+        Err(error) => {
+            let _ = ready.send(Err(error.clone()));
+            Err(error)
         }
-        // worker_main's stack, client/IPC, and this runtime are dropped here,
-        // before any completion notification. This includes failed startup.
-    }))
-    .unwrap_or(Err(BleError::WorkerPanicked));
-    if let Err(error) = &result {
+    };
+    if let Err(error) = result {
         if let Ok(mut value) = terminal.lock() {
-            *value = Some(error.clone());
+            *value = Some(error);
         }
     }
-    drop(terminal);
-    if let Some(reply) = shutdown_reply {
-        let _ = reply.send(result.clone());
-    }
-    completed.send_replace(Some(result));
 }
 
 async fn worker_main(
     config: BleCentralConfig,
     requests: mpsc::Receiver<WorkerRequest>,
     ready: oneshot::Sender<Result<(), BleError>>,
-    shutdown_reply: &mut Option<oneshot::Sender<Result<(), BleError>>>,
 ) -> Result<(), BleError> {
     let runtime_client = match DirectHciClient::connect(config.client_name, config.client_version) {
         Ok(client) => client,
@@ -848,7 +769,9 @@ async fn worker_main(
         .await
         .map_err(|error| BleError::Runtime(format!("DirectHCI release failed: {error}")));
     let result = combine_result(exit.primary, cleanup.err());
-    *shutdown_reply = exit.reply;
+    if let Some(reply) = exit.reply {
+        let _ = reply.send(result.clone());
+    }
     result
 }
 
@@ -1109,34 +1032,8 @@ async fn connected_loop<'reference>(
     let mut discovered_services: Vec<GattService> = Vec::new();
     let mut next_listener_id = 1u64;
     let exit = loop {
-        if let Some(id) = active
-            .as_ref()
-            .filter(|listener| listener.events.is_closed())
-            .map(|listener| listener.id)
-        {
-            // This also rolls back a cancelled StartListener, even if the
-            // radio never sends a notification and no stream object existed.
-            match drive_without_listener(task.as_mut(), stop_listener(&client, &mut active, id))
-                .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) | Err(error) => {
-                    break WorkerExit {
-                        primary: Some(error),
-                        reply: None,
-                    };
-                }
-            }
-        }
-        let listener_events = active.as_ref().map(|listener| listener.events.clone());
         tokio::select! {
             biased;
-            _ = async {
-                match &listener_events {
-                    Some(events) => events.closed().await,
-                    None => pending::<()>().await,
-                }
-            } => continue,
             request = requests.recv() => {
                 let Some(request) = request else {
                     break WorkerExit {
@@ -1238,9 +1135,6 @@ async fn connected_loop<'reference>(
                         reply,
                     } => {
                         eprintln!("directhci-ble worker: request start-listener");
-                        if reply.is_closed() || events.is_closed() {
-                            continue;
-                        }
                         if active.is_some() {
                             let _ = reply.send(Err(BleError::ListenerAlreadyActive));
                             continue;
@@ -1255,21 +1149,7 @@ async fn connected_loop<'reference>(
                                 let id = listener.id;
                                 active = Some(listener);
                                 next_listener_id = next_listener_id.wrapping_add(1).max(1);
-                                if reply.send(Ok(id)).is_err() {
-                                    // No consumer owns the created listener.
-                                    // Undo both local delivery and CCCD before
-                                    // accepting another request.
-                                    match drive_without_listener(
-                                        task.as_mut(),
-                                        stop_listener(&client, &mut active, id),
-                                    ).await {
-                                        Ok(Ok(())) => {}
-                                        Ok(Err(error)) | Err(error) => break WorkerExit {
-                                            primary: Some(error),
-                                            reply: None,
-                                        },
-                                    }
-                                }
+                                let _ = reply.send(Ok(id));
                             }
                             Ok(Err(error)) => {
                                 let _ = reply.send(Err(error));
@@ -1285,19 +1165,36 @@ async fn connected_loop<'reference>(
                     }
                     WorkerRequest::StopListener { id, reply } => {
                         eprintln!("directhci-ble worker: request stop-listener");
-                        match drive_without_listener(
-                            task.as_mut(),
-                            stop_listener(&client, &mut active, id),
-                        ).await {
-                            Ok(result) => {
-                                let _ = reply.send(result);
-                            }
+                        match take_subscription(&mut active, id) {
                             Err(error) => {
-                                let _ = reply.send(Err(error.clone()));
-                                break WorkerExit {
-                                    primary: Some(error),
-                                    reply: None,
+                                let _ = reply.send(Err(error));
+                            }
+                            Ok(None) => {
+                                let _ = reply.send(Ok(()));
+                            }
+                            Ok(Some(characteristic)) => {
+                                let operation = async {
+                                    client
+                                        .unsubscribe(&characteristic)
+                                        .await
+                                        .map_err(|error| {
+                                            BleError::Listener(format!(
+                                                "unsubscribe: {error:?}"
+                                            ))
+                                        })
                                 };
+                                match drive_without_listener(task.as_mut(), operation).await {
+                                    Ok(result) => {
+                                        let _ = reply.send(result);
+                                    }
+                                    Err(error) => {
+                                        let _ = reply.send(Err(error.clone()));
+                                        break WorkerExit {
+                                            primary: Some(error),
+                                            reply: None,
+                                        };
+                                    }
+                                }
                             }
                         }
                     }
@@ -1442,8 +1339,10 @@ async fn forward_notification(
     match send {
         Ok(()) => Ok(()),
         Err(mpsc::error::TrySendError::Closed(_)) => {
-            // Keep subscription ownership for connected_loop's closed-channel
-            // cleanup; taking it here would lose the CCCD unsubscribe target.
+            // Stream::drop normally queues StopListener. If its receiver
+            // closes first, stop local delivery; the queued request or
+            // connection teardown handles a standard CCCD subscription.
+            active.take();
             Ok(())
         }
         Err(mpsc::error::TrySendError::Full(_)) => Err(BleError::Backpressure),
@@ -1454,8 +1353,7 @@ async fn next_notification(
     active: &mut Option<ActiveListener<'_>>,
 ) -> Option<Notification<NOTIFICATION_MTU>> {
     match active {
-        Some(active) if !active.events.is_closed() => Some(active.listener.next().await),
-        Some(_) => pending().await,
+        Some(active) => Some(active.listener.next().await),
         None => pending().await,
     }
 }
@@ -1515,20 +1413,6 @@ async fn start_listener<'a>(
             })
         }
     }
-}
-
-async fn stop_listener(
-    client: &GattClient<'_, DirectHciController, DefaultPacketPool, MAX_SERVICES>,
-    active: &mut Option<ActiveListener<'_>>,
-    id: u64,
-) -> Result<(), BleError> {
-    if let Some(characteristic) = take_subscription(active, id)? {
-        client
-            .unsubscribe(&characteristic)
-            .await
-            .map_err(|error| BleError::Listener(format!("unsubscribe: {error:?}")))?;
-    }
-    Ok(())
 }
 
 fn take_subscription(
@@ -1787,14 +1671,6 @@ impl EventHandler for ScanCollector {
         };
         for report in reports.flatten() {
             let address = from_trouble_address(Address::new(report.addr_kind, report.addr));
-            if !records.contains_key(&address) && records.len() >= SCAN_DEVICE_LIMIT {
-                continue;
-            }
-            // Legacy LE Advertising Reports carry a one-byte data length.
-            // Keep the memory bound explicit if the input parser ever changes.
-            if report.data.len() > u8::MAX as usize {
-                continue;
-            }
             let (name, service_uuids) = parse_advertisement(report.data);
             let record = records.entry(address).or_insert_with(|| ScanResult {
                 address,
@@ -1814,15 +1690,10 @@ impl EventHandler for ScanCollector {
                 &mut record.advertisement_data
             };
             if !raw.iter().any(|value| value == report.data) {
-                if raw.len() >= SCAN_PAYLOAD_HISTORY {
-                    raw.remove(0);
-                }
                 raw.push(report.data.to_vec());
             }
             for uuid in service_uuids {
-                if record.service_uuids.len() < SCAN_UUID_LIMIT
-                    && !record.service_uuids.contains(&uuid)
-                {
+                if !record.service_uuids.contains(&uuid) {
                     record.service_uuids.push(uuid);
                 }
             }

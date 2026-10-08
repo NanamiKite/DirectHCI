@@ -18,24 +18,6 @@ pub const HCI_READ_LOCAL_SUPPORTED_COMMANDS: u16 = opcode(0x04, 0x0002);
 pub const HCI_READ_LOCAL_SUPPORTED_FEATURES: u16 = opcode(0x04, 0x0003);
 pub const HCI_READ_BUFFER_SIZE: u16 = opcode(0x04, 0x0005);
 
-/// Unsolicited traffic in host receive order. Command responses retain their
-/// separate correlation path. USB endpoints have no shared wire-order clock;
-/// this preserves enqueue order without subsequently prioritizing events.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum HciIncomingPacket {
-    Event(HciEventPacket),
-    Acl(HciAclPacket),
-}
-
-impl HciIncomingPacket {
-    pub fn encoded_len(&self) -> usize {
-        match self {
-            Self::Event(packet) => 2 + packet.parameters.len(),
-            Self::Acl(packet) => 4 + packet.payload.len(),
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HciPacketError {
     CommandParametersTooLong(usize),

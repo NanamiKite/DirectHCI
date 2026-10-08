@@ -1,167 +1,190 @@
-# Install and use DirectHCI on Windows
+# Windows installation
 
-[简体中文](installation.zh-CN.md) · [Troubleshooting and safe recovery](troubleshooting.md)
+The installer targets Windows x64 and installs four executables, the libwdi
+provisioning DLL, a Start Menu shortcut and the `DirectHCI` Windows service.
+The service runs as LocalSystem and starts on demand. Setup leaves Bluetooth
+controller drivers unchanged.
 
-DirectHCI targets Windows x64. The installer installs the runtime service,
-Control Panel, command-line tools and the provisioning component. It does
-**not** switch any Bluetooth controller while installing. End users do not
-need EWDK, MSBuild or driver-signing tools.
-
-The newer dynamic preparation and installer paths still need full Windows
-host acceptance; see [compatibility](compatibility.md).
+The latest installer and Control Panel changes still need Windows host
+acceptance; tracked results are in [compatibility.md](compatibility.md).
 
 ## Install and start
 
-1. Close any foreground `directhcid run` process before installing so the
-   installed service can own the named pipe.
-2. Run `DirectHCI-Setup-<version>.exe` for the release you downloaded and approve administrator elevation.
+If building from source, first [build the installer](#build-the-installer).
+
+1. Close any foreground `directhcid run` process so it releases the named pipe.
+2. Run `DirectHCI-Setup-0.1.0-alpha.1.exe` with administrator approval.
    Programs are installed under `C:\Program Files\DirectHCI`.
-3. Open **DirectHCI Control Panel** from the Start Menu. It requests elevation
-   if needed; declining closes the panel.
-4. Click **Start Service**. Select the USB Bluetooth controller you intend to
-   use in **Preferred Controller**.
+3. Open **DirectHCI Control Panel** from the Start Menu. The panel requests
+   elevation if needed; declining closes it.
+4. Click **Start Service**, then select the controller to use.
 
-The service saves the chosen ControllerId in
-`%ProgramData%\DirectHCI\config.json`. If exactly one controller is found and
-no preference exists, it can select that controller automatically. If several
-exist, choose one. If a saved controller is no longer present, the panel does
-not silently select another. Preferences cannot change during an active
-session.
-
-If Device Manager shows Bluetooth but the panel lists no controller, follow
-[the no-controller troubleshooting steps](troubleshooting.md#the-control-panel-lists-no-controller): this backend currently
-enumerates eligible USB Bluetooth devnodes, not every Windows Bluetooth
-radio or bus type.
+The daemon saves the preferred controller in
+`%ProgramData%\DirectHCI\config.json`. With one controller and no saved
+preference, it selects that controller automatically. With several, select
+one in the panel. A missing saved controller requires a new selection;
+preferences cannot change during an active session.
 
 ## Prepare a controller
 
-If the selected controller shows **Not prepared**, click **Prepare Controller**
-and review the local certificate-trust confirmation. The service reads that
-controller's actual PnP Hardware ID, generates a matching device-specific
-WinUSB package, signs it with a one-time local certificate and asks Windows
-to stage it in the Driver Store. A newly attached eligible USB controller can
-be prepared without reinstalling DirectHCI.
+When the selected controller shows **Not prepared**, click **Prepare
+Controller**. The confirmation describes the certificate trust change:
 
-**Prepare is not takeover.** It does not request a DirectHCI session or
-replace the controller's active Windows Bluetooth driver. After successful
-staging, the runtime checks that the Windows binding remains active and
-reruns its safety planner. A later client acquisition is a separate operation.
+1. The service reads the controller's current USB Hardware ID and generates
+   a matching WinUSB INF.
+2. libwdi creates a one-time certificate, adds its public certificate to
+   LocalMachine Root and TrustedPublisher, signs the catalog, and destroys
+   the private key.
+3. The service stages the package in the Driver Store, checks the resulting
+   driver candidate and verifies that the Windows Bluetooth driver is still
+   bound.
 
-Windows may reject a locally signed package under its code-integrity policy.
-The preparation error is reported without initiating takeover. DirectHCI
-does not change Secure Boot, TESTSIGNING or BCD. Follow
-[the safe preparation-failure steps](troubleshooting.md#prepare-controller-is-rejected-by-windows); see
-[driver provisioning internals](internals/driver-provisioning.md) for INF,
-catalog, certificate and Driver Store details.
+The package uses Microsoft's in-box `WinUSB.sys`. Preparation requires no
+WDK or signing tools on the user machine. A newly attached controller can be
+prepared without reinstalling DirectHCI.
+
+Windows may reject the locally signed package. In that case, preparation
+reports the SetupAPI error and leaves the Bluetooth binding unchanged.
+DirectHCI does not change Secure Boot, TESTSIGNING or BCD. The public
+certificate may remain trusted after a failed preparation because automatic
+certificate cleanup is not yet implemented with package-reference checks.
+
+Preparation only makes the driver available. The service switches to WinUSB
+when a client acquires a session, after checking identity, driver rank and
+recovery readiness. See [temporary-rebind.md](temporary-rebind.md) for the
+checks and recovery sequence.
 
 ## Use the service
 
-The Control Panel shows runtime status, selected controller, active client
-and recovery state. The service is the controller owner; closing a client
-session should restore Windows Bluetooth while leaving the service running.
-
-| Action | Expected result |
-| --- | --- |
-| Client releases or disconnects | HCI session closes; runtime attempts and verifies Windows Bluetooth restore; service stays running |
-| **Stop Service** | Stops the service and keeps the panel open |
-| Close the panel or choose **Exit Control Panel** in the tray | Stops the service, waits for `Stopped`, then exits |
-| Minimize the panel | Hides it in the tray; service keeps running |
-
-Stopping with an active session requires confirmation. If stopping fails,
-the panel stays open and shows the error. Click the tray icon to reopen it.
-**A stopped service does not prove Bluetooth has recovered.** Check the actual
-controller and Windows Bluetooth state.
-
-The main service remains manual-start. Installation also registers
-**DirectHCI Boot Recovery**, a SYSTEM task that runs `directhcid boot-recovery`
-at boot and exits after checking any retained journal. It does not start the
-interactive runtime or take over a controller. Failed recovery is recorded in
-the Windows Application event log under `DirectHCI`. Upgrade/reinstall is
-needed to register this task and the service's preshutdown timeout.
-
-CLI status queries can use a normal PowerShell:
+With the service running, status queries work from a normal PowerShell:
 
 ```powershell
-$cli = Join-Path $env:ProgramFiles 'DirectHCI\directhci.exe'
-& $cli status
-& $cli controllers
+& "$env:ProgramFiles\DirectHCI\directhci.exe" status
+& "$env:ProgramFiles\DirectHCI\directhci.exe" controllers --json
+& "$env:ProgramFiles\DirectHCI\directhci.exe" doctor --json
 ```
 
-Acquiring a controller or sending Raw HCI requires administrator membership
-with the current pipe policy. For other commands see [CLI](cli.md), and for
-Rust consumers see [SDK](sdk.md). `DirectHciClient::connect_or_start(...)` can
-request service startup when the caller has Windows `SERVICE_START` permission;
-`connect(...)` requires an already running service.
+Clients that acquire a controller or send raw HCI need administrator rights.
+For BLE commands and library use, see [directhci-ble](../crates/directhci-ble/README.md).
 
-## Recovery after abnormal termination
+The panel refreshes status about every two seconds. Its lifecycle controls
+behave as follows:
 
-**Known limitation: recovery of system Bluetooth after abnormal termination
-is not yet fixed.** Unexpected power loss, a blue screen, replacement of
-program files while the DirectHCI service is running, or abnormal process
-termination can interrupt orderly restoration. Windows Bluetooth may then
-remain off and refuse to turn on, even when Device Manager shows a healthy
-controller.
+| Action | Result |
+| --- | --- |
+| Client releases or disconnects | HCI closes and Windows Bluetooth is restored; the service stays running |
+| **Stop Service** | Stops the service and keeps the panel open |
+| Close the panel or choose **Exit Control Panel** in the tray | Stops the service, waits for `Stopped`, then exits |
+| Minimize the panel | Hides it in the tray; the service keeps running |
 
-Windows **Restart** may be needed to restore Bluetooth; shutdown and power-on
-with Fast Startup are not equivalent. Restart is not a guaranteed fix. A
-stopped service, an active BTHUSB driver or an absent journal alone does not
-prove Bluetooth is usable. Before upgrading, disconnect clients, stop the
-service and exit the applications normally; do not replace running files or
-force-terminate processes. See [safe next steps after abnormal termination](troubleshooting.md#system-bluetooth-is-unusable-after-abnormal-termination).
+Stopping with an active session requires confirmation. If stopping fails,
+the panel stays open and shows the error. Click the tray icon to reopen a
+minimized panel.
+
+Rust clients can opt into service startup with
+`DirectHciClient::connect_or_start(...)`. It requires Windows `SERVICE_START`
+permission, normally held by administrators with this installation.
+`DirectHciClient::connect(...)` connects to an already running service.
 
 ## Recovery
 
-If recovery is required while the runtime is available, use **Restore
-Windows** in the panel. If the service cannot recover normally, stop it and
-run offline recovery in an elevated PowerShell:
+For recovery while the runtime is available, use **Restore Windows** in the
+panel. If the runtime cannot recover normally, stop it and run offline recovery
+from an elevated PowerShell:
 
 ```powershell
-$cli = Join-Path $env:ProgramFiles 'DirectHCI\directhci.exe'
-& $cli recover --offline --json
+& "$env:ProgramFiles\DirectHCI\directhci.exe" recover --offline --json
 ```
 
-Recovery re-enumerates the saved physical controller and the current driver
-state; a stale journal is not by itself proof that the driver is still wrong.
-It can clear a journal only after the required Windows-owned state is freshly
-confirmed. Missing or ambiguous devices, unsafe journal storage and
-unconfirmed restoration remain blocked. **Do not delete the journal to make
-an error disappear**; it contains recovery evidence. Start with
-[troubleshooting and safe recovery](troubleshooting.md); see
-[ownership and recovery](ownership-and-recovery.md) and the
-[failure model](failure-model.md).
+Offline recovery checks the saved journal against a fresh device and driver
+observation. It refuses to run while the journal's owning process is active.
+If the controller is missing, identity is ambiguous, or the journal path is
+unsafe, keep the reported error and `%ProgramData%\DirectHCI` contents for
+diagnosis. Deleting the journal removes information needed for recovery.
 
-If recovery requests a reboot, choose Windows **Restart**, not shutdown and
-power-on with Fast Startup. Recovery compares the kernel boot identifier before
-checking an old owner PID. New journals include the original device security
-baseline; an older journal may require explicit repair if that baseline is
-unknown. Do not widen permissions or delete evidence to force a successful result.
+Driver recovery and permission recovery are separate checks. New acquisitions
+save the controller's device-property override and actual Windows radio DACL
+before switching drivers. Release/recovery restores and verifies both; a
+healthy `BTHUSB` binding alone is no longer enough to clear that journal.
+If permissions need repair, recovery then restarts **only the selected
+Bluetooth device once**, with the saved permissions in place, and rechecks its
+binding and live radio access permissions. It does not reinstall the driver
+package or restart the computer. A failed/incomplete device restart retains
+the journal, including the pending step. Windows can still require a system
+restart; that result is reported, not ignored. Already-matching permissions
+with no pending step do not trigger this additional device restart. This is
+not proof of successful pairing or restoration of all remote GATT services.
+`ControllerSecurityBaselineMissing` means an older journal did not record the
+original permissions. Repeated restarts, deleting the journal or reinstalling
+DirectHCI cannot supply that missing baseline. Do not broaden permissions to
+Everyone or copy another computer's ACL. Keep the evidence for targeted repair.
+See [permission restoration](temporary-rebind.md#controller-permission-restoration).
 
 ## Upgrade or uninstall
 
+Startup recovery, offline recovery and uninstall share the same reconciliation
+path. An old `RecoveryRequired` record does not cause another driver bind when
+fresh observations confirm the same controller is running its pre-acquire
+Windows package, with `DN_STARTED`, no problem or pending restart, and no enabled
+DirectHCI application interface. The saved controller permissions must also
+be restored and verified before the satisfied journal is cleared.
+If Windows binding is visible but a restart or interface transition remains
+pending, recovery retains the journal without binding the Windows driver again
+or refreshing the journal timestamp. PnP recovery is not proof that the Windows
+Settings radio switch or pairing works. Driver selection remains unchanged;
+the added permission restoration does not guarantee reboot-free switching on
+every Windows driver version.
+
 Run a new installer to upgrade, or use **Installed apps → DirectHCI →
-Uninstall**. Before upgrading, disconnect active clients, stop the DirectHCI
-service, confirm Windows Bluetooth recovery, and exit the Control Panel
-(including its tray icon) and DirectHCI CLI tools. Setup refuses to open its
-wizard if a DirectHCI process or a non-stopped service is detected, and rechecks
-before recovery preflight and file replacement. A failed status query also
-blocks installation. Setup does not terminate processes or stop a running
-service for an upgrade. Keep DirectHCI closed throughout installation; these
-checks are checkpoints, not a system-wide lock against starting another process.
+Uninstall** to remove the application. Both first stop the service and check
+Windows Bluetooth recovery. If recovery cannot be confirmed, the operation
+stops and retains the files, service and journal; resolve the error and retry.
 
-Upgrade preflight still checks offline recovery before removing the stopped
-service registration; normal uninstall retains its stop/recover path. If
-recovery cannot be confirmed, removal is refused and recovery evidence is
-retained. A stopped service or absent journal alone is not proof that the
-Windows Bluetooth switch works; verify it before upgrading.
-
-The current uninstaller does not remove previously staged WinUSB packages,
-trusted public certificates or `%ProgramData%\DirectHCI` state. Their safe
-cleanup requires separate, reference-aware maintenance; do not remove a
-certificate before determining which packages use it.
+Uninstall leaves staged WinUSB packages, trusted public certificates and
+`%ProgramData%\DirectHCI` state in place. These need separate maintenance after
+controller recovery is confirmed.
 
 ## Build the installer
 
-Developer build prerequisites, EWDK/libwdi steps, Rust compilation, Inno
-Setup packaging and output directories are in
-[development.md](development.md#build-the-installer). Building executables
-alone does not install the service.
+The Windows build host needs:
+
+- Rust 1.87 or later with the `x86_64-pc-windows-gnu` target;
+- MinGW-w64 tools on `PATH`, including `windres.exe` for the panel's icon;
+- a mounted EWDK ISO for the native libwdi build;
+- Inno Setup 6.4 or later.
+
+In `cmd.exe`, initialize EWDK and run both build scripts from the same window:
+
+```cmd
+F:\LaunchBuildEnv.cmd
+SetupVSEnv
+cd /d "C:\path\to\DirectHCI"
+rustup target add x86_64-pc-windows-gnu
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-libwdi.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\windows\build-installer.ps1
+```
+
+Replace `F:` and the repository path with local values. `build-libwdi.ps1`
+downloads pinned libwdi 1.5.1, verifies the archive hash, applies the project's
+INF and private-key cleanup patches, then builds the DLL with EWDK MSBuild.
+`build-installer.ps1` checks the native build manifest, builds the four Rust
+executables, and runs Inno Setup.
+
+Default output locations:
+
+| Artifact | Directory under `%LOCALAPPDATA%\DirectHCI` |
+| --- | --- |
+| libwdi DLL, source archive and build manifest | `native` |
+| Rust executables | `target\x86_64-pc-windows-gnu\release` |
+| `DirectHCI-Setup-0.1.0-alpha.1.exe` | `installer-output` |
+
+An existing `CARGO_TARGET_DIR` overrides the Rust output directory. Source
+can live in a shared folder; keep build outputs on a local disk.
+
+After changing source, build without `-SkipBuild`. That flag reuses existing
+executables without checking whether they match the source. The development
+installer filename stays the same, so run the file from the output directory.
+
+The build requires a libwdi source archive, but the current Inno Setup file
+only installs its DLL. Binary distribution also needs the corresponding
+source and notices described in [references.md](references.md).

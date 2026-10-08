@@ -13,35 +13,31 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{
-    CheckTokenMembership, CreateWellKnownSid, GetLengthSid, GetTokenInformation, IsValidSid,
-    PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SECURITY_ATTRIBUTES, TOKEN_ELEVATION, TOKEN_QUERY,
-    TOKEN_USER, TokenElevation, TokenUser, WinBuiltinAdministratorsSid,
+    CheckTokenMembership, CreateWellKnownSid, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
+    SECURITY_ATTRIBUTES, TOKEN_QUERY, WinBuiltinAdministratorsSid,
 };
 use windows::Win32::Storage::FileSystem::{
     FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
 };
 use windows::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows::Win32::System::Pipes::{
-    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId,
-    ImpersonateNamedPipeClient, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-    PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, ImpersonateNamedPipeClient,
+    PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES,
+    PIPE_WAIT,
 };
 use windows::Win32::System::Threading::{
-    CreateEventW, GetCurrentThread, OpenProcess, OpenProcessToken, OpenThreadToken,
-    PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
+    CreateEventW, GetCurrentThread, OpenThreadToken, WaitForSingleObject,
 };
 use windows::core::{BOOL, HRESULT, PCWSTR};
 
-use crate::runtime::{DirectHciRuntime, Outbound, SESSION_STOP_TIMEOUT};
+use crate::runtime::{DirectHciRuntime, Outbound};
 
 const OUTBOUND_DEPTH: usize = 128;
 const PIPE_BUFFER_SIZE: u32 = 64 * 1024;
 const MAX_CLIENT_NAME: usize = 128;
 const MAX_CONNECTIONS: usize = 16;
-const MAX_NON_ADMIN_CONNECTIONS: usize = 8;
-const MAX_CONNECTIONS_PER_USER: usize = 4;
 const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
-const DIAGNOSTIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const DIAGNOSTIC_IDLE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -49,135 +45,75 @@ pub fn serve(runtime: Arc<DirectHciRuntime>, stop: Arc<AtomicBool>) -> Result<()
     let connections: Arc<Mutex<Vec<Arc<PipeHandle>>>> = Arc::new(Mutex::new(Vec::new()));
     let mut workers: Vec<JoinHandle<()>> = Vec::new();
     let mut first_instance = true;
-    let accept_result = (|| -> Result<(), String> {
-        while !stop.load(Ordering::Acquire) {
-            reap_finished(&mut workers);
-            let handle = create_pipe(first_instance)?;
-            first_instance = false;
-            if let Err(error) = connect_pipe(handle, &stop) {
-                let _ = unsafe { CloseHandle(handle) };
-                if stop.load(Ordering::Acquire) {
-                    break;
-                }
-                return Err(error);
-            }
+    while !stop.load(Ordering::Acquire) {
+        reap_finished(&mut workers);
+        let handle = create_pipe(first_instance)?;
+        first_instance = false;
+        if let Err(error) = connect_pipe(handle, &stop) {
+            let _ = unsafe { CloseHandle(handle) };
             if stop.load(Ordering::Acquire) {
-                let _ = unsafe { DisconnectNamedPipe(handle) };
-                let _ = unsafe { CloseHandle(handle) };
                 break;
             }
-            let identity = match admission_identity(handle) {
-                Ok(identity) => identity,
-                Err(error) => {
-                    let _ = unsafe { DisconnectNamedPipe(handle) };
-                    let _ = unsafe { CloseHandle(handle) };
-                    eprintln!("directhcid: IPC admission rejected: {error}");
-                    continue;
-                }
-            };
-            let handle = Arc::new(PipeHandle {
-                raw: handle,
-                stopping: AtomicBool::new(false),
-                submission: Mutex::new(()),
-                identity,
-            });
-            {
-                let mut values = connections
-                    .lock()
-                    .map_err(|_| "connection registry lock poisoned")?;
-                let non_admin = values
-                    .iter()
-                    .filter(|value| !value.identity.elevated)
-                    .count();
-                let same_user = values
-                    .iter()
-                    .filter(|value| value.identity == handle.identity)
-                    .count();
-                if values.len() >= MAX_CONNECTIONS
-                    || (!handle.identity.elevated
-                        && (non_admin >= MAX_NON_ADMIN_CONNECTIONS
-                            || same_user >= MAX_CONNECTIONS_PER_USER))
-                {
-                    continue; // RAII closes the rejected instance, no worker allocated.
-                }
-                values.push(Arc::clone(&handle));
-            }
-            let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
-            let runtime = Arc::clone(&runtime);
-            let registry = Arc::clone(&connections);
-            workers.push(
-                thread::Builder::new()
-                    .name(format!("directhci-ipc-{connection_id}"))
-                    .spawn(move || {
-                        if let Err(error) = handle_connection(
-                            connection_id,
-                            Arc::clone(&handle),
-                            Arc::clone(&runtime),
-                        ) {
-                            eprintln!("directhcid: IPC connection {connection_id} ended: {error}");
-                        }
-                        runtime.disconnect(connection_id);
-                        handle.request_cancel();
-                        if let Ok(mut values) = registry.lock() {
-                            values.retain(|value| !Arc::ptr_eq(value, &handle));
-                        }
-                    })
-                    .map_err(|error| format!("spawn IPC connection: {error}"))?,
-            );
+            return Err(error);
         }
-        Ok(())
-    })();
-    // Never let an accept/lock/spawn failure bypass controller restoration.
-    let deadline = Instant::now() + SESSION_STOP_TIMEOUT;
-    let mut shutdown_result = runtime.shutdown(deadline);
-    let mut timeout_reported = false;
-    if Instant::now() >= deadline {
-        let message = shutdown_result
-            .as_ref()
-            .err()
-            .cloned()
-            .unwrap_or_else(|| "service shutdown exceeded 45 seconds".into());
-        eprintln!("directhcid: {message}");
-        crate::service::report_failure(&message);
-        timeout_reported = true;
-        shutdown_result = Err(message);
-    }
-    {
-        // Poison is an accept-loop error, not permission to strand live pipe
-        // operations. Recover the registry only to cancel/join, never admit.
-        let values = connections
+        if stop.load(Ordering::Acquire) {
+            let _ = unsafe { DisconnectNamedPipe(handle) };
+            let _ = unsafe { CloseHandle(handle) };
+            break;
+        }
+        if connections
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
+            .map_err(|_| "connection registry lock poisoned")?
+            .len()
+            >= MAX_CONNECTIONS
+        {
+            let _ = unsafe { DisconnectNamedPipe(handle) };
+            let _ = unsafe { CloseHandle(handle) };
+            continue;
+        }
+        let handle = Arc::new(PipeHandle {
+            raw: handle,
+            stopping: AtomicBool::new(false),
+            submission: Mutex::new(()),
+        });
+        connections
+            .lock()
+            .map_err(|_| "connection registry lock poisoned")?
+            .push(Arc::clone(&handle));
+        let connection_id = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
+        let runtime = Arc::clone(&runtime);
+        let registry = Arc::clone(&connections);
+        workers.push(
+            thread::Builder::new()
+                .name(format!("directhci-ipc-{connection_id}"))
+                .spawn(move || {
+                    if let Err(error) =
+                        handle_connection(connection_id, Arc::clone(&handle), Arc::clone(&runtime))
+                    {
+                        eprintln!("directhcid: IPC connection {connection_id} ended: {error}");
+                    }
+                    runtime.disconnect(connection_id);
+                    handle.request_cancel();
+                    if let Ok(mut values) = registry.lock() {
+                        values.retain(|value| !Arc::ptr_eq(value, &handle));
+                    }
+                })
+                .map_err(|error| format!("spawn IPC connection: {error}"))?,
+        );
+    }
+
+    runtime.shutdown();
+    if let Ok(values) = connections.lock() {
         for handle in values.iter() {
             handle.request_cancel();
         }
     }
-    // Never enter an unbounded join before checking the whole-stop deadline.
-    // CancelIoEx cannot interrupt synchronous PnP/libwdi work. At the deadline
-    // report failure NOW, but keep its owners alive until the work returns:
-    // detaching/terminating them and reporting Stopped could strand a device.
-    while !workers.is_empty() || runtime.shutdown_pending() {
-        reap_finished(&mut workers);
-        if workers.is_empty() && !runtime.shutdown_pending() {
-            break;
+    for worker in workers {
+        if worker.is_finished() {
+            let _ = worker.join();
         }
-        if !timeout_reported && Instant::now() >= deadline {
-            let message = format!(
-                "service shutdown exceeded 45 seconds with {} IPC workers still running; safe I/O/PnP cleanup is pending; Windows restore is not certified",
-                workers.len()
-            );
-            eprintln!("directhcid: {message}");
-            crate::service::report_failure(&message);
-            shutdown_result = Err(message);
-            timeout_reported = true;
-        }
-        thread::sleep(Duration::from_millis(10));
     }
-    match (accept_result, shutdown_result) {
-        (Err(primary), Err(cleanup)) => Err(format!("{primary}; shutdown: {cleanup}")),
-        (Err(error), _) | (_, Err(error)) => Err(error),
-        _ => Ok(()),
-    }
+    Ok(())
 }
 
 fn reap_finished(workers: &mut Vec<JoinHandle<()>>) {
@@ -458,7 +394,7 @@ fn send_json(
         .map_err(|error| (request_id, IpcErrorCode::Runtime, error.to_string()))?;
     let frame = IpcFrame::v1(IpcMessageKind::ControlResponse, request_id, payload)
         .map_err(|error| (request_id, IpcErrorCode::Runtime, error.to_string()))?;
-    crate::runtime::send_outbound(outbound, frame, None).map_err(|_| {
+    outbound.try_send(frame).map_err(|_| {
         (
             request_id,
             IpcErrorCode::Backpressure,
@@ -474,11 +410,9 @@ fn send_error(
     message: String,
 ) -> Result<(), ()> {
     let payload = encode_ipc_json(&IpcErrorResponse { code, message }).map_err(|_| ())?;
-    crate::runtime::send_outbound(
-        outbound,
-        IpcFrame::v1(IpcMessageKind::Error, request_id, payload).map_err(|_| ())?,
-        None,
-    )
+    outbound
+        .try_send(IpcFrame::v1(IpcMessageKind::Error, request_id, payload).map_err(|_| ())?)
+        .map_err(|_| ())
 }
 
 fn writer_loop(handle: Arc<PipeHandle>, outgoing: mpsc::Receiver<IpcFrame>) {
@@ -502,74 +436,6 @@ struct PipeHandle {
     raw: HANDLE,
     stopping: AtomicBool,
     submission: Mutex<()>,
-    identity: AdmissionIdentity,
-}
-
-#[derive(Eq, PartialEq)]
-struct AdmissionIdentity {
-    sid: Vec<u8>,
-    elevated: bool,
-}
-
-// OS-provided identity is only for resource quotas. Privileged requests still
-// use the existing post-ClientHello pipe impersonation authorization check.
-fn admission_identity(pipe: HANDLE) -> Result<AdmissionIdentity, String> {
-    let mut pid = 0;
-    unsafe { GetNamedPipeClientProcessId(pipe, &mut pid) }
-        .map_err(|e| format!("pipe client PID: {e}"))?;
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }
-        .map_err(|e| format!("open pipe client: {e}"))?;
-    let mut token = HANDLE::default();
-    let opened = unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) };
-    let _ = unsafe { CloseHandle(process) };
-    opened.map_err(|e| format!("pipe client token: {e}"))?;
-    let result = (|| {
-        let mut elevation = TOKEN_ELEVATION::default();
-        let mut required = 0;
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenElevation,
-                Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
-                std::mem::size_of::<TOKEN_ELEVATION>() as u32,
-                &mut required,
-            )
-        }
-        .map_err(|e| format!("pipe client elevation: {e}"))?;
-        let _ = unsafe { GetTokenInformation(token, TokenUser, None, 0, &mut required) };
-        if required < std::mem::size_of::<TOKEN_USER>() as u32 || required > 64 * 1024 {
-            return Err("invalid token user size".into());
-        }
-        // usize storage supplies TOKEN_USER's pointer alignment.
-        let mut storage = vec![0usize; (required as usize).div_ceil(std::mem::size_of::<usize>())];
-        unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
-                Some(storage.as_mut_ptr().cast()),
-                (storage.len() * std::mem::size_of::<usize>()) as u32,
-                &mut required,
-            )
-        }
-        .map_err(|e| format!("pipe client SID: {e}"))?;
-        let user = unsafe { &*storage.as_ptr().cast::<TOKEN_USER>() };
-        if !unsafe { IsValidSid(user.User.Sid) }.as_bool() {
-            return Err("invalid pipe client SID".into());
-        }
-        let sid = unsafe {
-            std::slice::from_raw_parts(
-                user.User.Sid.0.cast::<u8>(),
-                GetLengthSid(user.User.Sid) as usize,
-            )
-        }
-        .to_vec();
-        Ok(AdmissionIdentity {
-            sid,
-            elevated: elevation.TokenIsElevated != 0,
-        })
-    })();
-    let _ = unsafe { CloseHandle(token) };
-    result
 }
 unsafe impl Send for PipeHandle {}
 unsafe impl Sync for PipeHandle {}

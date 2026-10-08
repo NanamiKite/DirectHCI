@@ -15,7 +15,7 @@ pub struct DeviceSpecificPackageBlueprint {
 pub fn eligible_device_specific_package(
     controller: &directhci_core::ControllerObservation,
 ) -> Result<crate::rebind::DirectHciWinUsbPackageSpec, String> {
-    if !controller.status.present || controller.status.problem_code != Some(0) {
+    if !controller.status.present || controller.status.problem_code.is_some_and(|code| code != 0) {
         return Err("controller is not present and problem-free".into());
     }
     if !controller

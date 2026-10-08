@@ -28,7 +28,6 @@ enum Action {
 
 struct Snapshot {
     service: Result<ServiceState, String>,
-    service_failure: Option<String>,
     runtime: Option<RuntimeStatus>,
     preferences: Option<RuntimePreferences>,
     preparation: Option<Result<directhci_core::ControllerPreparationStatus, String>>,
@@ -168,23 +167,15 @@ pub fn run() -> Result<(), String> {
                     main_panel.window.close();
                 }
             } else if event == E::OnWindowClose && handle == main_panel.window.handle {
-                match service::query_with_failure() {
-                    Ok((ServiceState::Stopped | ServiceState::NotInstalled, failure)) => {
-                        if let Some(error) = failure {
-                            nwg::modal_error_message(
-                                &main_panel.window,
-                                "Windows recovery was not confirmed",
-                                &error,
-                            );
-                        }
+                match service::query() {
+                    Ok(ServiceState::Stopped | ServiceState::NotInstalled) => {
                         nwg::stop_thread_dispatch();
                     }
-                    Ok((
+                    Ok(
                         ServiceState::Running
                         | ServiceState::StartPending
                         | ServiceState::StopPending,
-                        _,
-                    )) => {
+                    ) => {
                         if let nwg::EventData::OnWindowClose(close) = data {
                             close.close(false);
                         }
@@ -205,7 +196,7 @@ pub fn run() -> Result<(), String> {
                             }
                         }
                     }
-                    Ok((ServiceState::Unknown, _)) => {
+                    Ok(ServiceState::Unknown) => {
                         if let nwg::EventData::OnWindowClose(close) = data {
                             close.close(false);
                         }
@@ -333,11 +324,7 @@ fn perform(action: Action) -> Result<(), String> {
 fn stop_service_and_wait() -> Result<(), String> {
     let mut stop_requested = false;
     for _ in 0..450 {
-        let (state, failure) = service::query_with_failure()?;
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        match state {
+        match service::query()? {
             ServiceState::NotInstalled | ServiceState::Stopped => return Ok(()),
             ServiceState::Running if !stop_requested => {
                 service::stop()?;
@@ -362,17 +349,13 @@ fn wait_for_service_attempts(target: ServiceState, attempts: usize) -> bool {
 }
 
 fn collect_snapshot() -> Snapshot {
-    let (service, service_failure) = match service::query_with_failure() {
-        Ok((state, failure)) => (Ok(state), failure),
-        Err(error) => (Err(error), None),
-    };
+    let service = service::query();
     if matches!(
         &service,
         Ok(ServiceState::Stopped | ServiceState::NotInstalled)
     ) {
         return Snapshot {
             service,
-            service_failure,
             runtime: None,
             preferences: None,
             preparation: None,
@@ -406,7 +389,6 @@ fn collect_snapshot() -> Snapshot {
             };
             Snapshot {
                 service,
-                service_failure,
                 runtime: status.as_ref().ok().cloned(),
                 preferences: preferences.as_ref().ok().cloned(),
                 preparation,
@@ -416,7 +398,6 @@ fn collect_snapshot() -> Snapshot {
         }
         Err(error) => Snapshot {
             service,
-            service_failure,
             runtime: None,
             preferences: None,
             preparation: None,
@@ -457,7 +438,7 @@ impl Panel {
             let stopped = matches!(
                 &result.snapshot.service,
                 Ok(ServiceState::Stopped | ServiceState::NotInstalled)
-            ) && result.snapshot.service_failure.is_none();
+            );
             let had_error = result.operation_error.is_some();
             if result.user_action {
                 self.busy.set(false);
@@ -467,7 +448,7 @@ impl Panel {
                 nwg::modal_error_message(&self.window, "DirectHCI operation failed", &error);
             }
             if self.close_requested.get() {
-                if stopped && !had_error && !self.busy.get() {
+                if stopped && !self.busy.get() {
                     nwg::stop_thread_dispatch();
                     return;
                 }
@@ -477,7 +458,7 @@ impl Panel {
                         nwg::modal_error_message(
                             &self.window,
                             "Cannot close DirectHCI Control Panel",
-                            "Service shutdown/recovery was not confirmed. See Diagnostics before retrying.",
+                            "DirectHCI service is not stopped. Try Stop Service again.",
                         );
                     }
                 } else if !self.busy.get() {
@@ -494,9 +475,6 @@ impl Panel {
 
     fn apply_snapshot(&self, snapshot: Snapshot) {
         self.service_value.set_text(match &snapshot.service {
-            Ok(ServiceState::Stopped) if snapshot.service_failure.is_some() => {
-                "Stopped / Recovery not confirmed"
-            }
             Ok(state) => state.label(),
             Err(_) => "Unknown / Error",
         });
@@ -562,7 +540,13 @@ impl Panel {
             }
             self.active_value
                 .set_text(&runtime.active_session.as_ref().map_or_else(
-                    || "None".into(),
+                    || {
+                        if runtime.recovery_required {
+                            "None - recovery incomplete".into()
+                        } else {
+                            "None".into()
+                        }
+                    },
                     |active| format!("{}  ·  Session {}", active.client_name, active.session_id),
                 ));
             self.recovery_value.set_text(if runtime.recovery_required {
@@ -570,7 +554,15 @@ impl Panel {
             } else {
                 "OK · No action required"
             });
-            let note = if runtime.active_session.is_some() {
+            let note = if runtime.recovery_required {
+                format!(
+                    "Windows recovery incomplete: {}. Use Restore Windows to retry; restarting the service is not required.",
+                    runtime
+                        .recovery_message
+                        .as_deref()
+                        .unwrap_or("Inspect Diagnostics for details")
+                )
+            } else if runtime.active_session.is_some() {
                 "Controller is currently in use. Disconnect the active client before changing it."
                     .into()
             } else if runtime.controllers.is_empty() {
@@ -594,18 +586,13 @@ impl Panel {
             self.support_value.set_text("Unavailable");
             self.active_value.set_text("None");
             self.recovery_value.set_text("Unknown");
-            self.note_value
-                .set_text(if let Some(error) = snapshot.service_failure.as_deref() {
-                    error
-                } else {
-                    match snapshot.service {
-                        Ok(ServiceState::NotInstalled) => "DirectHCI service is not installed.",
-                        Ok(ServiceState::Stopped) => {
-                            "DirectHCI service is stopped. Start it to view controllers."
-                        }
-                        _ => "Runtime IPC connection unavailable; see Diagnostics.",
-                    }
-                });
+            self.note_value.set_text(match snapshot.service {
+                Ok(ServiceState::NotInstalled) => "DirectHCI service is not installed.",
+                Ok(ServiceState::Stopped) => {
+                    "DirectHCI service is stopped. Start it to view controllers."
+                }
+                _ => "Runtime IPC connection unavailable; see Diagnostics.",
+            });
         }
         self.updating_combo.set(false);
         *self.snapshot.borrow_mut() = Some(snapshot);
@@ -780,9 +767,6 @@ fn format_diagnostics(snapshot: &Snapshot) -> String {
     ];
     if let Err(error) = &snapshot.service {
         lines.push(format!("Service error: {error}"));
-    }
-    if let Some(error) = &snapshot.service_failure {
-        lines.push(format!("Service failure: {error}"));
     }
     if let Some(error) = &snapshot.runtime_error {
         lines.push(format!("Runtime error: {error}"));

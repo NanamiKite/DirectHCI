@@ -2,114 +2,106 @@
 
 [中文](docs/README.zh-CN.md)
 
-DirectHCI is a Windows userspace Bluetooth controller ownership and Raw HCI
-runtime for USB Bluetooth controllers. Its local service temporarily binds a
-selected controller to Microsoft's WinUSB driver, carries HCI commands, events
-and ACL data, and restores the Windows Bluetooth driver when the session ends.
+DirectHCI gives Windows applications raw HCI access to a USB Bluetooth
+controller. A local service temporarily binds the selected controller to
+WinUSB, handles HCI commands, events and ACL data, and restores the Windows
+Bluetooth driver when the client releases the session or disconnects.
 
-DirectHCI does **not** use a static Bluetooth VID/PID allowlist. **Prepare
-Controller** generates an exact-Hardware-ID WinUSB package from a freshly
-observed, eligible USB Bluetooth controller. Preparation stages a driver
-candidate; it does **not** take the controller away from Windows. Windows
-signing policy and the later takeover safety checks can still reject it.
+The repository includes a Windows service, a control panel, command-line tools,
+and Rust libraries for raw HCI and BLE Central/GATT through TrouBLE.
 
-```text
-Windows Bluetooth (BTHUSB / IBTUSB)
-    │ Prepare Controller: stage an exact-Hardware-ID WinUSB candidate
-    │ Acquire: verify identity, driver rank and recovery path
-    ▼
-DirectHCI owns controller (WinUSB)
-    │ HCI Command / Event / ACL
-    │ Release, client disconnect or service stop
-    ▼
-Windows Bluetooth restored
+**Status: `0.1.0-alpha.1`.** Development testing has used an Intel AX201 on
+Windows 11. Driver takeover, raw HCI and Windows restoration have worked on
+that host. BLE lifecycle regressions and recent installer/control-panel
+changes still need hardware retesting. See [compatibility](docs/compatibility.md)
+for the recorded results and open items.
+
+While a DirectHCI session is active, Windows Bluetooth devices using that
+controller are unavailable. The runtime allows one active HCI session at a
+time. Keep a wired keyboard or mouse available when testing a controller used
+by your input devices.
+
+## Getting started
+
+The installer targets Windows x64. To build it from source, follow
+[the installation guide](docs/installation.md#build-the-installer); the build
+requires Rust, MinGW-w64, EWDK and Inno Setup.
+
+1. Run the installer and open **DirectHCI Control Panel** from the Start Menu.
+   Both require administrator approval.
+2. Click **Start Service** and select a controller.
+3. If it shows **Not prepared**, click **Prepare Controller**. This creates and
+   stages a WinUSB package after asking for local certificate trust. Windows
+   may reject the package under its signing policy; see
+   [controller preparation](docs/installation.md#prepare-a-controller).
+4. Use the CLI or a Rust client to open a session. Starting the service and
+   preparing a controller leave Windows Bluetooth in control; acquisition
+   happens when a client requests a session.
+
+With the service running, these PowerShell commands query its status and list
+controllers:
+
+```powershell
+& "$env:ProgramFiles\DirectHCI\directhci.exe" status
+& "$env:ProgramFiles\DirectHCI\directhci.exe" controllers
 ```
 
-The repository includes a Windows service, Control Panel, diagnostic CLI, and
-Rust libraries for Raw HCI and BLE Central/GATT through TrouBLE. DirectHCI is
-not a vendor-specific device protocol or a replacement BLE host stack.
+For command syntax, run `directhci.exe --help`. BLE operations are available
+through `directhci-ble.exe` and the [BLE library](crates/directhci-ble/README.md).
+Acquiring a controller requires an elevated client.
 
-## Key features
+Closing the Control Panel stops the service; minimizing it keeps the service
+running in the background. If a session ends abnormally and Bluetooth is not
+restored, follow [recovery](docs/installation.md#recovery).
 
-- Guarded, temporary USB Bluetooth ownership with a durable recovery journal.
-- Raw HCI Command, Event and ACL access through a local Windows service and SDK.
-- On-demand, exact-Hardware-ID WinUSB preparation without a static VID/PID list.
-- A native Control Panel, diagnostic CLI and optional BLE Central/GATT library.
+## Rust libraries
 
-## Installation and quick start
+| Crate | Purpose |
+| --- | --- |
+| [`directhci-client`](crates/directhci-client) | Local service client: controller queries, acquisition and raw HCI sessions |
+| [`directhci-bt-hci`](crates/directhci-bt-hci) | `bt-hci` controller adapter for a DirectHCI session |
+| [`directhci-ble`](crates/directhci-ble) | Async BLE scanning, connections, GATT read/write and notifications |
 
-The installer targets Windows x64. Installing DirectHCI does not switch any
-Bluetooth controller.
+The crates are unpublished; use path dependencies from a local checkout.
+The client talks to `directhcid` over a local named pipe. The service owns the
+WinUSB handles and driver changes, and records recovery state before takeover.
+See [architecture](docs/architecture.md) for the session and recovery model.
 
-1. Install DirectHCI and open **DirectHCI Control Panel** from the Start Menu.
-   Installation and the panel request administrator approval.
-2. Click **Start Service** and select the USB Bluetooth controller to use.
-3. If it shows **Not prepared**, click **Prepare Controller** and review the
-   local certificate-trust prompt. Windows may reject a locally signed package;
-   the panel reports that failure without switching the controller.
-4. Start a DirectHCI client. In normal use, client acquisition initiates the
-   temporary takeover; the explicit developer command `takeover ... --execute`
-   can also switch the driver. Release, disconnect or service stop triggers restoration.
+## Building
 
-The Control Panel shows service state, selected controller, active client and
-recovery state. Closing it stops the service; minimizing it keeps the service
-running in the tray. See [installation](docs/installation.md) for normal use
-and recovery.
+Rust 1.87 or later is required. On Windows, install the
+`x86_64-pc-windows-gnu` target and put the MinGW-w64 tools, including
+`windres.exe`, on `PATH`. From the repository root:
 
-While DirectHCI owns a controller, Windows Bluetooth devices using that
-controller are unavailable. Keep a non-Bluetooth keyboard or mouse available
-when experimenting with the controller that serves your input devices. The
-runtime allows one active Raw HCI session at a time.
-
-## Current status
-
-Version: `0.2.0`. Real-hardware users report normal DirectHCI
-operation with Intel AX201 (`8087:0026`), AX200 (`8087:0029`) and
-BE200/Gale Peak-family Bluetooth (`8087:0036`). These are common family
-labels, not proof of an exact module SKU from the USB ID alone. Detailed
-takeover, Raw HCI, BLE and restore observations are recorded for the AX201;
-the other reports still need archived
-build/host and per-stage logs. Windows acceptance of a locally signed package
-remains host-policy-dependent. See the
-[compatibility and validation record](docs/compatibility.md).
-
-Later BLE library changes have had reported GATT timeout/disconnection
-regressions. The current receive-order/lifecycle fixes require Windows-host
-regression acceptance; earlier working runs are not certification of this build.
-
-Recovery after abnormal termination remains a known, unresolved limitation.
-Unexpected power loss, a blue screen, replacement of files while the service
-is running, or abnormal process termination may leave system Bluetooth unusable.
-Windows **Restart** may be needed, but is not a guaranteed fix; see
-[safe recovery guidance](docs/troubleshooting.md#system-bluetooth-is-unusable-after-abnormal-termination).
-
-## Architecture and development
-
-```text
-Raw HCI consumer / CLI / Control Panel
-                  ↓
-           directhci-client
-                  ↓ local named pipe
-               directhcid
-                  ├─ ownership and recovery
-                  └─ Raw HCI over WinUSB
+```powershell
+rustup target add x86_64-pc-windows-gnu
+$env:CARGO_TARGET_DIR = "$env:LOCALAPPDATA\DirectHCI\target"
+cargo build --locked --release --workspace --target x86_64-pc-windows-gnu
 ```
 
-`directhcid` owns driver transitions, WinUSB handles and the recovery journal.
-The BLE host is an optional consumer of Raw HCI, not part of the privileged
-runtime. See [architecture](docs/architecture.md), the
-[SDK guide](docs/sdk.md), and [development](docs/development.md). The Rust
-crates are currently unpublished; use path dependencies from a local checkout.
+Executables are written to
+`%LOCALAPPDATA%\DirectHCI\target\x86_64-pc-windows-gnu\release`.
+Building them does not install the service. See
+[development](docs/development.md) for running the daemon from a terminal,
+Linux checks and installer prerequisites.
+
+## Repository
+
+| Path | Contents |
+| --- | --- |
+| `apps/` | Service, Control Panel, diagnostic CLI and BLE CLI |
+| `crates/` | Client libraries, shared types and Windows backend |
+| `driver/` | Device-specific WinUSB INF template and legacy development package |
+| `installer/`, `scripts/windows/` | Windows packaging and build scripts |
+| `docs/` | Setup, architecture, recovery and hardware test notes |
 
 ## Documentation
 
-- [Installation and recovery](docs/installation.md) · [Troubleshooting and safe recovery](docs/troubleshooting.md)
-- [Compatibility model and hardware validation](docs/compatibility.md)
+- [Installation, preparation and recovery](docs/installation.md)
+- [Development](docs/development.md)
+- [Hardware compatibility and known issues](docs/compatibility.md)
 - [Architecture](docs/architecture.md)
-- [Ownership and recovery internals](docs/ownership-and-recovery.md)
-- [Failure model](docs/failure-model.md)
-- [CLI](docs/cli.md) · [Rust SDK](docs/sdk.md) · [Development](docs/development.md)
-- [Driver provisioning internals](docs/internals/driver-provisioning.md)
+- [Temporary driver rebind and recovery](docs/temporary-rebind.md)
 - [Windows hardware test plan](docs/windows-test-plan.md)
 - [Dependencies and references](docs/references.md)
 

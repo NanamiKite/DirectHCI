@@ -1,6 +1,4 @@
 #[cfg(windows)]
-mod boot_recovery;
-#[cfg(windows)]
 mod ipc;
 #[cfg(windows)]
 mod runtime;

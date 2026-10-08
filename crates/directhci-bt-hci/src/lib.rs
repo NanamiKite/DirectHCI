@@ -4,8 +4,7 @@
 //! unsolicited events and ACL data are exposed through `Controller::read`.
 
 use std::convert::Infallible;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -15,8 +14,8 @@ use bt_hci::event::CommandCompleteWithStatus;
 use bt_hci::param::{RemainingBytes, Status};
 use bt_hci::{ControllerToHostPacket, FromHciBytes, PacketKind, WriteHci};
 use directhci_client::{ClientError, RawHciClientSession};
-use directhci_core::{HciAclPacket, HciCommandResponse, HciIncomingPacket};
-use tokio::sync::{Mutex as AsyncMutex, mpsc as async_mpsc, oneshot, watch};
+use directhci_core::{HciAclPacket, HciCommandResponse};
+use tokio::sync::{Mutex as AsyncMutex, mpsc as async_mpsc, oneshot};
 
 const REQUEST_DEPTH: usize = 32;
 const INBOUND_DEPTH: usize = 128;
@@ -32,19 +31,12 @@ pub enum AdapterError {
     Client(String),
     Encode(String),
     Decode(String),
-    UnexpectedResponse {
-        expected: u16,
-        actual: u16,
-    },
+    UnexpectedResponse { expected: u16, actual: u16 },
     UnexpectedResponseKind(&'static str),
     UnsupportedPacket(&'static str),
     Backpressure,
     Closed,
     WorkerPanicked,
-    Cleanup {
-        primary: Box<AdapterError>,
-        cleanup: Box<AdapterError>,
-    },
 }
 impl std::fmt::Display for AdapterError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -61,9 +53,6 @@ impl std::fmt::Display for AdapterError {
             Self::Backpressure => f.write_str("DirectHCI adapter inbound queue overflow"),
             Self::Closed => f.write_str("DirectHCI adapter is closed"),
             Self::WorkerPanicked => f.write_str("DirectHCI adapter worker panicked"),
-            Self::Cleanup { primary, cleanup } => {
-                write!(f, "primary: {primary}; cleanup: {cleanup}")
-            }
         }
     }
 }
@@ -89,17 +78,18 @@ enum Request {
         packet: HciAclPacket,
         reply: oneshot::Sender<Result<(), AdapterError>>,
     },
+    Shutdown {
+        reply: oneshot::Sender<Result<(), AdapterError>>,
+    },
 }
 enum Inbound {
     Event(Vec<u8>),
     Acl(Vec<u8>),
 }
 struct Shared {
-    requests: async_mpsc::Sender<Request>,
+    requests: mpsc::SyncSender<Request>,
     inbound: AsyncMutex<async_mpsc::Receiver<Result<Inbound, AdapterError>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
-    stopping: Arc<AtomicBool>,
-    completed: watch::Receiver<Option<Result<(), AdapterError>>>,
 }
 
 #[derive(Clone)]
@@ -108,30 +98,17 @@ pub struct DirectHciController {
 }
 impl DirectHciController {
     pub fn new(session: RawHciClientSession) -> Result<Self, AdapterError> {
-        let (request_tx, request_rx) = async_mpsc::channel(REQUEST_DEPTH);
+        let (request_tx, request_rx) = mpsc::sync_channel(REQUEST_DEPTH);
         let (inbound_tx, inbound_rx) = async_mpsc::channel(INBOUND_DEPTH);
-        let stopping = Arc::new(AtomicBool::new(false));
-        let worker_stopping = Arc::clone(&stopping);
-        let (completed_tx, completed_rx) = watch::channel(None);
         let worker = thread::Builder::new()
             .name("directhci-bt-hci".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    worker_loop(session, request_rx, inbound_tx, worker_stopping)
-                }))
-                .unwrap_or(Err(AdapterError::WorkerPanicked));
-                // worker_loop's session, channel receivers and other owned
-                // resources have ALL been dropped before publishing completion.
-                completed_tx.send_replace(Some(result));
-            })
+            .spawn(move || worker_loop(session, request_rx, inbound_tx))
             .map_err(|e| AdapterError::Client(e.to_string()))?;
         Ok(Self {
             shared: Arc::new(Shared {
                 requests: request_tx,
                 inbound: AsyncMutex::new(inbound_rx),
                 worker: Mutex::new(Some(worker)),
-                stopping,
-                completed: completed_rx,
             }),
         })
     }
@@ -140,72 +117,50 @@ impl DirectHciController {
         opcode: u16,
         params: Vec<u8>,
     ) -> Result<HciCommandResponse, AdapterError> {
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(AdapterError::Closed);
-        }
         let (tx, rx) = oneshot::channel();
         self.shared
             .requests
-            .send(Request::Command {
+            .try_send(Request::Command {
                 opcode,
                 params,
                 reply: tx,
             })
-            .await
-            .map_err(|_| AdapterError::Closed)?;
+            .map_err(map_send)?;
         rx.await.map_err(|_| AdapterError::Closed)?
     }
     pub async fn shutdown(&self) -> Result<(), AdapterError> {
-        // Out-of-band stop cannot be stranded behind a full request queue.
-        // The shared completion remains observable if this future is cancelled.
-        self.shared.stopping.store(true, Ordering::Release);
-        let mut completed = self.shared.completed.clone();
-        let result = loop {
-            if let Some(result) = completed.borrow().clone() {
-                break result;
-            }
-            if completed.changed().await.is_err() {
-                break Err(AdapterError::WorkerPanicked);
-            }
+        let worker = self
+            .shared
+            .worker
+            .lock()
+            .map_err(|_| AdapterError::Closed)?
+            .take();
+        let Some(worker) = worker else {
+            return Ok(());
         };
-        let worker = {
-            self.shared
-                .worker
-                .lock()
-                .map_err(|_| AdapterError::Closed)?
-                .take()
-        };
-        if let Some(worker) = worker {
-            // A final channel signal precedes OS/TLS thread-exit bookkeeping.
-            // Reap off the executor without requiring a Tokio runtime in a
-            // standalone bt-hci consumer. Cancelling this await does not kill
-            // the reaper or worker and cannot free their resources early.
-            let (joined_tx, joined_rx) = oneshot::channel();
-            thread::Builder::new()
-                .name("directhci-bt-hci-reap".into())
-                .spawn(move || {
-                    let result = worker.join().map_err(|_| AdapterError::WorkerPanicked);
-                    let _ = joined_tx.send(result);
-                })
-                .map_err(|error| AdapterError::Client(format!("start shutdown reaper: {error}")))?;
-            joined_rx
-                .await
-                .map_err(|_| AdapterError::WorkerPanicked)??;
-        }
+        let (tx, rx) = oneshot::channel();
+        self.shared
+            .requests
+            .send(Request::Shutdown { reply: tx })
+            .map_err(|_| AdapterError::Closed)?;
+        let result = rx.await.map_err(|_| AdapterError::Closed)?;
+        worker.join().map_err(|_| AdapterError::WorkerPanicked)?;
         result
+    }
+}
+fn map_send<T>(error: mpsc::TrySendError<T>) -> AdapterError {
+    match error {
+        mpsc::TrySendError::Full(_) => AdapterError::Backpressure,
+        mpsc::TrySendError::Disconnected(_) => AdapterError::Closed,
     }
 }
 fn worker_loop(
     mut session: RawHciClientSession,
-    mut requests: async_mpsc::Receiver<Request>,
+    requests: mpsc::Receiver<Request>,
     inbound: async_mpsc::Sender<Result<Inbound, AdapterError>>,
-    stopping: Arc<AtomicBool>,
-) -> Result<(), AdapterError> {
-    let primary = loop {
-        if stopping.load(Ordering::Acquire) {
-            break None;
-        }
-        match requests.try_recv() {
+) {
+    loop {
+        match requests.recv_timeout(POLL_INTERVAL) {
             Ok(Request::Command {
                 opcode,
                 params,
@@ -216,24 +171,22 @@ fn worker_loop(
             Ok(Request::Acl { packet, reply }) => {
                 let _ = reply.send(session.send_acl(&packet).map_err(Into::into));
             }
-            Err(async_mpsc::error::TryRecvError::Disconnected) => {
-                break None;
+            Ok(Request::Shutdown { reply }) => {
+                let result = session.release().map(|_| ()).map_err(Into::into);
+                let _ = reply.send(result);
+                break;
             }
-            Err(async_mpsc::error::TryRecvError::Empty) => thread::sleep(POLL_INTERVAL),
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = session.release();
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if let Err(error) = pump_inbound(&session, &inbound) {
-            let _ = inbound.try_send(Err(error.clone()));
-            break Some(error);
+            let _ = inbound.try_send(Err(error));
+            let _ = session.release();
+            break;
         }
-    };
-    let cleanup = session.release().map(|_| ()).map_err(AdapterError::from);
-    match (primary, cleanup) {
-        (None, result) => result,
-        (Some(primary), Ok(())) => Err(primary),
-        (Some(primary), Err(cleanup)) => Err(AdapterError::Cleanup {
-            primary: Box::new(primary),
-            cleanup: Box::new(cleanup),
-        }),
     }
 }
 fn pump_inbound(
@@ -241,37 +194,32 @@ fn pump_inbound(
     tx: &async_mpsc::Sender<Result<Inbound, AdapterError>>,
 ) -> Result<(), AdapterError> {
     for _ in 0..MAX_DRAIN_PER_TICK {
-        // Reserve BEFORE consuming the SDK stream. A full queue only pauses
-        // RX pumping; it does not drop packets or prevent shutdown commands.
-        let permit = match tx.try_reserve() {
-            Ok(permit) => permit,
-            Err(async_mpsc::error::TrySendError::Full(_)) => break,
-            Err(async_mpsc::error::TrySendError::Closed(_)) => return Err(AdapterError::Closed),
-        };
-        let Some(packet) = session.receive_packet(Duration::ZERO)? else {
+        let Some(event) = session.receive_event(Duration::ZERO)? else {
             break;
         };
-        let inbound = match packet {
-            HciIncomingPacket::Event(event) => {
-                if event
-                    .command_response()
-                    .map_err(|e| AdapterError::Decode(e.to_string()))?
-                    .is_some()
-                {
-                    continue;
-                }
-                Inbound::Event(
-                    event
-                        .encode()
-                        .map_err(|e| AdapterError::Decode(e.to_string()))?,
-                )
-            }
-            HciIncomingPacket::Acl(acl) => Inbound::Acl(
-                acl.encode()
-                    .map_err(|e| AdapterError::Decode(e.to_string()))?,
-            ),
+        if event
+            .command_response()
+            .map_err(|e| AdapterError::Decode(e.to_string()))?
+            .is_some()
+        {
+            continue;
+        }
+        tx.try_send(Ok(Inbound::Event(
+            event
+                .encode()
+                .map_err(|e| AdapterError::Decode(e.to_string()))?,
+        )))
+        .map_err(|_| AdapterError::Backpressure)?;
+    }
+    for _ in 0..MAX_DRAIN_PER_TICK {
+        let Some(acl) = session.receive_acl(Duration::ZERO)? else {
+            break;
         };
-        permit.send(Ok(inbound));
+        tx.try_send(Ok(Inbound::Acl(
+            acl.encode()
+                .map_err(|e| AdapterError::Decode(e.to_string()))?,
+        )))
+        .map_err(|_| AdapterError::Backpressure)?;
     }
     Ok(())
 }
@@ -279,17 +227,14 @@ impl embedded_io::ErrorType for DirectHciController {
     type Error = AdapterError;
 }
 impl Controller for DirectHciController {
-    type Buffer<'a> = Vec<u8>;
+    type Buffer<'a> = [u8; 4096];
     fn alloc_buf(&self) -> Result<Self::Buffer<'_>, Self::Error> {
-        Ok(vec![0; 4 + u16::MAX as usize])
+        Ok([0; 4096])
     }
     async fn write_acl_data(
         &self,
         packet: &bt_hci::data::AclPacket<'_>,
     ) -> Result<(), Self::Error> {
-        if self.shared.stopping.load(Ordering::Acquire) {
-            return Err(AdapterError::Closed);
-        }
         let (tx, rx) = oneshot::channel();
         let p = HciAclPacket {
             handle: packet.handle().into_inner(),
@@ -299,12 +244,11 @@ impl Controller for DirectHciController {
         };
         self.shared
             .requests
-            .send(Request::Acl {
+            .try_send(Request::Acl {
                 packet: p,
                 reply: tx,
             })
-            .await
-            .map_err(|_| AdapterError::Closed)?;
+            .map_err(map_send)?;
         rx.await.map_err(|_| AdapterError::Closed)?
     }
     async fn write_sync_data(&self, _: &bt_hci::data::SyncPacket<'_>) -> Result<(), Self::Error> {

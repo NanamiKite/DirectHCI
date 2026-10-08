@@ -21,6 +21,7 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+mod device_security;
 #[cfg(windows)]
 mod enumeration;
 mod journal;
@@ -31,7 +32,6 @@ mod provisioning;
 mod provisioning_windows;
 mod raw_hci;
 mod rebind;
-mod recovery_support;
 #[cfg(windows)]
 mod security;
 mod takeover;

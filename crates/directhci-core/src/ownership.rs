@@ -7,7 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{ControllerIdentity, ControllerObservation};
 
-pub const OWNERSHIP_JOURNAL_SCHEMA_VERSION: u32 = 1;
+// Keep the filename stable. Older runtimes must refuse a lease whose pending
+// post-permission device restart they cannot complete, rather than clear it.
+pub const OWNERSHIP_JOURNAL_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -59,7 +61,7 @@ impl OwnershipPhase {
         matches!(
             (self, next),
             (WindowsOwned, AcquirePrepared)
-                | (WindowsOwned, RecoveryRequired)
+                | (WindowsOwned, RestoringWindows)
                 | (AcquirePrepared, RebindingToDirectHci)
                 | (AcquirePrepared, RestoringWindows)
                 | (AcquirePrepared, RecoveryRequired)
@@ -93,19 +95,16 @@ pub struct LeaseOwnerMetadata {
     pub process_id: Option<u32>,
     pub session_id: Option<String>,
     pub client_label: Option<String>,
-    /// Kernel boot identifier: a resumed Fast Startup session is not a restart.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub boot_identifier: Option<String>,
-    /// GetProcessTimes creation FILETIME, not a reusable PID alone.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub process_creation_time: Option<u64>,
 }
 
+/// Captured while this exact controller is Windows-owned, before any rebind.
+/// None for the device property means confirmed absence, never a read failure.
+/// The live radio descriptor includes owner/group/DACL, not SACL or key material.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-pub struct DeviceSecurityBaseline {
-    /// None means the device had no explicit security override. An absent
-    /// baseline in an older journal means unknown, NOT an absent override.
-    pub security_sddl: Option<String>,
+pub struct ControllerSecurityBaseline {
+    pub instance_id: String,
+    pub device_security_sddl: Option<String>,
+    pub radio_security_sddl: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -119,12 +118,18 @@ pub struct OwnershipJournal {
     /// Historical evidence only. Interface paths and driver names in this
     /// observation must never be replayed without a fresh observation.
     pub pre_acquire_observation: ControllerObservation,
+    /// Older journals have no baseline. Never invent a default ACL for them.
+    #[serde(default)]
+    pub pre_acquire_security: Option<ControllerSecurityBaseline>,
+    /// Set durably BEFORE permission replay. Cleared only after one Windows
+    /// device restart and fresh binding/security verification. ACL readback
+    /// alone cannot prove clients reinitialized after an earlier access denial.
+    #[serde(default)]
+    pub windows_stack_restart_pending: bool,
     pub directhci_driver_package: DriverPackageIdentity,
     pub created_unix_ms: u64,
     pub updated_unix_ms: u64,
     pub owner: LeaseOwnerMetadata,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub device_security_baseline: Option<DeviceSecurityBaseline>,
 }
 
 impl OwnershipJournal {
@@ -146,11 +151,12 @@ impl OwnershipJournal {
             recovery_desired_state: DesiredControllerState::WindowsOwned,
             controller_identity,
             pre_acquire_observation,
+            pre_acquire_security: None,
+            windows_stack_restart_pending: false,
             directhci_driver_package,
             created_unix_ms,
             updated_unix_ms,
             owner,
-            device_security_baseline: None,
         }
     }
 
