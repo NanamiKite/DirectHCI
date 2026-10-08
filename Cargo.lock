@@ -88,6 +88,7 @@ name = "directhci-ble-cli"
 version = "0.1.0-alpha.1"
 dependencies = [
  "directhci-ble",
+ "directhci-windows",
  "tokio",
 ]
 
@@ -116,6 +117,7 @@ version = "0.1.0-alpha.1"
 dependencies = [
  "directhci-client",
  "directhci-core",
+ "directhci-windows",
  "native-windows-gui",
  "windows",
 ]

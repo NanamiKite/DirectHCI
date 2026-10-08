@@ -4,6 +4,8 @@
 mod app;
 #[cfg(windows)]
 mod service;
+#[cfg(windows)]
+mod single_instance;
 
 #[cfg(windows)]
 fn main() {
@@ -17,6 +19,12 @@ fn run() -> Result<(), String> {
     if !ensure_elevated()? {
         return Ok(());
     }
+    let _presence = directhci_windows::process_lifecycle::enter_application()?;
+    let Some(_instance) = single_instance::enter()? else {
+        // Existing window has been shown. Do not create a Panel or run its
+        // close handler (which would request a service stop).
+        return Ok(());
+    };
     app::run()
 }
 

@@ -49,6 +49,7 @@ pub fn dispatch(arguments: Vec<String>) -> Result<(), String> {
 }
 
 fn run_console() -> Result<(), String> {
+    let _presence = directhci_windows::process_lifecycle::enter_application()?;
     let stop = Arc::new(AtomicBool::new(false));
     let _ = STOP.set(Arc::clone(&stop));
     // SAFETY: the callback only sets an atomic flag whose Arc is process-global.
@@ -91,6 +92,18 @@ unsafe extern "system" fn service_main(_: u32, _: *mut PWSTR) {
     };
     STATUS_HANDLE.store(handle.0, Ordering::Release);
     set_status(SERVICE_START_PENDING, 0, 30_000);
+    // Register with SCM before checking the installer gate, so a rejected
+    // service start reports an error instead of timing out in the dispatcher.
+    // install-service/uninstall-service intentionally do not enter this gate:
+    // Setup must be able to run its existing recovery helper while holding it.
+    let _presence = match directhci_windows::process_lifecycle::enter_application() {
+        Ok(presence) => presence,
+        Err(error) => {
+            eprintln!("directhcid: startup refused: {error}");
+            set_status_with_exit(SERVICE_STOPPED, 0, 0, 1618); // ERROR_INSTALL_ALREADY_RUNNING
+            return;
+        }
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let _ = STOP.set(Arc::clone(&stop));
     let runtime = DirectHciRuntime::start();
@@ -137,6 +150,15 @@ fn request_stop() {
 }
 
 fn set_status(current: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u32) {
+    set_status_with_exit(current, accepted, wait_hint, NO_ERROR.0);
+}
+
+fn set_status_with_exit(
+    current: SERVICE_STATUS_CURRENT_STATE,
+    accepted: u32,
+    wait_hint: u32,
+    exit_code: u32,
+) {
     let raw = STATUS_HANDLE.load(Ordering::Acquire);
     if raw.is_null() {
         return;
@@ -145,7 +167,7 @@ fn set_status(current: SERVICE_STATUS_CURRENT_STATE, accepted: u32, wait_hint: u
         dwServiceType: SERVICE_WIN32_OWN_PROCESS,
         dwCurrentState: current,
         dwControlsAccepted: accepted,
-        dwWin32ExitCode: NO_ERROR.0,
+        dwWin32ExitCode: exit_code,
         dwServiceSpecificExitCode: 0,
         dwCheckPoint: 0,
         dwWaitHint: wait_hint,

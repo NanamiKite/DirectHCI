@@ -114,6 +114,10 @@ pub fn run() -> Result<(), String> {
     let (requests, actions) = mpsc::channel();
     let (completed, results) = mpsc::channel();
     let panel = Rc::new(build_panel(requests, results)?);
+    let activation_panel = Rc::clone(&panel);
+    let _activation = crate::single_instance::bind(&panel.window, move || {
+        activation_panel.show_from_tray();
+    })?;
     let notice = panel.notice.sender();
     thread::Builder::new()
         .name("directhci-control-panel-io".into())

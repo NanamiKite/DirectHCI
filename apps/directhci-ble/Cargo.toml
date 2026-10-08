@@ -10,6 +10,9 @@ publish.workspace = true
 directhci-ble.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
 
+[target.'cfg(windows)'.dependencies]
+directhci-windows.workspace = true
+
 [[bin]]
 name = "directhci-ble"
 path = "src/main.rs"

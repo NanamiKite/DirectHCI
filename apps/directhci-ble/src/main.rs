@@ -69,6 +69,9 @@ async fn main() {
 }
 
 async fn run() -> AppResult<()> {
+    #[cfg(windows)]
+    let _presence = directhci_windows::process_lifecycle::enter_application()
+        .map_err(std::io::Error::other)?;
     let (controller_id, command) = parse_args()?;
     let central = DirectHciBleCentral::connect(BleCentralConfig {
         controller_id,

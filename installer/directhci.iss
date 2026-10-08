@@ -10,7 +10,7 @@
 [Setup]
 AppId={{C6F4C08B-6961-49FE-98AB-6CEA79EC0D6E}
 AppName=DirectHCI
-AppVersion=V0.1.6test
+AppVersion=V2.0.1
 AppPublisher=DirectHCI Project
 DefaultDirName={autopf}\DirectHCI
 DefaultGroupName=DirectHCI
@@ -18,7 +18,7 @@ DisableDirPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64os
 ArchitecturesInstallIn64BitMode=x64os
-OutputBaseFilename=DirectHCI-Setup-V0.1.6test
+OutputBaseFilename=DirectHCI-Setup-V2.0.1
 Compression=lzma
 SolidCompression=yes
 CloseApplications=no
@@ -43,6 +43,8 @@ Name: "{group}\DirectHCI Control Panel"; Filename: "{app}\directhci-control-pane
 Name: "{group}\Uninstall DirectHCI"; Filename: "{uninstallexe}"
 
 [Code]
+#include "process-guard.iss"
+
 function LastNonEmptyLine(const Lines: TArrayOfString): String;
 var
   I: Integer;
@@ -84,7 +86,10 @@ var
   Helper: String;
   Details: String;
 begin
-  Result := '';
+  { InitializeSetup already holds the startup gate. Recheck older, unguarded
+    applications before running the existing stop/recover preflight. }
+  Result := TryBeginDirectHciMaintenance;
+  if Result <> '' then Exit;
   { First install has no service to replace. Only an existing service or an
     outstanding journal warrants the stop/recover preflight. }
   if not RegKeyExists(HKEY_LOCAL_MACHINE,
@@ -98,7 +103,8 @@ begin
     Result := 'Cannot check existing DirectHCI service: ' + Details
   else if ResultCode <> 0 then
     Result := 'DirectHCI service/recovery preflight failed (exit ' +
-      IntToStr(ResultCode) + '). No files were replaced. ' + Details;
+      IntToStr(ResultCode) + '). No files were replaced. ' + Details +
+      ' Close Setup before running standalone recovery commands.';
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
@@ -107,6 +113,10 @@ var
   Exe: String;
   Details: String;
 begin
+  if CurStep = ssInstall then begin
+    Details := DirectHciRunningProblem;
+    if Details <> '' then RaiseException(Details);
+  end;
   if CurStep = ssPostInstall then begin
     Exe := ExpandConstant('{app}\directhcid.exe');
     if not RunDaemon(Exe, 'install-service', ResultCode, Details) then
@@ -124,6 +134,8 @@ var
   Exe: String;
   Details: String;
 begin
+  Result := BeginDirectHciMaintenance;
+  if not Result then Exit;
   Exe := ExpandConstant('{app}\directhcid.exe');
   Result := FileExists(Exe);
   if not Result then begin
@@ -136,7 +148,7 @@ begin
     Result := False;
   end else if ResultCode <> 0 then begin
     MsgBox('Windows Bluetooth recovery was not confirmed: ' + Details +
-      '. Uninstall is cancelled; run directhci recover --offline as Administrator and retry.', mbError, MB_OK);
+      '. Uninstall is cancelled; close this uninstaller, run directhci recover --offline as Administrator and retry.', mbError, MB_OK);
     Result := False;
   end;
 end;

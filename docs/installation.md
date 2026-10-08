@@ -12,11 +12,14 @@ acceptance; tracked results are in [compatibility.md](compatibility.md).
 
 If building from source, first [build the installer](#build-the-installer).
 
-1. Close any foreground `directhcid run` process so it releases the named pipe.
+1. Disconnect consumers, stop DirectHCI normally, and exit the Control Panel
+   (including its tray icon) and any DirectHCI command-line processes.
 2. Run `DirectHCI-Setup-0.1.0-alpha.1.exe` with administrator approval.
    Programs are installed under `C:\Program Files\DirectHCI`.
 3. Open **DirectHCI Control Panel** from the Start Menu. The panel requests
-   elevation if needed; declining closes it.
+   elevation if needed; declining closes it. Only one panel runs per Windows
+   login session. Opening it again shows/restores the existing window, including
+   from the tray; the duplicate process exits without stopping the service.
 4. Click **Start Service**, then select the controller to use.
 
 The daemon saves the preferred controller in
@@ -81,6 +84,11 @@ Stopping with an active session requires confirmation. If stopping fails,
 the panel stays open and shows the error. Click the tray icon to reopen a
 minimized panel.
 
+Repeated launches request foreground activation; Windows may instead flash the
+taskbar button. If the existing panel does not respond within the bounded
+activation wait, the new process reports that fact without opening another panel
+or terminating anything. The existing panel's close/minimize behavior is unchanged.
+
 Rust clients can opt into service startup with
 `DirectHciClient::connect_or_start(...)`. It requires Windows `SERVICE_START`
 permission, normally held by administrators with this installation.
@@ -136,9 +144,27 @@ the added permission restoration does not guarantee reboot-free switching on
 every Windows driver version.
 
 Run a new installer to upgrade, or use **Installed apps → DirectHCI →
-Uninstall** to remove the application. Both first stop the service and check
-Windows Bluetooth recovery. If recovery cannot be confirmed, the operation
-stops and retains the files, service and journal; resolve the error and retry.
+Uninstall** to remove the application. Both refuse to proceed while a DirectHCI
+panel, runtime, CLI process or non-stopped service is detected, including in
+other login sessions. Close consumers, stop the service normally, and exit the
+panel before retrying. Minimizing the panel is not enough. The check never kills
+processes or stops a running session automatically.
+
+After the running-state check, the existing service removal/recovery preflight
+still checks Windows Bluetooth recovery. If recovery cannot be confirmed, the
+operation stops and retains the files, service and journal; resolve the error
+and retry.
+Close Setup/Uninstall before using standalone recovery commands.
+
+While Setup/Uninstall is open after a successful check, a machine-wide startup
+gate blocks new current-build DirectHCI application/runtime starts. The gate is
+not held by normal running applications, and is not used by HCI, release or
+recovery. The installer recovery/registration helpers remain available. Canceling
+or exiting Setup releases the gate; it creates no persistent startup-disable flag.
+Existing older builds are detected by executable name and checked again before
+file changes, but they do not honor this new gate: do not launch an old build
+during maintenance. An already-installed old uninstaller is not retroactively
+updated by changes to this installer source.
 
 Uninstall leaves staged WinUSB packages, trusted public certificates and
 `%ProgramData%\DirectHCI` state in place. These need separate maintenance after

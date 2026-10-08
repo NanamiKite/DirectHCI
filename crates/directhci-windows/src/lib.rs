@@ -29,6 +29,8 @@ mod journal;
 mod preferences;
 mod provisioning;
 #[cfg(windows)]
+pub mod process_lifecycle;
+#[cfg(windows)]
 mod provisioning_windows;
 mod raw_hci;
 mod rebind;

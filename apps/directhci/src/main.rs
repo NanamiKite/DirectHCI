@@ -24,6 +24,8 @@ fn main() -> ExitCode {
 }
 
 fn run(arguments: Vec<String>) -> Result<(), String> {
+    #[cfg(windows)]
+    let _presence = directhci_windows::process_lifecycle::enter_application()?;
     match arguments.as_slice() {
         [command] if command == "controllers" => list_controllers(false, false),
         [command, flag] if command == "controllers" && flag == "--json" => {
